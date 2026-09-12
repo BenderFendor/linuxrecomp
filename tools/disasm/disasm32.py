@@ -109,6 +109,19 @@ class Function:
     is_thunk: bool = False  # single-jmp wrapper
     size: int = 0
     jump_targets: set = field(default_factory=set)
+    # "start" -- we believe a function begins here.
+    # "alias" -- we do NOT. Something branches into the middle of another
+    # function (a shared epilogue, a switch arm reached from elsewhere, an
+    # alternate entry point), and the lifter needs a dispatchable body at that
+    # address or the branch is unresolved at runtime. The body deliberately
+    # overlaps the function that contains it.
+    #
+    # The distinction is not cosmetic. Scored against Trespasser's linker map,
+    # 6,427 of 7,364 "false positives" were aliases -- addresses the catalog
+    # never claimed were function starts, counted as if it had. That is 87% of
+    # the error in a precision number, and it was measuring a design decision
+    # rather than a defect.
+    entry_kind: str = "start"
 
     @property
     def num_instructions(self) -> int:
@@ -128,12 +141,76 @@ class Disassembler:
         self.md = Cs(CS_ARCH_X86, CS_MODE_32)
         self.md.detail = True
 
+        # A second decoder with detail OFF, for probes_as_function_body. The
+        # probe wants mnemonics and sizes and nothing else; building capstone
+        # operand detail for every instruction it walks past is the whole cost
+        # of running it, and it throws all of it away.
+        self._probe_md = Cs(CS_ARCH_X86, CS_MODE_32)
+
         # Build VA -> file offset cache for code sections
         # adj = raw_offset - va_start, so file_offset = va + adj
         self._code_sections = [(s.virtual_address + image_base,
                                 s.virtual_address + image_base + s.raw_size,
                                 s.raw_offset - (s.virtual_address + image_base))
                                for s in sections if s.is_code and s.name != '.bind']
+
+    def code_section_bounds(self, va: int):
+        """(start, end) of the code section holding `va`, or None."""
+        for start, end, _ in self._code_sections:
+            if start <= va < end:
+                return start, end
+        return None
+
+    def probes_as_function_body(self, va: int, window: int = 4096) -> bool:
+        """Read-only: does the instruction stream at `va` look like code?
+
+        Corroboration for a candidate that came out of a raw byte scan rather
+        than out of an instruction we actually decoded. `find_data_code_pointers`
+        reads four bytes at every offset of every data section and calls each
+        value in the code range a function; `find_branch_targets` does the same
+        for every `E8`/`E9` byte. Both therefore accept anything that merely
+        *looks* like an address -- a float, a string fragment, the middle of a
+        wider immediate. On Trespasser that was 2,905 function starts invented
+        out of data, each of which lifts to garbage.
+
+        The test is whether the bytes decode as a run of instructions that
+        reaches a `ret` or a tail `jmp`. Data almost never does; code almost
+        always does. Alignment was the obvious alternative and is not good
+        enough -- a real MSVC function start is only aligned when the linker had
+        a reason to pad it, and the optimised accessors this repo keeps losing
+        are exactly the ones it does not pad.
+
+        Decoding cleanly for a whole `window` without terminating counts as a
+        pass: garbage does not stay decodable for four kilobytes. Running off
+        the end of the *section* without terminating does not -- real code does
+        not end by falling out of .text.
+
+        Nothing here is recorded. The probe uses its own detail-free decoder and
+        touches no state, so running it cannot change what the sweep produces.
+        """
+        bounds = self.code_section_bounds(va)
+        if bounds is None:
+            return False
+        sec_end = bounds[1]
+
+        size = min(window, sec_end - va)
+        data = self.read_bytes(va, size)
+        if not data:
+            return False
+
+        end = va
+        for insn in self._probe_md.disasm(data, va):
+            if insn.mnemonic in RETS or insn.mnemonic in UNCOND_JUMPS:
+                return True
+            end = insn.address + insn.size
+
+        # The decode stopped short of the window: a byte that is not an
+        # instruction, which is the signature of data read as code.
+        if end < va + size:
+            return False
+        # It consumed everything we gave it. Clean for a full window is a pass;
+        # clean right up to the section end without a terminator is not.
+        return va + size < sec_end
 
     def is_code_address(self, va: int) -> bool:
         """Check if a VA falls within a code section."""
@@ -412,10 +489,19 @@ class Disassembler:
         the code range and not already part of decoded code. Unaligned on
         purpose: packed struct arrays put function pointers at odd addresses
         (GTA1's handler table starts at 0x4B4AD1), and an aligned-only scan
-        misses them entirely. False positives just become dead functions --
-        harmless now that out-of-function branches tail-dispatch.
+        misses them entirely.
+
+        Every hit is then corroborated by decoding it -- see
+        probes_as_function_body. Without that the scan accepts any four bytes
+        that happen to look like a code address: a float, a string fragment,
+        the middle of a wider immediate. Measured against Trespasser's linker
+        map, the unchecked scan invented 2,905 function starts. Calling those
+        harmless because they lift to dead code was the wrong trade: they
+        poison the precision number, bury the real misses in noise, and spend
+        codegen on decoded garbage.
         """
         found = set()
+        probed = rejected = 0
         for s in self.sections:
             if s.is_code:
                 continue
@@ -427,9 +513,16 @@ class Disassembler:
                 va = int.from_bytes(data[off:off + 4], 'little')
                 if not (code_start <= va < code_end):
                     continue
-                if va in covered or va in queued:
+                if va in covered or va in queued or va in found:
+                    continue
+                probed += 1
+                if not self.probes_as_function_body(va):
+                    rejected += 1
                     continue
                 found.add(va)
+        if probed:
+            print(f"[*] Data scan: probed {probed} pointer targets, "
+                  f"rejected {rejected} that do not decode as code")
         return found
 
     def find_functions(self, code_start: int, code_end: int, iat_map: dict = None) -> dict:
@@ -471,13 +564,15 @@ class Disassembler:
         functions = {}
         covered = set()          # every instruction start address across all funcs
         owner = {}               # instruction address -> the function that decoded it
+        alias_entries = set()    # entry points inside another function's body
         queue = list(all_targets)
         queued = set(all_targets)
 
-        def _add_func(addr):
+        def _add_func(addr, entry_kind="start"):
             func = self.disassemble_function(addr, iat_map)
             if not (func and func.blocks):
                 return None
+            func.entry_kind = entry_kind
             functions[addr] = func
             if len(func.blocks) == 1:
                 block = next(iter(func.blocks.values()))
@@ -506,7 +601,7 @@ class Disassembler:
                       print(f"[*] Disassembling function {i}/{total}...")
                   if addr in functions:
                       continue
-                  _add_func(addr)
+                  _add_func(addr, "alias" if addr in alias_entries else "start")
 
               # Harvest jmp/call immediate targets from everything decoded so far,
               # enqueue any that don't start an already-decoded instruction.
@@ -530,6 +625,9 @@ class Disassembler:
                               # the caller's frame carries through.
                               if tgt in functions or owner.get(tgt) == func.address:
                                   continue
+                              # It is an entry point, but it is NOT a function
+                              # start and the catalog must not say it is.
+                              alias_entries.add(tgt)
                           queued.add(tgt)
                           queue.append(tgt)
 
@@ -591,6 +689,7 @@ def _func_to_dict(func, full: bool = False) -> dict:
         "num_blocks": len(func.blocks),
         "num_instructions": func.num_instructions,
         "is_thunk": func.is_thunk,
+        "entry_kind": func.entry_kind,
         "calls_to": sorted(func.calls_to),
     }
     if full:
@@ -611,6 +710,58 @@ def _func_to_dict(func, full: bool = False) -> dict:
     return d
 
 
+def demo():
+    """One runnable check for probes_as_function_body: code passes, data does not.
+
+    A fake single-section image, so the probe is exercised without needing a PE
+    on disk. Every assertion below is a decision the probe has to get right for
+    the data-pointer scan to stop inventing functions.
+    """
+    class _Sec:
+        def __init__(self, name, va, raw_off, raw_size, is_code):
+            self.name, self.virtual_address = name, va
+            self.raw_offset, self.raw_size = raw_off, raw_size
+            self.virtual_size, self.is_code = raw_size, is_code
+
+    BASE = 0x400000
+    body = (b"\x55"                      # push ebp
+            b"\x8b\xec"                  # mov ebp, esp
+            b"\x33\xc0"                  # xor eax, eax
+            b"\xc3")                     # ret
+    tail = (b"\x8b\x44\x24\x04"          # mov eax, [esp+4]
+            b"\xe9\x00\x00\x00\x00")     # jmp rel32 -- a tail call terminates too
+    junk = b"\x0f\xff" * 4               # 0F FF is not an x86 instruction
+    text = body + tail + junk
+    text += b"\x90" * (0x200 - len(text))   # nops out to the section end
+
+    d = Disassembler(b"\x00" * 0x400 + text, BASE,
+                     [_Sec(".text", 0x1000, 0x400, 0x200, True)])
+
+    a_body = BASE + 0x1000
+    a_tail = a_body + len(body)
+    a_junk = a_tail + len(tail)
+
+    assert d.probes_as_function_body(a_body), "a prologue reaching ret is code"
+    assert d.probes_as_function_body(a_tail), "a tail jmp is a terminator too"
+    assert not d.probes_as_function_body(a_junk), \
+        "bytes that do not decode are not a function body"
+    assert not d.probes_as_function_body(BASE + 0x9000), \
+        "an address outside every code section is not code"
+
+    # Nops decode cleanly forever. Running to the end of .text without ever
+    # reaching a terminator is still a reject: real code does not end by
+    # falling out of its section.
+    assert not d.probes_as_function_body(BASE + 0x11F0), \
+        "clean decode to the section end without a terminator is not a body"
+
+    # The same nops, when there is more section after them than the probe
+    # window, are a pass -- garbage does not stay decodable that long.
+    assert d.probes_as_function_body(BASE + 0x1100, window=16), \
+        "a full clean window counts as corroboration"
+
+    print("disasm32.py self-test OK")
+
+
 def main(argv=None):
     import argparse, json, os, sys
 
@@ -620,7 +771,9 @@ def main(argv=None):
 
     ap = argparse.ArgumentParser(
         description="Recursive-descent x86-32 disassembler + function recovery (pcrecomp).")
-    ap.add_argument("exe", help="Path to the 32-bit PE executable")
+    ap.add_argument("exe", nargs="?", help="Path to the 32-bit PE executable")
+    ap.add_argument("--selftest", action="store_true",
+                    help="Run the built-in checks and exit")
     ap.add_argument("--output", "-o", help="Write function catalog as JSON to this path")
     ap.add_argument("--pe-json", help="(optional) reserved: path to a pe_analyze JSON; "
                                       "analysis is recomputed from the exe regardless")
@@ -629,6 +782,12 @@ def main(argv=None):
     ap.add_argument("--min-size", type=int, default=0,
                     help="Drop recovered functions smaller than N bytes from the catalog")
     args = ap.parse_args(argv)
+
+    if args.selftest:
+        demo()
+        return 0
+    if not args.exe:
+        ap.error("an executable is required (or --selftest)")
 
     info = analyze_pe(args.exe)
     iat = build_iat_map(info)

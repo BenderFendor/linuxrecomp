@@ -78,9 +78,10 @@ simply does not have:
   item on the list — the Trespasser scorecard has been hand-rolling validation
   that partly exists here.
 - **`func_id` (2,406).** `vtable_scanner`, `imm_scanner`, `crt_identifier`,
-  `stub_classifier`, `clustering`. Directly relevant: Trespasser's audit found
-  pcrecomp's unaligned data-pointer scan produced 2,905 false function starts,
-  and a real vtable scanner is the principled replacement for it.
+  `stub_classifier`, `clustering`. Directly relevant: pcrecomp's unaligned
+  data-pointer scan accepts any four bytes that look like a code address, and a
+  real vtable scanner -- runs of consecutive code pointers, not isolated hits --
+  is the principled replacement for it.
 - **`rtti` (351).** Trespasser hand-rolled RTTI extraction in its own
   `tools/recon.py` because pcrecomp had none. This already exists.
 - **`disasm` improvements.** E9 seeding is now ported (see below). Section-end
@@ -116,16 +117,94 @@ So the recommendation is deliberately narrow:
    compared, ~4 lines. That is the template, and the port queue below follows it.
 2. **Start with the disassembler, not the big modules.** The first instinct was
    to take `conformance` and `func_id` first, because Trespasser needs both. That
-   is backwards: every downstream tool consumes the function catalog, so a
-   catalog with 2,905 invented starts in it makes every measurement below it
-   noisy. Fix what produces the catalog first — items 1 to 3 — then the
-   modules that consume it.
+   is backwards: every downstream tool consumes the function catalog, so until
+   the catalog is trustworthy every measurement below it is noisy. Fix what
+   produces the catalog first — items 0 to 3 — then the modules that consume
+   it. Scoring the catalog first is what turned up item 0, which was not on the
+   list at all and turned out to be 87% of the measured error.
 3. **Do not attempt a shared repo yet.** Prove the modules transplant cleanly
    first. A `pcrecomp-core` extraction is a conversation for after three or
    four successful ports, not before.
 4. **Keep the Xbox-specific 2,800 lines where they are.** They are not
    candidates for anything.
 
+
+## What the first measurement found
+
+Before porting anything, the queue below was scored against ground truth. It
+changed the order, and it changed what item 1 even is. The method:
+
+- **Reference**: `trespass.map` — a linker map from a source build of
+  Trespasser, so it is symbol-derived truth rather than another tool's opinion.
+  34,159 distinct function starts. The map carries no end addresses, so IDA's
+  ranges over an md5-identical copy of the same binary were merged onto its
+  starts (92.3% coverage) to make the split/invented breakdown possible.
+- **Candidate**: the stored `oracle_functions.json`, restricted to the truth's
+  own VA range so the two populations are comparable.
+
+```
+  true positives      26,808
+  false positives      7,981
+      split            7,364  (inside a known function)
+      invented           617  (outside every known function)
+  false negatives      7,351
+
+  precision   77.06%    recall 78.48%    F1 77.76%
+```
+
+**Splits are 92% of the error, and invented is 617 — not the 2,905 this
+document claimed.** That number came from a different measurement and does not
+reproduce against the map. Item 1 as originally written was aimed at the small
+half of the problem.
+
+Four things were then checked, because "7,364 splits" has several possible
+causes and they need different fixes:
+
+| Question | Answer |
+|---|---|
+| Are the splits real functions the map simply omits? | **No.** 0 of 7,364 are IDA function starts either, and IDA agrees with the map almost perfectly — of 31,512 IDA starts in range, exactly 1 is not a map start. Both authorities say no function starts there. |
+| Are they tiny stubs, or real bodies? | **Real bodies.** 5,890 of 7,364 decode to more than 20 instructions. |
+| Which scan produces them? | Not the seed scans. 28 come from the `55 8B EC` prologue scan, 362 from the `E8` scan, 547 from the `E9` scan — and **6,427 from none of them.** |
+| So where do they come from? | The fixpoint in `find_functions`, from the branch that promotes a jump landing inside another function's body into a function of its own. |
+
+That branch is deliberate, and its comment says so: a shared epilogue or a
+switch arm reached from elsewhere "has no label in the jumping function, so the
+lifter tail-dispatches to it; make it a real entry point or that dispatch is
+unresolved at runtime."
+
+So the dominant finding is not a recovery defect. **It is a category error in
+the catalog format.** The disassembler knows perfectly well that these are not
+function starts — it creates them precisely because they are *not*, and the
+lifter needs a dispatchable body at an address in the middle of something else.
+It then writes them into the catalog in a field that says "function", and every
+consumer, the scorecard included, has no way to tell the two apart.
+
+Measuring that as 77% precision measures a design decision. The disassembler was
+never claiming a function starts at those 6,427 addresses.
+
+xboxrecomp already draws this distinction — `_build_alias_entries` and
+`_pass_seed_aliases` record such an address as an alias of its containing
+function, with `detection_method="tail_jump_alias"` and `has_prologue=False`,
+bounded by the containing function's end. That is the thing worth taking, and
+it is a field, not a redesign.
+
+### What changed as a result
+
+1. **`entry_kind` on every catalog entry** — `"start"` where we believe a
+   function begins, `"alias"` where we do not and are only making an address
+   dispatchable. Set by the branch that creates them, emitted in the JSON.
+2. **`score_recovery.py` holds aliases out of precision** and reports them on
+   their own line, split by whether they land inside a known function (expected)
+   or outside every one (suspect — a body pointing at nothing). An alias landing
+   exactly on a reference start is counted separately again, because that is a
+   real function demoted, and a demoted start is not reported as found.
+3. **`probes_as_function_body` still lands**, because 617 invented functions are
+   still 617 functions' worth of decoded garbage, and the probe is ~40 lines and
+   carries its own self-test. It is just no longer item 1.
+
+The rest of the queue keeps its order. The lesson is the one this repo keeps
+re-learning: the number a tool reports about itself is not a measurement, and
+the first real measurement usually reorders the work.
 
 ## The port queue
 
@@ -140,7 +219,41 @@ the target, not the exception.
 
 ---
 
-### 1. Candidate validation -- `engine.probes_as_*` · ~120 lines · **do this first**
+### 0. Function start vs. alias entry · ~30 lines · **done**
+
+**Source**: `xboxrecomp/tools/disasm/functions.py` --
+`_build_alias_entries`, `_pass_seed_aliases`, and the `detection_method` field
+carried on every `Function`.
+
+**The defect.** `disasm32.find_functions` promotes a branch landing inside
+another function's body into a function of its own, deliberately: the lifter
+tail-dispatches to that address and needs a body there. It then writes the
+result into the catalog in a field that says "function", identical to a real
+function start. Nothing downstream can tell a genuine start from an address we
+only made dispatchable.
+
+Measured: **6,427 of 7,364 false positives were aliases** -- 87% of the reported
+error, and the disassembler was never claiming a function started there.
+
+**The fix.** `Function.entry_kind`, `"start"` or `"alias"`, set where the
+aliases are created and emitted in the JSON. `score_recovery.py` holds aliases
+out of precision, and reports them separately split by whether they land inside
+a known function (expected) or outside every one (suspect). An alias landing on
+a reference start is counted again on its own line: that is a real function
+demoted, and a demoted start will not be reported as found.
+
+The overlap between an alias body and its containing function stays. That is
+the same trade xboxrecomp makes, and for the same reason its docstring gives:
+the alternative is a stub that returns immediately, silently skipping the
+epilogue and leaking the caller's frame.
+
+**Verify**: precision against the map, with aliases excluded, versus the 77.06%
+baseline. Plus `score_recovery.py --selftest`, which now asserts that an alias
+inside a known function does not touch precision.
+
+---
+
+### 1. Candidate validation -- `engine.probes_as_*` · ~40 lines · **done**
 
 **Source**: `xboxrecomp/tools/disasm/engine.py` -- `probes_as_function_body`,
 `probes_as_prologue`, `probes_as_constant_stub`, `probes_as_vcall_thunk`,
@@ -150,15 +263,20 @@ the target, not the exception.
 every data section for a value in the code range and calls each hit a function.
 Unaligned on purpose -- GTA1's handler table starts at `0x4B4AD1` and an
 aligned-only scan misses it entirely -- but the price is that any four bytes
-that happen to look like a code address become a function. On Trespasser that
-was **2,905 invented function starts**, each one lifting data as code.
+that happen to look like a code address become a function.
 `find_branch_targets` has the same shape: a linear `E8`/`E9` byte scan that
 cannot tell an opcode from the middle of an immediate.
 
-The comment in `find_data_code_pointers` says false positives "just become dead
-functions -- harmless". True for the *build*, false for everything else: it
-poisons the precision number, buries real misses in noise, and spends codegen
-on garbage.
+**Scale, measured rather than assumed.** Against the map this is **617 invented
+function starts**, not the 2,905 an earlier draft of this document claimed --
+that figure came from a different measurement and does not reproduce here. 617
+is still 617 functions' worth of decoded garbage, and the fix is about forty
+lines, so it lands. It is simply not the largest thing wrong.
+
+The comment in `find_data_code_pointers` says "false positives just become dead
+functions -- harmless". That is true for the *build* and false for everything
+else: it poisons the precision number, buries real misses in noise, and spends
+codegen on garbage.
 
 **The fix.** xboxrecomp does not guess harder, it *corroborates*. Before
 accepting a candidate, decode forward from it and require the stream to reach a
@@ -173,8 +291,12 @@ The probe is deliberately *read-only*: it follows instructions the sweep already
 decoded where they exist and decodes the rest without recording them, so running
 it never changes what the sweep produced.
 
-**Verify**: re-score Trespasser. Invented count should fall sharply with recall
-unchanged. If recall moves at all, the probe is too strict.
+**Verify**: re-score Trespasser. The invented count should fall with recall
+unchanged. If recall moves at all, the probe is too strict. The probe also
+prints what it rejected, so its effect is visible without a second full run.
+`disasm32.py --selftest` covers the decision boundaries: a prologue reaching
+`ret` passes, a tail `jmp` passes, undecodable bytes fail, a clean decode that
+runs off the section end without a terminator fails.
 
 ---
 
@@ -427,7 +549,11 @@ each should merge rather than one winning.
 - [x] `disasm32.find_branch_targets` -- E9 tail-call seeding, ported from the
       behaviour in `xboxrecomp/tools/disasm/xrefs.py`. Measured on an 8.8 MB
       binary with a linker map: recovers 6,550 of 7,331 missed functions.
-- [ ] 1. `probes_as_*` candidate validation
+- [x] 0. `entry_kind` -- function start vs. alias entry, with the scorer
+      taught to stop counting a design decision as a defect. 87% of the
+      measured "false positives" were this.
+- [x] 1. `probes_as_*` candidate validation -- `probes_as_function_body`,
+      gating the data-pointer scan, with a self-test.
 - [ ] 2. `resync_jump_tables`
 - [ ] 3. Section-end function bounding
 - [ ] 4. `seed_from_log`
