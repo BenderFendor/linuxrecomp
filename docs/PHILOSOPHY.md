@@ -6,7 +6,7 @@
 
 Not "some applications." Not "simple ones." *Any.* DOS games from 1991. MFC desktop apps from 1996. Triple-A shooters from 2000. Multimedia encyclopedias with proprietary fractal codecs. It doesn't matter how old, how complex, or how proprietary -- if it ran on x86, we can make it run again.
 
-This isn't a theoretical claim. We've done it. Across nine projects spanning 16-bit DOS, Win32, Quake II, GoldSrc, id Tech 3, and completely custom engines, the same fundamental approach works every time.
+This isn't a theoretical claim. We've done it. Across thirty-odd projects spanning 16-bit DOS, Win16 NE, Win32, MFC, Watcom, Borland, Quake-family engines, GoldSrc, id Tech 3 and completely custom engines -- from a 1991 DOS strategy game to a 13 MB MSVC 7.1 C++ RTS from 2006 -- the same fundamental approach works every time. See the table in the [README](../README.md) for the roll call.
 
 ---
 
@@ -181,7 +181,7 @@ The automation handles 80% of the code. The remaining 20% is where the actual re
 
 This is the whole point of this repo. The tools compound:
 
-- `pe_analyze.py` has been refined across 7 projects. It handles edge cases (UPX packing, ordinal imports, non-standard image bases) that we only discovered by hitting them.
+- `pe_analyze.py` has been refined across every project in the table. It handles edge cases -- UPX packing, ordinal imports, non-standard image bases, and Watcom linkers that write `VirtualSize = 0` in every section header -- that we only discovered by hitting them.
 - The 32-bit lifter started in XWA and now handles every x86 instruction we've encountered across all projects.
 - The Win32 compat header from SoF applies to every Win32-era game.
 - The DOS compat layer from Civ applies to every 16-bit DOS game.
@@ -189,6 +189,24 @@ This is the whole point of this repo. The tools compound:
 - The Ghidra scripts from Gunman work on any binary.
 
 **We're building a universal toolkit, one project at a time.**
+
+### 11. A Tool You Have Not Scored Is a Tool You Do Not Know
+
+The most expensive lesson in this repo, and the most recent. The 32-bit
+disassembler ran on a dozen projects, reported its function count every time,
+and nobody checked the count against anything. Then one project had a linker
+map, we scored against it, and the disassembler was missing **7,331 real
+functions** -- tail-called methods that no CALL anywhere in the image named.
+Four lines of fix recovered 6,550 of them.
+
+Every one of those dozen projects had been quietly lifting an incomplete
+catalog and debugging the consequences at runtime, one unresolved indirect call
+at a time, without ever suspecting the disassembler.
+
+The lesson is not "write more tests". It is that a recovery tool reports how
+much it *found*, never how much it *missed*, and the second number is the one
+that matters. Get ground truth -- a linker map, a PDB, IDA -- and score against
+it before you lift. `disasm/score_recovery.py` exists for exactly this.
 
 ---
 
@@ -205,11 +223,18 @@ Is it a 16-bit DOS executable?
   YES -> decode16 -> analyze -> lift16 -> DOS compat runtime
   NO  -> Continue...
 
+Is it a 16-bit NE (Win16 / OS-2)?
+  YES -> ne_parse -> ne_decode -> lift16, plus gen_win16_stubs for the
+         PASCAL purge table. Get the purge counts right or the crash
+         lands in code that is fine.
+  NO  -> Continue...
+
 Is it a 32-bit PE (Win32)?
   YES -> Is it DRM protected?
          YES -> safedisc_dump.py first, then continue
-         NO  -> pe_analyze -> disasm32 -> lift32 -> translator
-  NO  -> Different toolchain needed (see sibling repos for N64/360/PS2)
+         NO  -> pe_analyze -> disasm32 -> SCORE IT -> lift32 -> translator
+  NO  -> Different toolchain needed (see the sibling toolboxes in the
+         README; xboxrecomp is also x86-32 and shares the most)
 
 Is it SDK/engine-based (Quake, GoldSrc, id Tech, Unreal)?
   YES -> Ghidra decompile -> classify against SDK -> reconstruct custom code only
@@ -224,7 +249,12 @@ Is it C++ heavy (vtables, RTTI, templates)?
 
 ## The Proof
 
-Nine projects. Spanning 1991 to 2001. DOS to Win32. 16-bit to 32-bit. Assembly to C++ with virtual inheritance. Single executables to multi-DLL architectures. Custom engines to licensed middleware.
+Thirty-odd projects. Spanning 1991 to 2006. DOS to Win16 to Win32. Microsoft C
+5.x, Borland, Watcom, MSVC 4 through 7.1. Assembly to C++ with virtual
+inheritance. Single executables to multi-DLL architectures. Custom engines to
+licensed middleware. A strategy game, a flight sim, a fractal-codec
+encyclopedia, a virtual pet, and a 13 MB RTS with 25,513 functions reachable
+only through vtables.
 
 **Every single one follows the same pipeline.** The tools are different at the edges, but the core approach -- analyze, disassemble, classify, lift, shim, build, debug -- is universal.
 

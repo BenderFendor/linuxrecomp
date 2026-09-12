@@ -22,7 +22,8 @@ This repo collects every tool, runtime, and hard-won trick from our PC static re
 pcrecomp/
   tools/           Reusable analysis & transformation tools
     pe/            PE analysis (imports, exports, sections, hashes, delay-imports,
-                   protection/DRM detection, recursive binary catalog)
+                   protection/DRM detection, recursive binary catalog,
+                   stdcall_argc.py derives each import's stack purge from the SDK)
     ne/            NE (16-bit New Executable) parse / disasm / call-graph,
                    Win16 import resolution (ordinal -> API name + the PASCAL
                    stack-purge table) and C shim generation
@@ -33,8 +34,9 @@ pcrecomp/
                    splits false positives into "split" vs "invented")
     lift/          Code lifters (x86-32 and x86-16 to readable C; lift32_cpu.py
                    is the reentrant CPU-struct model needed for hybrid builds;
-                   difftest.py runs the lifted C against Unicorn and names
-                   every register, flag and byte the two disagree on)
+                   recover.py finds alternate entry points a catalog missed;
+                   difftest.py / difftest16.py run the lifted C against Unicorn
+                   and name every register, flag and byte the two disagree on)
     classify/      Function classifiers (SDK vs custom, multi-signal, string refs)
     ghidra/        Ghidra headless scripts (decompile, export, stats, xrefs,
                    range disasm, function bounds)
@@ -42,9 +44,11 @@ pcrecomp/
     drm/           DRM analysis (SafeDisc memory dumping, DLL injection)
     assets/        Asset extraction (InstallShield, Wise, PK3/ZIP, BIN/ISO, CAB)
     cpp/           C++ RE helpers (MSVC/MWerks name mangling, vtable parsing)
-    formats/       Format decoders (FIF fractal images, M20/MVB, SPAM, DAT)
+    formats/       Format decoders (FIF fractal images, M20/MVB, SPAM, DAT,
+                   string tables)
   runtime/         Drop-in runtime support for recompiled code
-    recomp32/      32-bit x86 runtime (global registers, memory model, dispatch)
+    recomp32/      32-bit x86 runtime (global registers, memory model, dispatch,
+                   image loader, crash reporter)
     recomp32_cpu/  32-bit x86 runtime, explicit CPU struct (reentrant; pairs
                    with lift32_cpu.py, required for hybrid builds)
     recomp16/      16-bit DOS runtime (CPU state, INT handlers, HAL, SDL2)
@@ -58,38 +62,72 @@ pcrecomp/
 
 ## The Projects That Built This
 
-Every tool here was forged in the fires of an actual recompilation project. These are the PC games and apps we've taken apart so far:
+Every tool here was forged in the fires of an actual recompilation project.
+These are the PC games and apps we've taken apart so far. Statuses are what the
+project's own README claims; the numbers are function counts from its last
+pipeline run.
 
 | Project | What | Era | Engine/Tech | Status |
 |---------|------|-----|-------------|--------|
 | **[civ](https://github.com/sp00nznet/civ)** | Civilization | 1991 | 16-bit DOS / MSC 5.x | Runs! 672 functions, interactive boot/menu, 164K lines |
-| **[dinopark](https://github.com/sp00nznet/dinopark)** | DinoPark Tycoon | 1993 | 16-bit DOS / Borland large model | Boots! Whole game lifted (~90K lines), runs startup→main; renders .PIC screens + .ACT dinosaurs in colour from recompiled code |
+| **[operationneptune](https://github.com/sp00nznet/operationneptune)** | Operation Neptune | 1991 / Win32 1998 | Borland PE32, ships its own linker map | **Plays!** CRT -> WinMain -> opening -> in the submarine |
+| **[skifree](https://github.com/sp00nznet/skifree)** | SkiFree | 1991 | Win16/Win32 (`ski32.exe`) | Playable rebuild from decompiled C, cross-platform + extras |
+| **[dinopark](https://github.com/sp00nznet/dinopark)** | DinoPark Tycoon | 1993 | 16-bit DOS / Borland large model | Boots! Whole game lifted (~90K lines), renders .PIC screens + .ACT dinosaurs in colour |
 | **[elfish](https://github.com/sp00nznet/elfish)** | El-Fish | 1993 | 16-bit NE + TSXLIB extender | Lifted & links - 2,236 functions, 121 segments, startup executes |
 | **[fury3](https://github.com/sp00nznet/fury3)** | Fury³ | 1995 | Terminal Reality voxel engine (Win32/MSVC) | **Playable!** Flies the canyon - 1,945 functions, SDL2+imgui frontend, real joystick |
-| **[hellbender](https://github.com/sp00nznet/hellbender)** | Hellbender | 1996 | Terminal Reality voxel engine (Win32/MSVC) | Bring-up - lifts clean (5,262 functions, 513K lines, 0 errors), 507 import bridges; same toolchain as Fury³ |
-| **[encarta](https://github.com/sp00nznet/encarta)** | Encarta 97 Encyclopedia | 1996 | MFC 4.0 + proprietary | **Runs!** Whole app lifted (7,326 fns); hybrid boundary puts the app body in recompiled code - 10,242 real MFC virtual dispatches land lifted per session, UI and articles on screen |
+| **[catz](https://github.com/sp00nznet/catz-recomp)** | Catz | 1996 | 16-bit NE engine DLL (PF Magic) | Runs! Win32 window, original frame loop, toys and saving work |
+| **[encarta](https://github.com/sp00nznet/encarta)** | Encarta 97 Encyclopedia | 1996 | MFC 4.0 + proprietary | **Runs!** Whole app lifted (7,326 fns); hybrid boundary puts the app body in recompiled code - 10,242 real MFC virtual dispatches land lifted per session |
 | **[gta](https://github.com/sp00nznet/gta)** | Grand Theft Auto | 1997 | DMA "Race'n'Chase" | Builds & runs - 4,094 functions, 444K lines, runtime bringup |
+| **[pod](https://github.com/sp00nznet/pod-recomp)** | POD Gold | 1997 | Ubi Soft MMX software rasteriser | Compiles & links - 3,405 functions, 0 lift errors, 422K lines |
 | **[fallout1-re](https://github.com/sp00nznet/fallout1-re)** | Fallout | 1997 | Custom (Interplay) | Fork - native + HTML5 web port, multiplayer |
 | **[fallout2-re](https://github.com/sp00nznet/fallout2-re)** | Fallout 2 | 1998 | Custom (Interplay) | Fork - decompilation ~complete (alexbatalov upstream) |
 | **[xwa](https://github.com/sp00nznet/xwa)** | X-Wing Alliance | 1999 | Custom (LucasArts) | Active - D3D11 port, concourse UI runs, 2,702 functions |
-| **[recoil](https://github.com/sp00nznet/recoil)** | Recoil | 1999 | Zipper GOS engine | Phase 2 - compiles, 3,490 functions, 321K lines |
-| **[mw3](https://github.com/sp00nznet/mw3)** | MechWarrior 3 | 1999 | Zipper GOS engine | Phase 2 - compiles, 2,805 functions, 159K lines |
 | **[sof](https://github.com/sp00nznet/sof)** | Soldier of Fortune | 2000 | Quake II + GHOUL | Active - SDL2 port, 8 subsystems, full maps render |
 | **[gunman](https://github.com/sp00nznet/gunman)** | Gunman Chronicles | 2000 | GoldSrc (Half-Life) | Phase 2 - 3,990 functions, weapons/entities rebuilt |
 | **[heavymetal](https://github.com/sp00nznet/heavymetal)** | Heavy Metal: FAKK2 | 2000 | id Tech 3 + UberTools | Foundation - 57 source files, core systems scaffolded |
 | **[crimsonskies](https://github.com/sp00nznet/crimsonskies)** | Crimson Skies | 2000 | Zipper GOS engine | Compiles & links - 6,232 functions, 826K lines, runtime bringup |
 | **[bw](https://github.com/sp00nznet/bw)** | Black & White | 2001 | Lionhead custom | Active - all 569 types done, 10 Hz game loop runs |
 
+**Not public yet** -- same toolbox, repos still private, listed because the
+tools here carry their scars: **bolo** (Bolo Adventures III, 1993 -- shipped
+`tools/unpklite.py`, a byte-exact static PKLITE 1.15 decompressor),
+**coaster** (Roller Coaster Construction Set, 1993 -- ~560 functions, boots),
+**bob** (Microsoft Bob, 1995 -- Win16 NE + Jet/WinG, `InitInstance` runs),
+**ejay** (Dance eJay 1+2, 1997 -- plays and draws, 16-bit audio engine behind a
+VB front end), **trespasser** (Jurassic Park: Trespasser, 1998 -- the linker-map
+scorecard that found the E9 seeding bug), **hellbender** (1996 -- 5,262
+functions, 0 lift errors, 507 import bridges), **mw3** (MechWarrior 3, 1999 --
+2,805 functions), **recoil** (1999 -- 3,490 functions), **xvt** (X-Wing vs TIE
+Fighter, 1997), **nocturne** (1999 -- 6,027 functions, Watcom, real window and
+IAT dispatch), **rol** (Rise of Legends, 2006 -- 13.25 MB, the largest binary
+this toolchain has been pointed at).
+
+### Sibling toolboxes
+
+Same idea, different instruction set or platform. They are separate repos, not
+submodules:
+
+- **[xboxrecomp](https://github.com/sp00nznet/xboxrecomp)** -- original Xbox
+  (XBE), and therefore **also x86-32**. It is the closest relative this repo
+  has, and the two have been converging: see
+  [docs/CONSOLIDATION.md](docs/CONSOLIDATION.md) for what has already been
+  ported across and what is queued next.
+- **[macrecomp](https://github.com/sp00nznet/macrecomp)** -- 68k Macintosh,
+  A-trap dispatch and a QuickDraw/Toolbox HAL.
+
 ## Quick Start
 
 ### "I have a mystery .exe and I want to know what's inside"
 
 ```bash
-# What are we dealing with?
-python tools/pe/pe_analyze.py mystery.exe --json > analysis.json
+# What are we dealing with? (prints a summary; --json names the output file)
+python tools/pe/pe_analyze.py mystery.exe --json analysis.json
 
-# What DLLs does it import? (including delay-loaded ones)
+# What DLLs does it import? (including delay-loaded ones). Point
+# extract_imports at the whole install folder to get the shared-API view
+# across every module at once -- those are the shims to write first.
 python tools/pe/extract_imports.py mystery.exe
+python tools/pe/extract_imports.py /path/to/install
 python tools/pe/delay_imports.py mystery.exe
 
 # Is it packed or copy-protected? (SafeDisc/SecuROM/UPX/...)
@@ -111,22 +149,35 @@ analyzeHeadless /path/to/project MyProject -import mystery.exe \
 python -m tools game.exe --all --output src/recomp/gen/
 
 # Or step by step:
-python tools/pe/pe_analyze.py game.exe --json > config/pe_analysis.json
-python tools/disasm/disasm32.py game.exe --output functions.json
-python tools/lift/lift32.py --functions functions.json --output src/
+python tools/pe/pe_analyze.py game.exe --json config/pe_analysis.json
+python tools/disasm/disasm32.py game.exe --output functions.json --pe-json config/pe_analysis.json
+
+# `python -m tools` is tools/lift/translator.py, and that is the only lifter
+# CLI. lift32.py itself is a library: `from lift32 import Lifter`, one
+# `Lifter` per function. Every project past the default pipeline drives it
+# from its own run_lift.py -- that is where per-project relocation handling,
+# import bridging and file splitting belong, not in a flag.
 ```
 
 ### "It's a 16-bit DOS game from 1991"
 
 ```bash
-# Decode the 16-bit instructions
-python tools/disasm/decode16.py GAME.EXE --output decoded.json
+# Disassemble: the whole resident image, one overlay, or a byte range
+python tools/disasm/decode16.py GAME.EXE --resident
+python tools/disasm/decode16.py GAME.EXE --overlay 3
+python tools/disasm/decode16.py GAME.EXE 0x1200 0x400
 
-# Find function boundaries (MSC 5.x patterns)
-python tools/disasm/analyze.py decoded.json --output functions.json
+# Find function boundaries (MSC 5.x patterns) and write the symbol table
+python tools/disasm/analyze.py GAME.EXE -symbols work/symbols.toml
 
-# Lift to C with DOS INT handlers
-python tools/lift/lift16.py functions.json --output RecompiledFuncs/
+# Large model (Borland/MSC): `largemodel16` is a library that extends the
+# analyzer in place -- detect_code_end() clips the DGROUP data blob off the
+# code, build_call_graph() resolves the far calls analyze.py leaves dangling.
+#   from largemodel16 import detect_code_end, build_call_graph
+#
+# Lifting is a library too, same as the 32-bit side: `from lift16 import Lifter`.
+# Copy a project's driver to start -- dinopark/tools/lift_full.py (DOS MZ,
+# large model) or elfish/tools/ne_lift.py (NE, segmented).
 ```
 
 ### "Did the lifter get the semantics right?"
@@ -203,7 +254,8 @@ resolve to `MODULE_OrdN` and the purge lookups all miss.
 python tools/pe/analyze_sections.py game.exe
 
 # Dump decrypted code from a running process (Steam/CD version)
-python tools/drm/safedisc_dump.py --exe game.exe --output decrypted.exe
+python tools/drm/safedisc_dump.py game.exe decrypted.exe
+python tools/drm/safedisc_dump.py --pid 1234 game.exe decrypted.exe
 ```
 
 ### "It's a Wise installer and I want the files out"
@@ -236,18 +288,23 @@ python tools/ne/ne_decode.py GAME.EXE --ida-json code_map.json
 ## Requirements
 
 **Python 3.10+** with:
-- `capstone` - disassembly engine
-- `pefile` - PE parsing (optional, has pure-struct fallback)
-- `lief` - advanced binary analysis (optional)
+- `capstone` - disassembly engine. Required.
+- `pefile` - PE parsing. Optional; there is a pure-struct fallback.
+- `lief` - advanced binary analysis. Optional.
+- `unicorn` - the reference x86 that `lift/difftest.py` checks the lifted C
+  against. Only needed to run the differential tests.
 
 **For Ghidra scripts:** Ghidra 11.0+
+
+**For IDA scripts:** IDA 7.4+ with its bundled Python (`ida_funcs.py` and
+`ida_export.py` run headless under `idat -A -S`).
 
 **For format tools:** C compiler (MSVC or GCC)
 
 **For runtime:** CMake 3.20+, Visual Studio 2022 or compatible
 
 ```bash
-pip install capstone pefile lief
+pip install capstone pefile lief unicorn
 ```
 
 ## Starting a New Project
@@ -255,19 +312,28 @@ pip install capstone pefile lief
 1. Copy `templates/CMakeLists.txt.template` and `templates/.gitignore.template`
 2. Run `pe_analyze.py` on your target binary
 3. Pick your pipeline:
-   - **32-bit PE**: `disasm32` -> `lift32` -> `translator` (fully automated)
+   - **32-bit PE**: `python -m tools game.exe --all` (`disasm32` -> `lift32`,
+     driven by `lift/translator.py`). Write your own `run_lift.py` when the
+     defaults stop fitting.
    - **16-bit DOS**: `decode16` -> `analyze` -> `lift16` (with DOS compat runtime)
    - **16-bit Windows/OS-2 (NE)**: `ne/ne_parse` -> `ne/ne_decode` -> `lift16` (see `tools/ne/README.md`)
    - **GoldSrc/SDK game**: `DecompileAll.java` -> `combined_classify.py` (SDK separation)
    - **C++ heavy**: `GhidraStats.java` + `msvc_mangler.py` + `parse_vtables.js`
-4. Drop in the appropriate `runtime/` files
-5. Build with CMake, fix, repeat
+4. **Score the recovery before you lift it.** `disasm/score_recovery.py`
+   against a linker map, a PDB or IDA. Lifting a catalog you have not scored
+   means finding its gaps at runtime, 30,000 calls deep, instead of now.
+5. Drop in the appropriate `runtime/` files
+6. Build with CMake, fix, repeat
 
-See [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md) for the full approach,
-[docs/PIPELINE.md](docs/PIPELINE.md) for detailed pipeline docs, and
-[docs/HYBRID.md](docs/HYBRID.md) for running lifted code *inside* a real
-program - the lifted/real boundary, its three non-obvious correctness rules,
-and how to bisect a hybrid build when it breaks 30,000 calls deep.
+### Where the docs are
+
+| Doc | What it covers |
+|-----|----------------|
+| [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md) | Why static recompilation, and the approach end to end |
+| [docs/PIPELINE.md](docs/PIPELINE.md) | Each phase, which tool, what it emits |
+| [docs/HYBRID.md](docs/HYBRID.md) | Running lifted code *inside* a real program - the lifted/real boundary, its three non-obvious correctness rules, and how to bisect a hybrid build when it breaks 30,000 calls deep |
+| [docs/PROJECTS.md](docs/PROJECTS.md) | Which project contributed which tool, and why it exists |
+| [docs/CONSOLIDATION.md](docs/CONSOLIDATION.md) | What pcrecomp and [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) should share, what has been ported, what is queued |
 
 ## Philosophy (the short version)
 

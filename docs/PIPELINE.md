@@ -42,13 +42,23 @@ Detailed documentation of each phase, what tools to use, and what to expect.
 **Tool**: `tools/disasm/disasm32.py`
 
 Uses Capstone disassembly engine with recursive descent:
-1. Find entry point and all call targets (`E8 xx xx xx xx` pattern)
+1. Seed from the entry point and every direct `rel32` branch target -- both
+   `call` (`E8`) **and `jmp` (`E9`)**. The `jmp` half is not optional: an
+   optimising compiler turns `call f; ret` into `jmp f`, and a method that is
+   only ever tail-called is named by no CALL anywhere in the image. Measured
+   against a linker map, seeding `E8` alone missed 7,331 real functions.
 2. Detect function prologues (`push ebp; mov ebp, esp` = `55 8B EC`)
-3. Recursive descent from each entry point
-4. Build basic blocks with successor addresses
-5. Group blocks into functions
+3. Recursive descent from each entry point, to a fixpoint -- newly decoded code
+   yields new branch targets, which yield more code
+4. Scan non-code sections for function pointers that exist only in data
+   (vtables, callback tables, handler arrays). Unaligned on purpose; packed
+   struct arrays put them at odd addresses
+5. Build basic blocks with successor addresses, group blocks into functions
 
 **Output**: JSON with all discovered functions, their addresses, instruction counts, and basic block structure.
+
+**Then score it.** See Phase 1b -- a catalog nobody scored is a catalog nobody
+knows the shape of.
 
 ### 16-bit (MZ / DOS)
 
@@ -57,6 +67,12 @@ Uses Capstone disassembly engine with recursive descent:
 Two-step process because 16-bit code has complications:
 1. **decode16.py** -- Table-driven 8086/80186 decoder. Handles segment:offset addressing, overlay modules (INT 3Fh), and all MSC 5.x code generation patterns.
 2. **analyze.py** -- Function boundary detection using MSC prologue/epilogue patterns, near/far call resolution, overlay segment mapping.
+3. **largemodel16.py** (Borland/large model only, a library rather than a
+   CLI) -- `detect_code_end()` finds where prologue-driven code stops and the
+   DGROUP initialized-data segment begins, which `analyze.py` otherwise decodes
+   as one bogus multi-KB function; `build_call_graph()` resolves the far calls
+   (`9A seg:off`) that `analyze.py` records as unconnected tuples, turning a
+   graph with hundreds of false roots into a usable one.
 
 **Output**: Symbol table (TOML) + decoded instruction stream.
 
@@ -84,6 +100,40 @@ functions for differential testing.
 
 ---
 
+## Phase 1b: Score the recovery
+
+**Goal**: find out how wrong the catalog is *before* lifting 400,000 lines from it.
+
+**Tool**: `tools/disasm/score_recovery.py`
+
+```bash
+python tools/disasm/score_recovery.py --reference ida_funcs.json                                       --candidate functions.json
+```
+
+Recursive descent reports how many functions it found. It cannot report how
+many of them are real. Scoring against a reference -- a linker map, a PDB
+export, or IDA -- gives precision and recall on function *start addresses*, and
+splits the false positives into the two defects that both read as "false
+positive" but need opposite fixes:
+
+| Kind | Means | Costs you |
+|------|-------|-----------|
+| **split** | The address lands *inside* a function the reference knows | One function entered twice; duplicated code in the lift |
+| **invented** | The address lands outside every known function | Data decoded as code; lifts to garbage |
+
+Telling them apart needs function *ranges*, so a reference that carries end
+addresses (IDA, a PDB) gets the better breakdown. Get one from IDA headless in
+about a minute with `tools/ida/ida_funcs.py`.
+
+**A reference is only ground truth if it came from symbols.** Otherwise it is a
+second opinion, and a disagreement means one of the two is wrong -- go look at
+which before quoting the number.
+
+This phase is new, and it exists because it was skipped for years. The first
+time anyone ran it, it found the disassembler missing 7,331 functions.
+
+---
+
 ## Phase 2: Classification
 
 **Goal**: Separate code you need to reverse-engineer from code you can get from public sources.
@@ -102,6 +152,9 @@ functions for differential testing.
 4. **Address clustering**: Functions from the same source file are compiled adjacent in the binary
 
 ### Typical Results
+
+A snapshot from three projects, to show the *shape* rather than to be current.
+Live counts are in the [README table](../README.md#the-projects-that-built-this).
 
 | Project | Total Functions | SDK/Library | Custom | Unknown |
 |---------|----------------|-------------|--------|---------|
@@ -256,22 +309,30 @@ The output is a standard native executable that runs on modern Windows (or Linux
 | Task | Tool | Input | Output |
 |------|------|-------|--------|
 | PE analysis | `pe/pe_analyze.py` | `.exe`/`.dll` | JSON metadata |
-| Import extraction | `pe/extract_imports.py` | `.exe`/`.dll` | Import table text |
+| Import extraction | `pe/extract_imports.py` | `.exe`/`.dll`, or an install dir | Per-module imports + shared-API summary |
 | Delay imports | `pe/delay_imports.py` | `.exe`/`.dll` | Delay-load import list |
 | Section/DRM analysis | `pe/analyze_sections.py` | `.exe`/`.dll` | Entropy + protection report |
 | Binary catalog | `pe/catalog.py` | Install dir | Per-PE catalog (text/JSON) |
+| stdcall stack purge | `pe/stdcall_argc.py` | Import names + SDK headers | Bytes each import pops (library) |
 | NE parse | `ne/ne_parse.py` | NE binary | Segments/relocs/imports |
 | NE disassembly | `ne/ne_decode.py` | NE binary | Annotated disasm |
 | NE call graph | `ne/ne_xref.py` | NE binary | Segment graph / clusters |
+| Win16 import shims | `ne/gen_win16_stubs.py` | NE binary + purge table | Prototypes + purging stubs |
 | 32-bit disassembly | `disasm/disasm32.py` | PE binary | Function JSON |
 | 16-bit decoding | `disasm/decode16.py` | MZ binary | Instruction stream |
-| 16-bit analysis | `disasm/analyze.py` | Instruction stream | Symbol table |
+| 16-bit analysis | `disasm/analyze.py` | MZ binary | Symbol table (TOML) |
+| Large-model completion | `disasm/largemodel16.py` | An `analyze.py` analyzer | Far-call graph + code/data boundary (**library**) |
+| Score a catalog | `disasm/score_recovery.py` | Reference + candidate JSON | Precision/recall, split vs invented |
 | x87 FPU decode | `disasm/fpu_decode.py` | ESC opcode + ModR/M | FPU mnemonic (library) |
 | Call-graph scan | `disasm/callgraph.py` | PE (+bounds CSV) | Callers/callees/leaves |
-| 32-bit lifting | `lift/lift32.py` | Function JSON | C source files |
-| 16-bit lifting | `lift/lift16.py` | Symbol table | C source files |
-| Full pipeline | `lift/translator.py` | PE binary | Complete C project |
+| 32-bit lifting | `lift/lift32.py` | Function JSON | C source (**library**: `from lift32 import Lifter`) |
+| 32-bit lifting, CPU struct | `lift/lift32_cpu.py` | Function JSON | Reentrant C for hybrid builds (**library**) |
+| 16-bit lifting | `lift/lift16.py` | Symbol table | C source (**library**: `from lift16 import Lifter`) |
+| Full pipeline | `lift/translator.py` (`python -m tools`) | PE binary | Complete C project |
 | Fast generation | `lift/generate.py` | PE binary | C source (linear sweep) |
+| Missed entry points | `lift/recover.py` | Catalog + binary | Alternate entries, thunk chains |
+| Differential test (32) | `lift/difftest.py` | -- | Lifted C vs Unicorn, field by field |
+| Differential test (16) | `lift/difftest16.py` | Raw/NE bytes | Lifted C vs Unicorn, field by field |
 | Basic classify | `classify/classify_functions.py` | Function list + SDK | Classification |
 | Multi-signal classify | `classify/combined_classify.py` | Decompiled C + SDK | Classification |
 | String analysis | `classify/deep_classify.py` | Decompiled C | String-based classification |
@@ -285,6 +346,8 @@ The output is a standard native executable that runs on modern Windows (or Linux
 | Function bounds CSV | `ghidra/DumpBounds.java` | Any binary | `start,end` CSV |
 | IDA code-map export | `ida/ida_export.py` | Any binary (in IDA) | Code map JSON |
 | IDA segment probe | `ida/ida_probe_segs.py` | Any binary (in IDA) | Segment layout |
+| IDA function ranges | `ida/ida_funcs.py` | Any binary (in IDA) | Reference catalog for scoring |
+| IDA xrefs | `ida/ida_xrefs.py` | Addresses (in IDA) | Caller/writer sites |
 | SafeDisc dump | `drm/safedisc_dump.py` | Protected PE | Clean PE |
 | DLL injection | `drm/inject_and_run.c` | DRM'd process | Memory dump |
 | Wise installer extract | `assets/extract_wise.py` | Wise setup `.exe` | Script + file list |
@@ -296,3 +359,12 @@ The output is a standard native executable that runs on modern Windows (or Linux
 | Cross-platform mangle | `cpp/cross_mangler.py` | Mac mangled names | MSVC mangled names |
 | Mac demangling | `cpp/mac_unmangler.py` | Mangled names | Readable names |
 | Vtable parsing | `cpp/parse_vtables.js` | Assembly vtables | Structured vtable data |
+| FIF fractal images | `formats/fifdecode/` | `.fif` | Decoded bitmap |
+| Fractal transform tables | `formats/ftcdecode/` | `.ftc` | Decoded tables |
+| MM Viewer 2.0 containers | `formats/m20dump/` | `.m20`/`.mvb` | Extracted members |
+| SPAM multimedia | `formats/spamdump/` | SPAM blobs | Extracted members |
+| Encarta DAT | `formats/datdump/` | `.dat` | Records |
+| String tables | `formats/strdump/` | Binary | Strings |
+| 16-bit CPU self-test | `runtime/recomp16/cpu_selftest.c` | -- | Flag/BCD checks vs hardware values |
+| MMX self-test | `runtime/recomp32/mmx_selftest.c` | -- | MMX model checks |
+| 32-bit CPU-struct self-test | `runtime/recomp32_cpu/cpu_selftest.c` | -- | Reentrant model checks |
