@@ -16,6 +16,12 @@ COND_JUMPS = {
     'je', 'jne', 'jz', 'jnz', 'ja', 'jae', 'jb', 'jbe',
     'jg', 'jge', 'jl', 'jle', 'js', 'jns', 'jo', 'jno',
     'jp', 'jnp', 'jcxz', 'jecxz',
+    # loop/loope/loopne are conditional branches with a fallthrough, and the
+    # lifter emits them as `if (--ecx) goto L_target`. Leaving them out here
+    # does not lose the jump -- it loses the LABEL, because block leaders only
+    # come from this set, and a `loop` back into the middle of its own block
+    # then compiles to a goto with nothing to go to.
+    'loop', 'loope', 'loopz', 'loopne', 'loopnz',
 }
 
 # Unconditional jump
@@ -206,7 +212,16 @@ class Disassembler:
 
         # The decode stopped short of the window: a byte that is not an
         # instruction, which is the signature of data read as code.
-        if end < va + size:
+        #
+        # Except at the very end, where the window itself truncates the last
+        # instruction and capstone stops for a reason that has nothing to do
+        # with the bytes. An x86 instruction is at most 15 bytes, so anything
+        # stopping inside that much of the end ran out of window rather than
+        # out of code. Without this a function longer than the window is
+        # rejected for being long: Trespasser 0x005D4DE0 decodes 1,031
+        # instructions, consumes 4,092 of 4,096 bytes, and needs 5 more for
+        # the call it stopped on.
+        if end < va + size - 15:
             return False
         # It consumed everything we gave it. Clean for a full window is a pass;
         # clean right up to the section end without a terminator is not.
@@ -525,10 +540,17 @@ class Disassembler:
                   f"rejected {rejected} that do not decode as code")
         return found
 
-    def find_functions(self, code_start: int, code_end: int, iat_map: dict = None) -> dict:
+    def find_functions(self, code_start: int, code_end: int, iat_map: dict = None,
+                       seeds=()) -> dict:
         """
         Find all functions in the code section.
         Uses call target analysis + common prologue patterns.
+
+        `seeds` are addresses that are functions whether or not anything here
+        recognises them -- the PE entry point above all. Nothing calls it, and
+        a CRT startup does not have to open with `push ebp; mov ebp, esp`, so
+        both heuristics can miss the one function the program begins with.
+
         Returns dict of addr -> Function.
         """
         print(f"[*] Scanning for call targets in 0x{code_start:08X}-0x{code_end:08X}...")
@@ -550,7 +572,7 @@ class Disassembler:
         print(f"[*] Found {len(prologue_targets)} prologue patterns")
 
         # Merge targets
-        all_targets = call_targets | prologue_targets
+        all_targets = call_targets | prologue_targets | set(seeds)
         # Filter to code range
         all_targets = {t for t in all_targets if code_start <= t < code_end}
         print(f"[*] Total unique function candidates: {len(all_targets)}")
@@ -759,6 +781,16 @@ def demo():
     assert d.probes_as_function_body(BASE + 0x1100, window=16), \
         "a full clean window counts as corroboration"
 
+    # A window that cuts its own last instruction in half stopped for a reason
+    # that has nothing to do with the bytes, and must not read as a reject.
+    # Here 6 bytes hold the 4-byte mov and only 2 of the 5-byte jmp after it.
+    # Getting this wrong rejects every function longer than the window: measured
+    # against Trespasser's linker map it cost exactly one real function start
+    # out of 34,159, which is the kind of defect that hides forever unless
+    # something is scoring against symbols.
+    assert d.probes_as_function_body(a_tail, window=6), \
+        "out of window is not out of code"
+
     print("disasm32.py self-test OK")
 
 
@@ -782,6 +814,16 @@ def main(argv=None):
     ap.add_argument("--min-size", type=int, default=0,
                     help="Drop recovered functions smaller than N bytes from the catalog")
     args = ap.parse_args(argv)
+
+    # This pass takes hours on a multi-megabyte image and prints its progress as
+    # it goes. Redirected to a file or a pipe, stdout is block-buffered, so none
+    # of that progress is visible -- and if the run dies partway (a 2.4 MB image
+    # peaks past 4 GB), the buffer dies with it and the log is zero bytes. Ask
+    # for line buffering so the progress is worth having.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, OSError):
+        pass
 
     if args.selftest:
         demo()
