@@ -131,6 +131,29 @@ class EndOfSegment(IndexError):
     Subclasses IndexError so the existing `except IndexError` recovery paths --
     which turn a truncated instruction into a `db` byte -- keep working."""
 
+# Does a near call/jmp target wrap inside a 64K segment?
+#
+# On the hardware it always does: the target is (IP + rel) & 0xFFFF. That is
+# right whenever `base_offset` is a segment base, so `pos` is the segment
+# offset -- which is how every 32-bit and NE project here drives the decoder.
+#
+# A project that decodes a *slice* of a flat image (civ hands us one function
+# at a time, base_offset = its file offset) has a `pos` that is relative to
+# that slice, and a backwards call produces a small NEGATIVE target which the
+# lifter then adds to the function's start. Masking that to 16 bits turns it
+# into 0xFFFx and lands the call 0x10000 too high -- silently, on a real
+# function that happens to exist up there. Those projects set this False once:
+#
+#     import decode16
+#     decode16.WRAP_NEAR_TARGETS = False
+WRAP_NEAR_TARGETS = True
+
+
+def _near(target: int) -> int:
+    """A relative branch target, wrapped inside its segment or not."""
+    return (target & 0xFFFF) if WRAP_NEAR_TARGETS else target
+
+
 class Decoder:
     """16-bit x86 instruction decoder."""
 
@@ -425,7 +448,7 @@ class Decoder:
                         'js','jns','jp','jnp','jl','jge','jle','jg']
             inst.mnemonic = CC_NAMES[opcode - 0x70]
             rel = self._s8()
-            target = (self.pos + rel) & 0xFFFF
+            target = _near(self.pos + rel)
             inst.op1 = Operand(type=OpType.REL8, disp=target, size=2)
 
         # Group 1: ALU r/m, imm
@@ -710,19 +733,19 @@ class Decoder:
         elif opcode == 0xE0:
             inst.mnemonic = 'loopnz'
             rel = self._s8()
-            inst.op1 = Operand(type=OpType.REL8, disp=(self.pos + rel) & 0xFFFF, size=2)
+            inst.op1 = Operand(type=OpType.REL8, disp=_near(self.pos + rel), size=2)
         elif opcode == 0xE1:
             inst.mnemonic = 'loopz'
             rel = self._s8()
-            inst.op1 = Operand(type=OpType.REL8, disp=(self.pos + rel) & 0xFFFF, size=2)
+            inst.op1 = Operand(type=OpType.REL8, disp=_near(self.pos + rel), size=2)
         elif opcode == 0xE2:
             inst.mnemonic = 'loop'
             rel = self._s8()
-            inst.op1 = Operand(type=OpType.REL8, disp=(self.pos + rel) & 0xFFFF, size=2)
+            inst.op1 = Operand(type=OpType.REL8, disp=_near(self.pos + rel), size=2)
         elif opcode == 0xE3:
             inst.mnemonic = 'jcxz'
             rel = self._s8()
-            inst.op1 = Operand(type=OpType.REL8, disp=(self.pos + rel) & 0xFFFF, size=2)
+            inst.op1 = Operand(type=OpType.REL8, disp=_near(self.pos + rel), size=2)
 
         # IN AL/AX, imm8
         elif opcode == 0xE4:
@@ -747,14 +770,14 @@ class Decoder:
         # CALL rel16
         elif opcode == 0xE8:
             rel = self._s16()
-            target = (self.pos + rel) & 0xFFFF
+            target = _near(self.pos + rel)
             inst.mnemonic = 'call'
             inst.op1 = Operand(type=OpType.REL16, disp=target, size=2)
 
         # JMP rel16
         elif opcode == 0xE9:
             rel = self._s16()
-            target = (self.pos + rel) & 0xFFFF
+            target = _near(self.pos + rel)
             inst.mnemonic = 'jmp'
             inst.op1 = Operand(type=OpType.REL16, disp=target, size=2)
 
@@ -768,7 +791,7 @@ class Decoder:
         # JMP rel8
         elif opcode == 0xEB:
             rel = self._s8()
-            target = (self.pos + rel) & 0xFFFF
+            target = _near(self.pos + rel)
             inst.mnemonic = 'jmp'
             inst.op1 = Operand(type=OpType.REL8, disp=target, size=2)
 
@@ -845,7 +868,7 @@ class Decoder:
             if 0x80 <= op2b <= 0x8F:          # Jcc near rel16
                 inst.mnemonic = 'j' + CC[op2b - 0x80]
                 rel = self._s16()
-                inst.op1 = Operand(type=OpType.REL16, disp=(self.pos + rel) & 0xFFFF, size=2)
+                inst.op1 = Operand(type=OpType.REL16, disp=_near(self.pos + rel), size=2)
             elif 0x90 <= op2b <= 0x9F:        # SETcc r/m8
                 _, rm, _ = self._decode_modrm(False, seg_override)
                 inst.mnemonic = 'set' + CC[op2b - 0x90]
