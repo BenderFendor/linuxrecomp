@@ -176,6 +176,30 @@ static inline uint32_t _pop32(uint32_t* sp) {
  * so it picks up the GCC statement-expr / MSVC inline-function variant above. */
 #define POP32(sp, dest) do { (dest) = POP32_VAL(sp); } while(0)
 
+/*
+ * The 16-bit forms. `push bp` / `pop bp` (66 55 / 66 5D) move esp by TWO, and
+ * the pop writes only BP -- the top half of EBP is untouched.
+ *
+ * Lifting them as their 32-bit cousins looks harmless while a push and a pop
+ * are paired, because the stack still balances. The register does not: a
+ * 32-bit pop into ebp replaces the whole of it with the zero-extended word, so
+ * `push bp ... pop bp ... leave` came back with ebp = 0x0000FD48 instead of
+ * 0x022AFD48, handed that to esp, and the next stack read was at 64 KB. This
+ * game's sprite code is full of 16-bit register traffic; that is where it bit.
+ */
+#define PUSH16(sp, val) do { \
+    uint16_t _pv = (uint16_t)(val); \
+    (sp) -= 2; \
+    MEM16(sp) = _pv; \
+} while(0)
+
+static inline uint16_t _pop16(uint32_t *sp) {
+    uint16_t v = MEM16(*sp);
+    *sp += 2;
+    return v;
+}
+#define POP16_VAL(sp) _pop16(&(sp))
+
 #define PUSHAD() do { \
     uint32_t _tmp_esp = esp; \
     PUSH32(esp, eax); PUSH32(esp, ecx); PUSH32(esp, edx); PUSH32(esp, ebx); \
@@ -454,6 +478,28 @@ static inline uint32_t recomp_flags_sbb(uint32_t a, uint32_t b, uint32_t c) {
                              c ? (a <= b) : (a < b),
                              ((a ^ b ^ r) >> 4) & 1u,
                              ((a ^ b) & (a ^ r)) >> 31);
+}
+
+/*
+ * A rotate writes CF and leaves ZF, SF and OF alone.
+ *
+ * The lazy flag triple cannot say that: it holds one instruction's operands, so
+ * publishing the rotate's carry through it would have to throw away the compare
+ * that set ZF, and NOT publishing it leaves a following `jae`/`jb` reading the
+ * carry of whatever came before. The RLE sprite decoder in Gizmos & Gadgets
+ * does exactly this -- `sub bx,cx; rcr cl,1; rep movsw; jae` -- where the jae
+ * is asking whether the count was odd, and answering it with the sub's borrow
+ * ran the decoder off the end of both the sprite and the framebuffer.
+ *
+ * So a rotate freezes the flags into a word, the same escape hatch ADC and
+ * POPFD use, and overwrites just the carry.
+ *
+ * OF is carried over rather than recomputed: x86 only defines it for a rotate
+ * of exactly 1, and no compiler emits a branch on it.
+ */
+static inline uint32_t recomp_eflags_setcf(uint32_t kind, uint32_t a, uint32_t b,
+                                           uint32_t cf, int df) {
+    return (recomp_eflags(kind, a, b, cf, df) & ~1u) | (cf & 1u);
 }
 
 /* ============================================================

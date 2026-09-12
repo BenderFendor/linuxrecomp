@@ -535,18 +535,31 @@ class Lifter:
                 lines.append(f"{self._fmt_write(ops[0], f'BSWAP32({r})')}; {comment}")
 
         # --- Stack Operations ---
+        #
+        # Width matters. `push bp` / `pop bp` (66 55 / 66 5D) move esp by two,
+        # and the pop writes BP only -- EBP keeps its top half. Lifting them as
+        # the 32-bit forms balances the stack, so it looks fine, and then the
+        # pop replaces the whole of ebp with a zero-extended word. A `leave`
+        # after that hands the truncated value to esp and the next stack access
+        # is down at 64 KB.
         elif m == 'push':
             if len(ops) == 1:
                 val = self._fmt_read(ops[0])
-                lines.append(f"PUSH32(esp, {val}); {comment}")
+                macro = 'PUSH16' if op_bits(ops[0]) == 16 else 'PUSH32'
+                lines.append(f"{macro}(esp, {val}); {comment}")
 
         elif m == 'pop':
             if len(ops) == 1:
-                lines.append(f"POP32(esp, {self._fmt_read(ops[0])}); {comment}")
-                # For pop to register, need assignment form
-                if ops[0].type == X86_OP_REG:
-                    r = reg_name(ops[0].reg)
-                    lines[-1] = f"{r} = POP32_VAL(esp); {comment}"
+                if op_bits(ops[0]) == 16:
+                    # _fmt_write keeps a 16-bit destination's upper half, for a
+                    # register (SET_LO16) and for memory (MEM16) alike.
+                    lines.append(f"{self._fmt_write(ops[0], 'POP16_VAL(esp)')}; {comment}")
+                else:
+                    lines.append(f"POP32(esp, {self._fmt_read(ops[0])}); {comment}")
+                    # For pop to register, need assignment form
+                    if ops[0].type == X86_OP_REG:
+                        r = reg_name(ops[0].reg)
+                        lines[-1] = f"{r} = POP32_VAL(esp); {comment}"
 
         elif m in ('pushad', 'pushal'):   # Capstone spells PUSHAD as 'pushal' in 32-bit
             lines.append(f"PUSHAD(); {comment}")
@@ -756,34 +769,49 @@ class Lifter:
                 lines.append(f"{self._fmt_write(ops[0], expr)};")
                 self._flag_state = ('or', "_flag_a, _flag_b")
 
-        elif m == 'rol':
+        # rol/ror/rcl/rcr: one emitter, because they share both of the things
+        # that were wrong with them.
+        #
+        # They were hard-coded 32-bit: ROL32 on an 8-bit operand rotates bits in
+        # from three bytes that are not part of it, and `rcr cl,1` fed the carry
+        # in at bit 31, where the write back to CL then dropped it.
+        #
+        # And they published nothing. A rotate writes CF; the lazy flag triple
+        # holds the PREVIOUS instruction's operands, so a following `jae`/`jb`
+        # was reading that instruction's carry instead. `sub bx,cx; rcr cl,1;
+        # rep movsw; jae` -- the jae asking "was the count odd?" -- is how the
+        # Gizmos & Gadgets sprite decoder says it, and it ran off the end of the
+        # sprite when the answer came from the sub.
+        elif m in ('rol', 'ror', 'rcl', 'rcr'):
             if len(ops) == 2:
-                a = self._fmt_read(ops[0])
-                b = self._fmt_read(ops[1])
-                lines.append(f"{self._fmt_write(ops[0], f'ROL32({a}, {b})')}; {comment}")
-
-        elif m == 'ror':
-            if len(ops) == 2:
-                a = self._fmt_read(ops[0])
-                b = self._fmt_read(ops[1])
-                lines.append(f"{self._fmt_write(ops[0], f'ROR32({a}, {b})')}; {comment}")
-
-        # rcr/rcl: rotate-through-carry (33-bit rotate of CF:operand). The clip-intersection
-        # forms its 64-bit lerp dividend with `sar edx,1; rcr eax,1`; without rcr the carry
-        # bit was dropped -> garbage clip vertices -> the flight rasterizer hung on huge spans.
-        elif m == 'rcr':
-            if len(ops) == 2:
-                a = self._fmt_read(ops[0]); b = self._fmt_read(ops[1])
+                a  = self._fmt_read(ops[0])
+                b  = self._fmt_read(ops[1])
+                w  = op_bits(ops[0])
                 wr = self._fmt_write(ops[0], '_rv')
-                lines.append(f"{{ uint32_t _rv = {a}, _rn = ({b}) & 31; for (uint32_t _i=0;_i<_rn;_i++){{ "
-                             f"uint32_t _rb = _rv & 1u; _rv = (_rv >> 1) | (_cf << 31); _cf = _rb; }} {wr}; }} {comment}")
-
-        elif m == 'rcl':
-            if len(ops) == 2:
-                a = self._fmt_read(ops[0]); b = self._fmt_read(ops[1])
-                wr = self._fmt_write(ops[0], '_rv')
-                lines.append(f"{{ uint32_t _rv = {a}, _rn = ({b}) & 31; for (uint32_t _i=0;_i<_rn;_i++){{ "
-                             f"uint32_t _rb = _rv >> 31; _rv = (_rv << 1) | _cf; _cf = _rb; }} {wr}; }} {comment}")
+                mask = '0xFFFFFFFFu' if w == 32 else f'{(1 << w) - 1}u'
+                # Through-carry rotates are w+1 bits wide (the carry is the
+                # extra bit); the plain ones are w.
+                modulo = w + 1 if m in ('rcl', 'rcr') else w
+                if m == 'rcr':
+                    step = (f"uint32_t _rb = _rv & 1u; "
+                            f"_rv = ((_rv >> 1) | (_cf << {w - 1})) & {mask}; _cf = _rb;")
+                elif m == 'rcl':
+                    step = (f"uint32_t _rb = (_rv >> {w - 1}) & 1u; "
+                            f"_rv = ((_rv << 1) | _cf) & {mask}; _cf = _rb;")
+                elif m == 'ror':
+                    step = (f"uint32_t _rb = _rv & 1u; "
+                            f"_rv = ((_rv >> 1) | (_rb << {w - 1})) & {mask}; _cf = _rb;")
+                else:  # rol
+                    step = (f"uint32_t _rb = (_rv >> {w - 1}) & 1u; "
+                            f"_rv = ((_rv << 1) | _rb) & {mask}; _cf = _rb;")
+                lines.append(f"{{ uint32_t _rv = ({a}) & {mask}, _rn = (({b}) & 31) % {modulo}u; "
+                             f"for (uint32_t _i=0;_i<_rn;_i++){{ {step} }} "
+                             f"if (_rn) {{ _flag_a = recomp_eflags_setcf(_flag_k, _flag_a, _flag_b, _cf, _df); "
+                             f"_flag_b = 0; _flag_k = FK_EFLAGS; }} {wr}; }} {comment}")
+                # Not a compile-time kind: a rotate of zero leaves the previous
+                # instruction's flags standing, so the following jcc has to read
+                # _flag_k at runtime rather than be told what it is here.
+                self._flag_state = None
 
         # --- Compare / Test (flag setters only, no writeback) ---
         elif m == 'cmp':

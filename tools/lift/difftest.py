@@ -166,6 +166,47 @@ CASES = [
          {'eax': 0x80, 'ebx': 0x01}, known=WIDTH),
     Case('add.16bit-carry', bytes.fromhex('6601c8'),              # add ax, cx
          {'eax': 0xFFFF, 'ecx': 2}, known=WIDTH),
+
+    # --- rotates: the right width, and the carry they actually write ---
+    #
+    # All four were lifted as 32-bit whatever the operand width, so `rcr cl,1`
+    # fed the carry in at bit 31 where the write back to CL then dropped it.
+    # And they published no flags at all, so a following carry-conditional read
+    # the PREVIOUS instruction's carry. Gizmos & Gadgets' RLE sprite decoder is
+    # `sub bx,cx; rcr cl,1; rep movsw; jae` -- the jae asking "was the count
+    # odd?" -- and answering it with the subtract's borrow ran the decoder off
+    # the end of both the sprite and the framebuffer.
+    Case('rcr.8bit.carry-in', bytes.fromhex('f9d0d9'),            # stc; rcr cl, 1
+         {'ecx': 0xAAAAAA0A}, undef=('OF',)),
+    Case('rcr.8bit.carry-out', bytes.fromhex('f8d0d9'),           # clc; rcr cl, 1
+         {'ecx': 0xAAAAAA0B}, undef=('OF',)),
+    Case('rcl.8bit', bytes.fromhex('f9d0d1'),                     # stc; rcl cl, 1
+         {'ecx': 0xAAAAAA81}, undef=('OF',)),
+    Case('rcr.16bit', bytes.fromhex('f966d1d9'),                  # stc; rcr cx, 1
+         {'ecx': 0xAAAA0003}, undef=('OF',)),
+    Case('rcr.32bit', bytes.fromhex('f9d1d9'),                    # stc; rcr ecx, 1
+         {'ecx': 0x00000003}, undef=('OF',)),
+    Case('rol.8bit', bytes.fromhex('d0c1'), {'ecx': 0xAAAAAA81}, undef=('OF',)),
+    Case('ror.8bit', bytes.fromhex('d0c9'), {'ecx': 0xAAAAAA81}, undef=('OF',)),
+    Case('rol.16bit', bytes.fromhex('66d1c1'), {'ecx': 0xAAAA8001}, undef=('OF',)),
+    # The whole point: the rotate's carry has to reach the consumer, not the
+    # subtract's. sub cx,dx leaves CF=0; rcr cl,1 sets CF from the old bit 0,
+    # which is 1; sbb eax,eax is then -1 only if that carry got through.
+    Case('rcr.publishes-cf', bytes.fromhex('6629d1d0d919c0'),
+         {'ecx': 0x00000005, 'edx': 1, 'eax': 0}, undef=('OF', 'AF')),
+
+    # --- 16-bit push/pop move esp by two and keep the register's top half ---
+    #
+    # Lifted as their 32-bit cousins the stack still balanced, so it looked
+    # fine, and then `pop bp` replaced the whole of ebp with a zero-extended
+    # word. The `leave` after it handed that to esp, and the next stack access
+    # was down at 64 KB.
+    Case('push16.then.pop32', bytes.fromhex('6655665d'),          # push bp; pop bp
+         {'ebp': 0x0022FD48}),
+    Case('push16.esp-by-two', bytes.fromhex('6655'),              # push bp
+         {'ebp': 0x12345678}),
+    Case('pop16.keeps-high-half', bytes.fromhex('6650665b'),      # push ax; pop bx
+         {'eax': 0x0000BEEF, 'ebx': 0xDEAD0000}),
 ]
 
 

@@ -541,7 +541,7 @@ class Disassembler:
         return found
 
     def find_functions(self, code_start: int, code_end: int, iat_map: dict = None,
-                       seeds=()) -> dict:
+                       seeds=(), release_operands: bool = False) -> dict:
         """
         Find all functions in the code section.
         Uses call target analysis + common prologue patterns.
@@ -550,6 +550,11 @@ class Disassembler:
         recognises them -- the PE entry point above all. Nothing calls it, and
         a CRT startup does not have to open with `push ebp; mov ebp, esp`, so
         both heuristics can miss the one function the program begins with.
+
+        `release_operands` frees each instruction's capstone operand list once
+        this pass has finished with it. It saves a great deal of memory on a
+        large image, and it is safe ONLY if the caller is going to export the
+        catalog rather than lift it in process -- the lifter reads operands.
 
         Returns dict of addr -> Function.
         """
@@ -688,16 +693,24 @@ class Disassembler:
                               queued.add(tgt)
                               queue.append(tgt)
 
-              # Both harvests are done with these instructions, and nothing
-              # downstream reads operands -- the JSON carries mnemonic, op_str
-              # and bytes. Each retained operand list pins a whole capstone
-              # cs_detail struct, so holding them for the entire image is what
-              # took a 2.4 MB input past 4 GB and killed the run. Drop them and
-              # keep the catalog.
-              for func in new_funcs:
-                  for b in func.blocks.values():
-                      for ins in b.instructions:
-                          ins.operands = None
+              # Both harvests are done with these instructions. Each retained
+              # operand list pins a whole capstone cs_detail struct, and holding
+              # them for an entire image is what took a 2.4 MB input past 4 GB
+              # and killed a run -- so a caller that only wants the catalog can
+              # say so and get them dropped.
+              #
+              # It is opt-in because "nothing downstream reads operands" is only
+              # true of the JSON path. Every project here drives the lifter in
+              # process (run_pipeline.py -> Lifter.lift_function), and lift32
+              # reads insn.operands directly: with them dropped, each handler's
+              # `if len(ops) == 2` is false and the instruction vanishes, no
+              # error. That lifts an image to a third of its real size, with the
+              # gotos and every instruction that has an operand quietly missing.
+              if release_operands:
+                  for func in new_funcs:
+                      for b in func.blocks.values():
+                          for ins in b.instructions:
+                              ins.operands = None
 
           if data_scanned:
               break
@@ -890,8 +903,11 @@ def main(argv=None):
         print(f"[*] {len(doc)} seeds from {args.seed_functions}")
 
     dis = Disassembler(pe_data, info.image_base, info.sections)
+    # This CLI exports a catalog and never lifts, so it is the caller that can
+    # afford to let the operand lists go -- which is where the memory went on a
+    # multi-megabyte image.
     functions = dis.find_functions(info.code_start, info.code_end, iat,
-                                   seeds=seeds)
+                                   seeds=seeds, release_operands=True)
 
     funcs = [f for f in functions.values() if f.size >= args.min_size]
     funcs.sort(key=lambda x: x.address)
