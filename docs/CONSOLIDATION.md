@@ -469,25 +469,56 @@ promoted to functions only because nothing owned them, every one of which is
 still covered by a function in the new catalog. So: one real function gained,
 48 false ones gone, nothing lost.
 
-### 5. `rtti` · 351 lines
+### 5. `rtti` · **done** · a symbol source, not a recovery one
 
-**Source**: `xboxrecomp/tools/rtti/rtti.py`.
+**Source**: `xboxrecomp/tools/rtti/rtti.py`. Ported as `tools/cpp/rtti.py`,
+which is where the other C++ RE helpers live.
 
-MSVC 32-bit RTTI, with plain VAs and none of the image-relative indirection x64
-uses -- which is exactly the layout in every C++ PC binary here. Where a build
-left RTTI on, it yields every polymorphic class name, every vtable (the
-CompleteObjectLocator sits at `vtable[-1]`), every virtual method address, and
-the full inheritance chain.
+32-bit MSVC RTTI uses plain VAs with none of the image-relative indirection x64
+uses, and the original Xbox is 32-bit MSVC, so the structure parsing transferred
+unchanged. Two things did not.
 
-Those method addresses are **proof of function entry points**, which is why this
-runs *before* disassembly rather than after: they are seeds that cannot be
-wrong, unlike anything the byte scans produce.
+**Vtables are not only in `.rdata`.** The Xbox original scans `.rdata` and
+`.data`, which is right for an XBE. On PE a linker may merge read-only data into
+`.text`, and a modern MSVC one routinely does: charmap.exe keeps all four of its
+vtables there. Restricting the scan to non-code sections found **zero** of them
+while cheerfully reporting the four class names -- a failure that looks exactly
+like "this binary has no vtables". Scanning every section costs nothing, because
+the filter is a word equal to the address of a CompleteObjectLocator the image
+actually contains, followed by an array of code pointers.
 
-Trespasser hand-rolled RTTI extraction in its own `tools/recon.py` because
-pcrecomp had none. Black & White's seven-level hierarchy is the other obvious
-customer. The port needs only the `XbeFile` reader swapped for a PE one.
+**Vtable slots point at linker stubs, not at functions.** MSVC's incremental
+linker parks a table of five-byte `jmp` stubs at the front of `.text` and puts
+*those* addresses in vtables, so relinking after an edit repoints one jump
+instead of every reference. Trespasser is built that way: 2,230 of its 2,243
+vtable slots are stubs.
 
----
+That one indirection is the whole difference between a symbol source and noise:
+
+| | agreement with the linker map |
+|---|---:|
+| vtable slot taken raw | 13 of 2,243 (**0.6%**) |
+| followed one hop | 2,243 of 2,243 (**100%**) |
+
+Validated against `trespass.map`, which is symbol-derived truth:
+
+- **2,243 of 2,243** recovered virtual-method addresses are exact map function
+  starts. Not "inside a function" -- exactly on the start, every one.
+- **2,226 of 2,239** class attributions agree with the map's own mangled names
+  (99.4%). The 13 that do not are inherited methods whose implementation lives
+  in a base class that is not itself in the RTTI graph -- the case
+  `owning_class` documents as unresolvable, behaving as documented.
+
+**What it is worth, honestly.** As a *seed* source on Trespasser: nothing. All
+2,243 methods were already in the catalog, because E9 seeding reaches them
+through the stub table. As a *symbol* source: 448 classes, a full inheritance
+graph, and 2,239 methods that stop being `sub_004A1C30` and start being
+`CBloodSplats__004A1C30` -- in under three seconds, at 99.4% verified accuracy.
+That is what makes lifted code readable and a crash stack worth reading.
+
+Its seeding value needs a binary with RTTI *and* poor recall. Note that Rise of
+Legends, the argument for item 6, is explicitly **not** that binary: it has no
+RTTI at all, which is why item 6 exists separately.
 
 ### 6. `func_id/vtable_scanner` · 325 lines
 
@@ -657,7 +688,9 @@ each should merge rather than one winning.
 - [x] 4. `seed_from_log` -- ported, plus the `--seed-functions` end that was
       missing. Found that the PE entry point was never seeded: on charmap.exe
       it was absent from the catalog entirely.
-- [ ] 5. `rtti`
+- [x] 5. `rtti` -- ported to `tools/cpp/rtti.py`. 100% of recovered method
+      addresses are exact linker-map function starts, 99.4% of class
+      attributions agree with the map. Worth names, not new functions.
 - [ ] 6. `func_id/vtable_scanner`
 - [ ] 7. `symbols/map_names`
 - [ ] 8. `debug_symbols`
