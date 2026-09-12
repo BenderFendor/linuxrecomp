@@ -204,8 +204,8 @@ def _analyze_with_pefile(filepath: str, info: PEInfo, pefile) -> None:
     info.entry_point_rva = oh.AddressOfEntryPoint
     info.timestamp = fh.TimeDateStamp
     try:
-        info.timestamp_str = datetime.datetime.utcfromtimestamp(
-            fh.TimeDateStamp).strftime('%Y-%m-%d %H:%M:%S UTC')
+        info.timestamp_str = datetime.datetime.fromtimestamp(
+            fh.TimeDateStamp, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     except Exception:
         info.timestamp_str = 'invalid'
     info.linker_version = f"{oh.MajorLinkerVersion}.{oh.MinorLinkerVersion:02d}"
@@ -309,8 +309,8 @@ def _analyze_with_struct(filepath: str, info: PEInfo) -> None:
     info.machine = machine_map.get(machine, f'0x{machine:X}')
     info.timestamp = timestamp
     try:
-        info.timestamp_str = datetime.datetime.utcfromtimestamp(
-            timestamp).strftime('%Y-%m-%d %H:%M:%S UTC')
+        info.timestamp_str = datetime.datetime.fromtimestamp(
+            timestamp, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     except Exception:
         info.timestamp_str = 'invalid'
     info.characteristics = characteristics
