@@ -139,6 +139,13 @@ static inline void MEMSET32(void* dst, uint32_t val, uint32_t count) {
     for (uint32_t i = 0; i < count; i++) p[i] = val;
 }
 
+/* And 16-bit, for `rep stosw` -- which is how a run-length codec writes a run
+ * of one colour, and so how most of a 1990s background image gets drawn. */
+static inline void MEMSET16(void* dst, uint16_t val, uint32_t count) {
+    uint16_t* p = (uint16_t*)dst;
+    for (uint32_t i = 0; i < count; i++) p[i] = val;
+}
+
 /* ============================================================
  * Stack Operations
  * ============================================================ */

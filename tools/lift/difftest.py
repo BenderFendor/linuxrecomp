@@ -96,9 +96,11 @@ class Case:
         return r
 
 
-WIDTH = ('the flag tuple stores what the operand read but not how wide it was, '
-         'so every flag is derived at 32 bits. Fixing it needs a width in the '
-         'tuple AND width-aware CMP_* macros at every statically paired jcc.')
+WIDTH = ('a narrow operand is stored left-aligned, so CF, ZF, SF and OF are '
+         'derived at the right width by the 32-bit macros -- but PF and AF are '
+         'read off the bottom of the result, which is now zeros. Nothing '
+         'branches on either: CMP_P/CMP_NP are stubs and no BCD instruction is '
+         'lifted. Real narrow PF is what a width in the tuple would buy.')
 
 CASES = [
     # --- the plain arithmetic the lazy tuple is built for ---
@@ -128,10 +130,16 @@ CASES = [
     Case('shl.carry-out', bytes.fromhex('c1e004'), {'eax': 0x10000000}, undef=('OF', 'AF')),
     Case('shr.1', bytes.fromhex('d1e8'), {'eax': 0x11}, undef=('AF',)),
     Case('sar', bytes.fromhex('c1f805'), {'eax': 0x80000000}, undef=('OF', 'AF')),
-    Case('shift.by-zero', bytes.fromhex('f9c1e000'), {'eax': 0}, undef=('OF', 'AF'),
-         known='a shift of zero writes no flags at all; the lifter captures the '
-               'result anyway. No compiler emits a shift by a literal zero, and '
-               'guarding the variable-count form costs a branch on every shift.'),
+    # A shift of zero writes no flags at all, and the guard on the shift's flag
+    # publication now says exactly that.
+    Case('shift.by-zero', bytes.fromhex('f9c1e000'), {'eax': 0}, undef=('OF', 'AF')),
+    # The carry a shift writes has to reach its consumer. `shr ecx,1` leaves the
+    # odd bit in CF and the next branch decides whether a trailing byte gets
+    # copied -- which is the background blitter's entire inner loop.
+    Case('shr.publishes-cf', bytes.fromhex('d1e919c0'),          # shr ecx,1; sbb eax,eax
+         {'ecx': 0x00000007, 'eax': 0}, undef=('OF', 'AF')),
+    Case('shl.publishes-cf', bytes.fromhex('d1e019c9'),          # shl eax,1; sbb ecx,ecx
+         {'eax': 0x80000000, 'ecx': 0}, undef=('OF', 'AF')),
 
     # --- carry consumers ---
     Case('neg', bytes.fromhex('f7d8'), {'eax': 5}),

@@ -377,7 +377,28 @@ class Lifter:
         """Format LEA (just the address calculation, no memory access)."""
         return self._fmt_mem_addr(mem)
 
-    def _flag_capture(self, a, b):
+    def _shift_flags(self, res, count, width):
+        """Publish a shift's flags: CF from _cf, ZF/SF from the result.
+
+        The lazy triple holds two operands and a kind. A shift needs the bit it
+        shifted out AND the result, and `('or', result, result)` -- what this
+        used to record -- says the carry is zero. Every carry-conditional after
+        a shift then read a constant: CMP_AE(r, r) is `r >= r`, which is always
+        true.
+
+        The background blitter in Gizmos & Gadgets is
+        `shr ecx,1; rep movsw; jae skip; movsb`, copying width/2 words and then
+        the odd byte. With that jae always taken, every row of every background
+        lost its last byte, and the picture came out as a diagonal smear.
+
+        A shift of zero writes no flags at all, so the whole thing is guarded --
+        which also retires the `shift.by-zero` divergence the harness carried.
+        """
+        aligned = res if width >= 32 else f"((uint32_t)({res}) << {32 - width})"
+        return (f"if ({count}) {{ _flag_a = recomp_flags_pack({aligned}, _cf, 0, 0); "
+                f"_flag_b = 0; _flag_k = FK_EFLAGS; }}")
+
+    def _flag_capture(self, a, b, width=32):
         """Snapshot flag operands into temps and record the flag state to use them.
 
         A jcc reads the flags set by an earlier cmp/test/sub/... The old code
@@ -386,9 +407,36 @@ class Lifter:
         eax,0; jne`, or `sub eax,ebx; jl` where eax is the destination) corrupted
         the condition. Capturing the values at the flag-setter fixes that.
         Returns the C snapshot statement to append; sets self._flag_state to temps.
+
+        A NARROW operand is stored left-aligned: shifted up so that its own top
+        bit lands on bit 31.
+
+        The tuple holds two values and a kind, but no width, and every consumer
+        derives its flags at 32 bits. `add ax,cx` with ax=0xFFFF and cx=2 wraps
+        at 16 bits and sets CF; the same two numbers at 32 bits do not. So every
+        flag off a narrow compare was wrong -- and in a Borland binary whose
+        drawing code is ported 16-bit assembly, that is most of the compares in
+        the program.
+
+        Left-aligning fixes it without a width anywhere. At the top of the word
+        a 16-bit value's sign bit IS bit 31, and its carry out IS the carry out
+        of 32 bits, so CF, ZF, SF and OF all come out right through the macros
+        that are already there -- no runtime cost, and no change at the hundreds
+        of sites that pair a jcc with its setter statically.
+
+        ponytail: PF and AF are the price. Both are read off the bottom of the
+        result -- parity of the low byte, bit 4 -- which is now zeros. Nothing
+        reads them: CMP_P/CMP_NP are already stubs, no BCD instruction is lifted
+        at all, and the only other reader is a PUSHFD round trip, carrying two
+        bits nobody branches on. If a program ever needs real narrow-operand PF,
+        that is when the tuple grows a width.
         """
         self._flag_seq += 1
-        return f"_flag_a = (uint32_t)({a}); _flag_b = (uint32_t)({b});"
+        if width >= 32:
+            return f"_flag_a = (uint32_t)({a}); _flag_b = (uint32_t)({b});"
+        sh = 32 - width
+        return (f"_flag_a = (uint32_t)({a}) << {sh}; "
+                f"_flag_b = (uint32_t)({b}) << {sh};")
 
     def _make_condition(self, jcc_mnemonic: str) -> str:
         """
@@ -589,7 +637,7 @@ class Lifter:
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
-                lines.append(self._flag_capture(a, b))
+                lines.append(self._flag_capture(a, b, op_bits(ops[0])))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} + {b}')}; {comment}")
                 self._flag_state = ('add', "_flag_a, _flag_b")
 
@@ -597,28 +645,28 @@ class Lifter:
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
-                lines.append(self._flag_capture(a, b))
+                lines.append(self._flag_capture(a, b, op_bits(ops[0])))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} - {b}')}; {comment}")
                 self._flag_state = ('sub', "_flag_a, _flag_b")
 
         elif m == 'inc':
             if len(ops) == 1:
                 a = self._fmt_read(ops[0])
-                lines.append(self._flag_capture(a, "1"))
+                lines.append(self._flag_capture(a, "1", op_bits(ops[0])))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} + 1')}; {comment}")
                 self._flag_state = ('inc', "_flag_a, _flag_b")
 
         elif m == 'dec':
             if len(ops) == 1:
                 a = self._fmt_read(ops[0])
-                lines.append(self._flag_capture(a, "1"))
+                lines.append(self._flag_capture(a, "1", op_bits(ops[0])))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} - 1')}; {comment}")
                 self._flag_state = ('dec', "_flag_a, _flag_b")
 
         elif m == 'neg':
             if len(ops) == 1:
                 a = self._fmt_read(ops[0])
-                lines.append(self._flag_capture("0", a))
+                lines.append(self._flag_capture("0", a, op_bits(ops[0])))
                 # NEG sets CF = (operand != 0), and MSVC leans on it for a
                 # branchless null check:
                 #     neg ecx / sbb ecx, ecx / and ecx, esi / add ecx, 8
@@ -680,7 +728,7 @@ class Lifter:
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
-                lines.append(self._flag_capture(a, b))
+                lines.append(self._flag_capture(a, b, op_bits(ops[0])))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} & {b}')}; {comment}")
                 lines.append("_cf = 0;")
                 self._flag_state = ('and', "_flag_a, _flag_b")
@@ -689,7 +737,7 @@ class Lifter:
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
-                lines.append(self._flag_capture(f"({a} | {b})", f"({a} | {b})"))
+                lines.append(self._flag_capture(f"({a} | {b})", f"({a} | {b})", op_bits(ops[0])))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} | {b}')}; {comment}")
                 lines.append("_cf = 0;")
                 self._flag_state = ('or', "_flag_a, _flag_b")
@@ -701,10 +749,10 @@ class Lifter:
                 # Detect xor reg, reg (zero idiom)
                 carry = '_cf'
                 if ops[0].type == X86_OP_REG and ops[1].type == X86_OP_REG and ops[0].reg == ops[1].reg:
-                    lines.append(self._flag_capture("0", "0"))
+                    lines.append(self._flag_capture("0", "0", op_bits(ops[0])))
                     lines.append(f"{self._fmt_write(ops[0], '0')}; {comment}")
                 else:
-                    lines.append(self._flag_capture(f"({a} ^ {b})", f"({a} ^ {b})"))
+                    lines.append(self._flag_capture(f"({a} ^ {b})", f"({a} ^ {b})", op_bits(ops[0])))
                     lines.append(f"{self._fmt_write(ops[0], f'{a} ^ {b}')}; {comment}")
                 lines.append("_cf = 0;")
                 self._flag_state = ('xor', "_flag_a, _flag_b")
@@ -721,9 +769,9 @@ class Lifter:
                 res = f"({a} << {b})"
                 w = op_bits(ops[0])
                 lines.append(f"if ({b}) _cf = ((({a}) >> ({w} - ({b}))) & 1u); {comment}")
-                lines.append(self._flag_capture(res, res))
+                lines.append(self._shift_flags(res, b, w))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} << {b}')}; {comment}")
-                self._flag_state = ('or', "_flag_a, _flag_b")
+                self._flag_state = None
 
         elif m == 'shr':
             if len(ops) == 2:
@@ -731,9 +779,9 @@ class Lifter:
                 b = self._fmt_read(ops[1])
                 res = f"({a} >> {b})"
                 lines.append(f"if ({b}) _cf = ((({a}) >> (({b}) - 1)) & 1u); {comment}")
-                lines.append(self._flag_capture(res, res))
+                lines.append(self._shift_flags(res, b, op_bits(ops[0])))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} >> {b}')}; {comment}")
-                self._flag_state = ('or', "_flag_a, _flag_b")
+                self._flag_state = None
 
         elif m == 'sar':
             if len(ops) == 2:
@@ -742,9 +790,9 @@ class Lifter:
                 res = f"((uint32_t)((int32_t){a} >> {b}))"
                 # sar must publish CF for a following rcr (the clip's `sar;rcr` lerp).
                 lines.append(f"if ({b}) _cf = ((({a}) >> (({b}) - 1)) & 1u); {comment}")
-                lines.append(self._flag_capture(res, res))
+                lines.append(self._shift_flags(res, b, op_bits(ops[0])))
                 lines.append(f"{self._fmt_write(ops[0], f'(uint32_t)((int32_t){a} >> {b})')};")
-                self._flag_state = ('or', "_flag_a, _flag_b")
+                self._flag_state = None
 
         # shld/shrd: double-precision shift (64-bit window across dst:src). Used pervasively
         # for 64-bit / fixed-point math; leaving them unimplemented silently dropped the
@@ -755,9 +803,9 @@ class Lifter:
                 w = op_bits(ops[0])
                 expr = f"(({c}) ? ((({d}) >> ({c})) | ((uint32_t)({s}) << ({w} - ({c})))) : ({d}))"
                 lines.append(f"if ({c}) _cf = ((({d}) >> (({c}) - 1)) & 1u); {comment}")
-                lines.append(self._flag_capture(expr, expr))
+                lines.append(self._shift_flags(expr, c, op_bits(ops[0])))
                 lines.append(f"{self._fmt_write(ops[0], expr)};")
-                self._flag_state = ('or', "_flag_a, _flag_b")
+                self._flag_state = None
 
         elif m == 'shld':
             if len(ops) == 3:
@@ -765,9 +813,9 @@ class Lifter:
                 w = op_bits(ops[0])
                 expr = f"(({c}) ? ((({d}) << ({c})) | ((uint32_t)({s}) >> ({w} - ({c})))) : ({d}))"
                 lines.append(f"if ({c}) _cf = ((({d}) >> ({w} - ({c}))) & 1u); {comment}")
-                lines.append(self._flag_capture(expr, expr))
+                lines.append(self._shift_flags(expr, c, w))
                 lines.append(f"{self._fmt_write(ops[0], expr)};")
-                self._flag_state = ('or', "_flag_a, _flag_b")
+                self._flag_state = None
 
         # rol/ror/rcl/rcr: one emitter, because they share both of the things
         # that were wrong with them.
@@ -819,7 +867,7 @@ class Lifter:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
                 lines.append(f"/* cmp {a}, {b} */ {comment}")
-                lines.append(self._flag_capture(a, b))
+                lines.append(self._flag_capture(a, b, op_bits(ops[0])))
                 self._flag_state = ('cmp', "_flag_a, _flag_b")
             self._flag_seq += 1
 
@@ -828,7 +876,7 @@ class Lifter:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
                 lines.append(f"/* test {a}, {b} */ {comment}")
-                lines.append(self._flag_capture(a, b))
+                lines.append(self._flag_capture(a, b, op_bits(ops[0])))
                 lines.append("_cf = 0;")
                 self._flag_state = ('test', "_flag_a, _flag_b")
 
@@ -916,7 +964,9 @@ class Lifter:
         # capstone is inconsistent: it may fold the prefix into the mnemonic
         # ("repne movsb") or leave a bare "movsd" with the prefix in the bytes.
         # Direction is assumed forward (DF clear), as in any compiled memcpy/memset.
-        elif (m.split()[-1] in ('movsb', 'movsd', 'movsw', 'stosb', 'stosd', 'lodsb', 'lodsd')
+        elif (m.split()[-1] in ('movsb', 'movsd', 'movsw',
+                                'stosb', 'stosw', 'stosd',
+                                'lodsb', 'lodsw', 'lodsd')
               and insn.bytes
               and next((b for b in insn.bytes
                         if b not in (0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67, 0xF0, 0xF2, 0xF3)), 0)
@@ -925,7 +975,9 @@ class Lifter:
             #  but are 0x0F-escaped, not single-byte string opcodes)
             base = m.split()[-1]
             rep = (' ' in m) or any(b in (0xF2, 0xF3) for b in (insn.bytes[:4] if insn.bytes else ()))
-            esz = {'movsb': 1, 'movsd': 4, 'movsw': 2, 'stosb': 1, 'stosd': 4, 'lodsb': 1, 'lodsd': 4}[base]
+            esz = {'movsb': 1, 'movsw': 2, 'movsd': 4,
+                   'stosb': 1, 'stosw': 2, 'stosd': 4,
+                   'lodsb': 1, 'lodsw': 2, 'lodsd': 4}[base]
             if base.startswith('movs'):
                 if rep:
                     lines.append(f"memcpy((void*)ADDR(edi), (void*)ADDR(esi), ecx * {esz}u); {comment}")
@@ -940,16 +992,23 @@ class Lifter:
                 if rep and esz == 1:
                     lines.append(f"memset((void*)ADDR(edi), LO8(eax), ecx); {comment}")
                     lines.append(f"edi += ecx; ecx = 0;")
+                elif rep and esz == 2:
+                    lines.append(f"MEMSET16((void*)ADDR(edi), (uint16_t)LO16(eax), ecx); {comment}")
+                    lines.append(f"edi += ecx * 2u; ecx = 0;")
                 elif rep:
                     lines.append(f"MEMSET32((void*)ADDR(edi), eax, ecx); {comment}")
                     lines.append(f"edi += ecx * 4; ecx = 0;")
                 elif esz == 1:
                     lines.append(f"MEM8(edi) = LO8(eax); edi += _df; {comment}")
+                elif esz == 2:
+                    lines.append(f"MEM16(edi) = (uint16_t)LO16(eax); edi += _df * 2; {comment}")
                 else:
                     lines.append(f"MEM32(edi) = eax; edi += _df * 4; {comment}")
-            else:  # lodsb/lodsd
+            else:  # lodsb/lodsw/lodsd
                 if esz == 1:
                     lines.append(f"SET_LO8(eax, MEM8(esi)); esi += _df; {comment}")
+                elif esz == 2:
+                    lines.append(f"SET_LO16(eax, MEM16(esi)); esi += _df * 2; {comment}")
                 else:
                     lines.append(f"eax = MEM32(esi); esi += _df * 4; {comment}")
 
