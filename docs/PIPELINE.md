@@ -13,7 +13,9 @@ Detailed documentation of each phase, what tools to use, and what to expect.
 - `tools/pe/extract_imports.py` -- Detailed import table extraction across modules
 - `tools/pe/delay_imports.py` -- Delay-loaded import table (the easy-to-miss deps)
 - `tools/pe/analyze_sections.py` -- Per-section entropy + SafeDisc/SecuROM/packer detection
-- `tools/pe/catalog.py` -- Recursively catalog/categorize every PE in an install tree
+- `tools/pe/catalog.py` -- Recursively catalog/categorize every PE in an install tree,
+  and identify the ones that are not PE (NE, LE/LX, plain-MZ DOS) rather than
+  reporting them as broken -- each is named and routed to the front end that reads it
 
 **What you learn**:
 
@@ -312,7 +314,7 @@ The output is a standard native executable that runs on modern Windows (or Linux
 | Import extraction | `pe/extract_imports.py` | `.exe`/`.dll`, or an install dir | Per-module imports + shared-API summary |
 | Delay imports | `pe/delay_imports.py` | `.exe`/`.dll` | Delay-load import list |
 | Section/DRM analysis | `pe/analyze_sections.py` | `.exe`/`.dll` | Entropy + protection report |
-| Binary catalog | `pe/catalog.py` | Install dir | Per-PE catalog (text/JSON) |
+| Binary catalog | `pe/catalog.py` | Install dir | Per-binary catalog, PE + NE/LE/MZ (text/JSON) |
 | stdcall stack purge | `pe/stdcall_argc.py` | Import names + SDK headers | Bytes each import pops (library) |
 | NE parse | `ne/ne_parse.py` | NE binary | Segments/relocs/imports |
 | NE disassembly | `ne/ne_decode.py` | NE binary | Annotated disasm |

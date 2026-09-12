@@ -22,7 +22,9 @@ This repo collects every tool, runtime, and hard-won trick from our PC static re
 pcrecomp/
   tools/           Reusable analysis & transformation tools
     pe/            PE analysis (imports, exports, sections, hashes, delay-imports,
-                   protection/DRM detection, recursive binary catalog,
+                   protection/DRM detection, recursive binary catalog that
+                   also names the non-PE binaries (NE/LE/MZ) instead of
+                   calling them broken,
                    stdcall_argc.py derives each import's stack purge from the SDK)
     ne/            NE (16-bit New Executable) parse / disasm / call-graph,
                    Win16 import resolution (ordinal -> API name + the PASCAL
