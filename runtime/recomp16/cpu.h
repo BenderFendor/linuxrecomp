@@ -584,6 +584,45 @@ static inline void cpu_init(CPU *cpu)
 }
 
 /* Allocate flat memory */
+/* ---------- Interrupt poll ----------
+ *
+ * Lifted code runs to completion inside one C call: a guest loop is a C loop,
+ * and nothing outside it gets a turn. That is fatal for a DOS program, which
+ * routinely spins on a counter its own timer ISR increments and expects the
+ * hardware to interrupt it. The lifter emits RECOMP_TICK on every loop
+ * back-edge; the project implements recomp_tick to run whatever the guest is
+ * waiting for -- its timer handler, the host event pump.
+ *
+ * A budget rather than a clock read: the common case is one decrement. Set the
+ * budget from recomp_tick itself (it is re-armed there, not here) so the
+ * project picks its own poll rate. Built out entirely without RECOMP_IRQ. */
+#ifdef RECOMP_IRQ
+extern int g_recomp_tick_budget;
+void recomp_tick(CPU *cpu);
+#define RECOMP_TICK(cpu) do { if (--g_recomp_tick_budget <= 0) recomp_tick(cpu); } while (0)
+#else
+#define RECOMP_TICK(cpu) ((void)0)
+#endif
+
+/* ---------- Entry trace ----------
+ *
+ * Lifted code gives a host debugger nothing to work with: every frame is a
+ * function called sub_01A2F4 inside a generated file, and a runaway recursion
+ * blows the stack long before you can read one. Each lifted body announces
+ * itself here instead, into a ring buffer that is dumped when the C stack gets
+ * too deep -- which turns "it died somewhere" into the repeating cycle itself.
+ *
+ * Off unless the project is built with RECOMP_TRACE, and then it is one call
+ * and one compare per lifted function. No init call: the first entry records
+ * the stack base it measures against. */
+#ifdef RECOMP_TRACE
+void recomp_enter(const char *fn);
+void recomp_trace_dump(const char *why);
+#define RECOMP_ENTER(name) recomp_enter(name)
+#else
+#define RECOMP_ENTER(name) ((void)0)
+#endif
+
 int cpu_alloc_mem(CPU *cpu);
 
 /* Free CPU resources */
