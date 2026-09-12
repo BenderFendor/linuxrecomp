@@ -618,16 +618,30 @@ class Disassembler:
                   print(f"[*] Disassembling {total} initial candidates...")
               else:
                   print(f"[*] Discovery round {round_no}: {total} new jmp/call targets...")
+              new_funcs = []
               for i, addr in enumerate(sorted_targets):
                   if round_no == 1 and i % 1000 == 0 and i > 0:
                       print(f"[*] Disassembling function {i}/{total}...")
                   if addr in functions:
                       continue
-                  _add_func(addr, "alias" if addr in alias_entries else "start")
+                  f = _add_func(addr, "alias" if addr in alias_entries else "start")
+                  if f is not None:
+                      new_funcs.append(f)
 
-              # Harvest jmp/call immediate targets from everything decoded so far,
-              # enqueue any that don't start an already-decoded instruction.
-              for func in list(functions.values()):
+              # Harvest jmp/call immediate targets from the functions decoded in
+              # THIS round -- not from every function decoded so far.
+              #
+              # Re-walking the whole catalog each round was quadratic and bought
+              # nothing: a function is harvested in the round it is decoded, and
+              # every target that harvest accepts lands in `queued`, which the
+              # first test below skips forever after. The only other exit from
+              # the loop body skips without queuing, and its conditions
+              # (`tgt in functions`, `owner[tgt] == func.address`) never go from
+              # true back to false. So a re-walk can only re-skip what it already
+              # skipped. Harvesting once also means an instruction's capstone
+              # operands stop being live state, which is what lets them be freed
+              # below.
+              for func in new_funcs:
                   for b in func.blocks.values():
                       for ins in b.instructions:
                           if not (ins.is_uncond_jump or ins.is_call):
@@ -658,7 +672,7 @@ class Disassembler:
               # DirectDraw EnumDisplayModes). Nothing CALLs it and it sits in no
               # data table, so neither the call scan nor the data scan finds it;
               # it surfaces at runtime as a callback that cannot be dispatched.
-              for func in list(functions.values()):
+              for func in new_funcs:
                   for b in func.blocks.values():
                       for ins in b.instructions:
                           if ins.is_call or ins.is_jump or not ins.operands:
@@ -673,6 +687,18 @@ class Disassembler:
                                   continue
                               queued.add(tgt)
                               queue.append(tgt)
+
+              # Both harvests are done with these instructions, and nothing
+              # downstream reads operands -- the JSON carries mnemonic, op_str
+              # and bytes. Each retained operand list pins a whole capstone
+              # cs_detail struct, so holding them for the entire image is what
+              # took a 2.4 MB input past 4 GB and killed the run. Drop them and
+              # keep the catalog.
+              for func in new_funcs:
+                  for b in func.blocks.values():
+                      for ins in b.instructions:
+                          ins.operands = None
+
           if data_scanned:
               break
           data_scanned = True
