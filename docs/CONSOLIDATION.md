@@ -430,25 +430,44 @@ known to be function starts.
 **Do not** simply widen the `0x100000` guard. That was nearly done while fixing
 the E9 bug and would have merged every tail-called function into its caller.
 
-### 4. `seed_from_log` · 157 lines · **cheapest win on the list**
+### 4. `seed_from_log` · **done** · and the loop was open at both ends
 
 **Source**: `xboxrecomp/tools/seed_from_log/`.
 
-The `recomp32` runtime already prints `ITAIL/ICALL: unresolved VA ...` when
-dispatch misses. Today a human reads those out of a console and hand-edits a
-seed list; several projects carry one. This feeds the log straight back into the
-next codegen pass.
+Ported as `tools/disasm/seed_from_log.py`. The `recomp32` runtime already
+prints every dispatch it could not resolve, with the calling function:
 
-Static analysis cannot see where a vtable call goes, or a thread entry point
-that is only ever *pushed* as an argument and never called. The Xbox note on the
-latter applies verbatim to Win32: the thread never starts, the process exits
-cleanly after a couple of API calls, and it reads as a successful run rather
-than as zero progress.
+    ICALL: unresolved VA 0x004A1C30 from 0x0048D4E0
+    ITAIL: unresolved VA 0x004B2088 from 0x00401D10
 
-Needs a `CreateThread`-shaped equivalent of the `PsCreateSystemThreadEx` case
-and a change to the log-line regex. Little else.
+A human was reading those out of a console and hand-editing a seed list.
 
----
+Gates are xboxrecomp's, and they matter: an address the program *mentioned* is
+not automatically a function. A garbage slot points at data just as easily, and
+seeding data is worse than the missing target was -- it splits a real function
+and can break the build, where the missing target only broke one dispatch. So a
+candidate must lie in an executable section **and** pass
+`probes_as_function_body`. That is item 1 paying for itself somewhere it was
+not built for.
+
+Three outcomes are reported separately, because they mean different things:
+a new function, an alternate entry inside a known one, and -- loudly -- an
+address the catalog **already contains**, which means the run failed to
+dispatch a function that was found all along. That last one is a dispatch-table
+bug and this tool cannot fix it; saying so is more useful than seeding it again.
+
+**The other end was missing.** `find_functions` has taken a `seeds` argument all
+along, with a docstring explaining that the PE entry point matters most --
+nothing calls it, and a CRT startup need not open with `push ebp; mov ebp, esp`.
+`main()` never passed any. So the tool wrote a seed file nothing could read, and
+the entry point was never seeded.
+
+Measured on charmap.exe, a stock Microsoft binary: **the entry point at
+`0x0041D340` was not in the catalog at all.** Seeding it recovered it, and
+dropped 48 spurious function starts -- mid-function addresses that had been
+promoted to functions only because nothing owned them, every one of which is
+still covered by a function in the new catalog. So: one real function gained,
+48 false ones gone, nothing lost.
 
 ### 5. `rtti` · 351 lines
 
@@ -635,7 +654,9 @@ each should merge rather than one winning.
 - [~] 3. Function-end bounding -- **real defect (95 functions), every fix
       measured worse than leaving it.** Reverted. Needs a call-graph answer,
       not a distance or gap one.
-- [ ] 4. `seed_from_log`
+- [x] 4. `seed_from_log` -- ported, plus the `--seed-functions` end that was
+      missing. Found that the PE entry point was never seeded: on charmap.exe
+      it was absent from the catalog entirely.
 - [ ] 5. `rtti`
 - [ ] 6. `func_id/vtable_scanner`
 - [ ] 7. `symbols/map_names`

@@ -839,6 +839,11 @@ def main(argv=None):
                     help="Include per-instruction detail in the JSON (large output)")
     ap.add_argument("--min-size", type=int, default=0,
                     help="Drop recovered functions smaller than N bytes from the catalog")
+    ap.add_argument("--seed-functions", metavar="FILE",
+                    help="JSON list of addresses that are functions whether or "
+                         "not the scans find them. Produced by seed_from_log.py "
+                         "from a run's unresolved dispatches; also fine to "
+                         "hand-write.")
     args = ap.parse_args(argv)
 
     # This pass takes hours on a multi-megabyte image and prints its progress as
@@ -866,8 +871,27 @@ def main(argv=None):
           f"code=0x{info.code_start:08X}-0x{info.code_end:08X} "
           f"imports(IAT)={len(iat)}")
 
+    # The entry point is the one function guaranteed to exist and not
+    # guaranteed to be found: nothing calls it, and a CRT startup need not open
+    # with `push ebp; mov ebp, esp`, so both heuristics can miss the address
+    # the program actually begins at. find_functions has taken seeds for this
+    # all along and main never passed any.
+    seeds = set()
+    if info.entry_point_rva:
+        seeds.add(info.image_base + info.entry_point_rva)
+
+    if args.seed_functions:
+        with open(args.seed_functions) as f:
+            doc = json.load(f)
+        for e in doc:
+            if isinstance(e, dict):
+                e = e.get("address", e.get("address_hex"))
+            seeds.add(int(e, 0) if isinstance(e, str) else e)
+        print(f"[*] {len(doc)} seeds from {args.seed_functions}")
+
     dis = Disassembler(pe_data, info.image_base, info.sections)
-    functions = dis.find_functions(info.code_start, info.code_end, iat)
+    functions = dis.find_functions(info.code_start, info.code_end, iat,
+                                   seeds=seeds)
 
     funcs = [f for f in functions.values() if f.size >= args.min_size]
     funcs.sort(key=lambda x: x.address)
