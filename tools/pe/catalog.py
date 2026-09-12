@@ -7,6 +7,12 @@ overlay size, UPX/packer status, imported DLLs, and exported symbols. The first
 thing you want when staring at an unfamiliar install folder: what are all these
 binaries, which is the engine, which are mods/plugins, which is the installer.
 
+An old install tree is rarely all-PE. Anything that is a valid executable but
+not a PE -- NE (16-bit Windows/OS-2), LE/LX (VxD, DOS extender), or a plain MZ
+DOS binary -- is identified as what it is and routed to the front end that can
+read it, rather than reported as a broken PE. NE in particular is a first-class
+citizen of this toolbox: see tools/ne/.
+
 Categorization is heuristic and format-driven (no per-game filename lists):
   - INSTALLER   large trailing overlay, or name like setup/install/unwise/patch
   - PACKED      UPX or another recognized packer section
@@ -14,9 +20,12 @@ Categorization is heuristic and format-driven (no per-game filename lists):
   - HELPER-DLL  DLL with no/few exports (resource or side-loaded dll)
   - APP         GUI executable
   - TOOL        console executable
+  - NE16        16-bit New Executable (parse with tools/ne/ne_parse.py)
+  - DOS/OTHER   MZ-only DOS binary, or LE/LX (16-bit path: tools/disasm/decode16.py)
 
 Usage:
     python catalog.py <dir> [--json]
+    python catalog.py --selftest
 """
 import struct
 import os
@@ -24,6 +33,46 @@ import sys
 import json
 import hashlib
 import datetime
+
+
+# NE header field offsets we actually use (ne_flags bit 15 = library/DLL).
+_NE_TARGET_OS = {1: 'OS/2', 2: 'Windows', 3: 'DOS 4.x', 4: 'Windows 386', 5: 'BOSS'}
+
+
+def identify_non_pe(data, lfanew):
+    """Name an MZ-headed file that is not a PE, and say which tool reads it.
+
+    Returns a dict merged into the catalog entry. Reports ``format`` for every
+    case; NE additionally gets segment count, target OS and the DLL flag, which
+    is what decides whether tools/ne/ is worth pointing at it.
+    """
+    sig = data[lfanew:lfanew + 2] if lfanew and lfanew + 2 <= len(data) else b''
+
+    if sig == b'NE' and lfanew + 0x38 <= len(data):
+        flags = struct.unpack_from('<H', data, lfanew + 0x0C)[0]
+        info = {
+            'format': 'NE',
+            'linker_version': f'{data[lfanew + 2]}.{data[lfanew + 3]}',
+            'is_dll': bool(flags & 0x8000),
+            'ne_segments': struct.unpack_from('<H', data, lfanew + 0x1C)[0],
+            'ne_modrefs': struct.unpack_from('<H', data, lfanew + 0x1E)[0],
+            'target_os': _NE_TARGET_OS.get(data[lfanew + 0x36], f'0x{data[lfanew + 0x36]:02X}'),
+            'tool': 'tools/ne/ne_parse.py',
+        }
+        # Resident name table: the first entry is the module's own name,
+        # length-prefixed. It is the only human-readable label an NE carries.
+        rt = lfanew + struct.unpack_from('<H', data, lfanew + 0x26)[0]
+        if rt < len(data) and data[rt]:
+            info['module_name'] = data[rt + 1:rt + 1 + data[rt]].decode('ascii', 'replace')
+        return info
+
+    if sig in (b'LE', b'LX'):
+        return {'format': sig.decode(), 'tool': 'tools/disasm/decode16.py',
+                'note': 'linear executable (VxD / DOS extender)'}
+
+    # No recognized secondary header: a plain real-mode DOS binary.
+    return {'format': 'MZ', 'tool': 'tools/disasm/decode16.py',
+            'note': 'real-mode DOS executable'}
 
 
 def analyze_pe(filepath):
@@ -35,12 +84,14 @@ def analyze_pe(filepath):
     info['md5'] = hashlib.md5(data).hexdigest()
     info['sha1'] = hashlib.sha1(data).hexdigest()
 
-    if data[:2] != b'MZ':
-        info['error'] = 'Not a PE file'
+    if data[:2] not in (b'MZ', b'ZM'):
+        info['error'] = 'Not an executable (no MZ header)'
         return info
-    pe = struct.unpack_from('<I', data, 0x3C)[0]
+    pe = struct.unpack_from('<I', data, 0x3C)[0] if len(data) >= 0x40 else 0
     if data[pe:pe + 4] != b'PE\x00\x00':
-        info['error'] = 'Invalid PE signature'
+        # Not a PE. That does not make it broken -- an install from this era
+        # is full of NE and plain-DOS binaries, and this toolbox can read them.
+        info.update(identify_non_pe(data, pe))
         return info
 
     machine = struct.unpack_from('<H', data, pe + 4)[0]
@@ -148,6 +199,10 @@ def categorize(info):
     name = os.path.basename(info['path']).lower()
     if 'error' in info:
         return 'UNKNOWN'
+    if info.get('format') == 'NE':
+        return 'NE16'
+    if 'format' in info:          # MZ / LE / LX
+        return 'DOS/OTHER'
     if (any(k in name for k in ('setup', 'install', 'unwise', 'unins', 'patch', 'update'))
             or info.get('overlay_size', 0) > 256 * 1024):
         return 'INSTALLER'
@@ -158,9 +213,64 @@ def categorize(info):
     return 'APP' if info['subsystem'] == 'GUI' else 'TOOL'
 
 
+def _selftest():
+    """Synthesize one header of each format and check we name it correctly."""
+    def mz(lfanew, tail=b''):
+        h = bytearray(0x40)
+        h[0:2] = b'MZ'
+        struct.pack_into('<I', h, 0x3C, lfanew)
+        return bytes(h) + tail
+
+    # NE: a Windows DLL, 5 segments, 2 module refs, module name "TESTMOD".
+    ne = bytearray(0x40)
+    ne[0:2] = b'NE'
+    ne[2], ne[3] = 6, 1                       # linker 6.1
+    struct.pack_into('<H', ne, 0x0C, 0x8000)  # ne_flags: library
+    struct.pack_into('<H', ne, 0x1C, 5)       # ne_cseg
+    struct.pack_into('<H', ne, 0x1E, 2)       # ne_cmod
+    struct.pack_into('<H', ne, 0x26, 0x40)    # ne_restab -> right past the header
+    ne[0x36] = 2                              # target OS: Windows
+    name = b'\x07TESTMOD'
+    got = identify_non_pe(mz(0x40, bytes(ne) + name), 0x40)
+    assert got['format'] == 'NE', got
+    assert got['is_dll'] is True, got
+    assert got['linker_version'] == '6.1', got
+    assert got['ne_segments'] == 5 and got['ne_modrefs'] == 2, got
+    assert got['target_os'] == 'Windows', got
+    assert got['module_name'] == 'TESTMOD', got
+    assert got['tool'] == 'tools/ne/ne_parse.py', got
+
+    # An NE EXE is the same minus the library flag.
+    ne_exe = bytearray(ne)
+    struct.pack_into('<H', ne_exe, 0x0C, 0)
+    assert identify_non_pe(mz(0x40, bytes(ne_exe) + name), 0x40)['is_dll'] is False
+
+    # LE / LX are linear executables, not NE.
+    for sig in (b'LE', b'LX'):
+        got = identify_non_pe(mz(0x40, sig + bytes(0x20)), 0x40)
+        assert got['format'] == sig.decode(), got
+        assert 'ne_segments' not in got, got
+
+    # e_lfanew of 0, or pointing at garbage, is a plain DOS binary -- not an error.
+    assert identify_non_pe(mz(0), 0)['format'] == 'MZ'
+    assert identify_non_pe(mz(0x40, b'ZZ' + bytes(8)), 0x40)['format'] == 'MZ'
+
+    # A truncated NE must not raise; it falls back rather than half-reporting.
+    assert identify_non_pe(mz(0x40, b'NE' + bytes(4)), 0x40)['format'] == 'MZ'
+
+    # And a real PE still takes the PE path, untouched by any of this.
+    pe = mz(0x40, b'PE\x00\x00')
+    assert pe[0x40:0x44] == b'PE\x00\x00'
+
+    print('catalog.py selftest: OK')
+
+
 def main():
+    if '--selftest' in sys.argv:
+        _selftest()
+        return
     if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <dir> [--json]")
+        print(f"Usage: {sys.argv[0]} <dir> [--json] | --selftest")
         sys.exit(1)
     base = sys.argv[1]
     as_json = '--json' in sys.argv
@@ -190,7 +300,8 @@ def main():
     for info in catalog:
         by_cat.setdefault(info['category'], []).append(info)
 
-    for cat in ('APP', 'TOOL', 'PLUGIN/LIB', 'HELPER-DLL', 'PACKED', 'INSTALLER', 'UNKNOWN'):
+    for cat in ('APP', 'TOOL', 'PLUGIN/LIB', 'HELPER-DLL', 'PACKED', 'INSTALLER',
+                'NE16', 'DOS/OTHER', 'UNKNOWN'):
         items = by_cat.get(cat)
         if not items:
             continue
@@ -200,6 +311,17 @@ def main():
             print(f"  SHA1: {info['sha1']}")
             if 'error' in info:
                 print(f"  Error: {info['error']}")
+                continue
+            if 'format' in info:
+                if info['format'] == 'NE':
+                    print(f"  NE {'DLL' if info['is_dll'] else 'EXE'} "
+                          f"({info['target_os']}), linker {info['linker_version']}, "
+                          f"{info['ne_segments']} segments, {info['ne_modrefs']} module refs")
+                    if info.get('module_name'):
+                        print(f"  module: {info['module_name']}")
+                else:
+                    print(f"  {info['format']} -- {info.get('note', '')}")
+                print(f"  read with: {info['tool']}")
                 continue
             print(f"  {info['pe_type']} {'DLL' if info['is_dll'] else 'EXE'} "
                   f"({info['machine']}), {info['subsystem']}, linker {info['linker_version']}, "
