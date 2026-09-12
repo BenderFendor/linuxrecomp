@@ -224,6 +224,16 @@ class Lifter:
         return (f'recomp_dispatch(cpu, 0x{(abs_t >> 4) & 0xFFFF:X}, '
                 f'0x{abs_t & 0xF:X}); return;')
 
+    def _tick_back_edge(self, inst, target):
+        """A backward branch is a loop iteration, and a loop is the only place a
+        real machine would have taken an interrupt. A guest that busy-waits on a
+        counter its own timer ISR increments -- `cmp word [tick], ax / jb` --
+        never leaves its C function, so without a poll here nothing else in the
+        program ever runs again. Costs one decrement per iteration, and nothing
+        at all unless the project builds with the interrupt hook."""
+        if target <= inst.address:
+            self._emit('RECOMP_TICK(cpu);')
+
     def lift_instruction(self, inst: Instruction, func_start: int):
         """Lift a single instruction to C code."""
         m = inst.mnemonic
@@ -621,6 +631,7 @@ class Lifter:
                 target = op1.disp
                 if target in self.valid_addrs:
                     self.labels_needed.add(target)
+                    self._tick_back_edge(inst, target)
                     self._emit(f'goto {_label(target, self.func_name)};', orig)
                 else:
                     # Tail jump to another function (or shared continuation).
@@ -679,6 +690,7 @@ class Lifter:
             cc = CC_MAP[m]
             if target in self.valid_addrs:
                 self.labels_needed.add(target)
+                self._tick_back_edge(inst, target)
                 self._emit(f'if ({cc}(cpu)) goto {_label(target, self.func_name)};', orig)
             else:
                 # Conditional tail jump to another function.
@@ -690,6 +702,7 @@ class Lifter:
             target = op1.disp
             if target in self.valid_addrs:
                 self.labels_needed.add(target)
+                self._tick_back_edge(inst, target)
                 self._emit(f'cpu->cx--; if (cpu->cx != 0) goto {_label(target, self.func_name)};', orig)
             else:
                 abs_t = func_start + target; tail = self._tail_jump(abs_t)
@@ -699,6 +712,7 @@ class Lifter:
             target = op1.disp
             if target in self.valid_addrs:
                 self.labels_needed.add(target)
+                self._tick_back_edge(inst, target)
                 self._emit(f'cpu->cx--; if (cpu->cx != 0 && zf(cpu)) '
                            f'goto {_label(target, self.func_name)};', orig)
             else:
@@ -709,6 +723,7 @@ class Lifter:
             target = op1.disp
             if target in self.valid_addrs:
                 self.labels_needed.add(target)
+                self._tick_back_edge(inst, target)
                 self._emit(f'cpu->cx--; if (cpu->cx != 0 && !zf(cpu)) '
                            f'goto {_label(target, self.func_name)};', orig)
             else:
@@ -719,6 +734,7 @@ class Lifter:
             target = op1.disp
             if target in self.valid_addrs:
                 self.labels_needed.add(target)
+                self._tick_back_edge(inst, target)
                 self._emit(f'if (cpu->cx == 0) goto {_label(target, self.func_name)};', orig)
             else:
                 abs_t = func_start + target; tail = self._tail_jump(abs_t)
@@ -727,6 +743,14 @@ class Lifter:
         elif m == 'call':
             if op1 and op1.type == OpType.REL16:
                 target = func_start + op1.disp
+                # A near branch wraps inside its own 64K segment: the hardware
+                # computes (IP + rel) & 0xFFFF. Lifting slices of a flat image
+                # we work in file offsets instead, so a call backwards past the
+                # segment base comes out NEGATIVE -- and every one of those was
+                # becoming a do-nothing stub. Wrapping it recovers the real
+                # target, which is 64K further up.
+                if target < 0 and (target + 0x10000) in self.known_funcs:
+                    target += 0x10000
                 # Look up known function name at this address
                 if target in self.known_funcs:
                     func_name = self.known_funcs[target]
@@ -1166,6 +1190,10 @@ class Lifter:
         # Second pass: generate C code
         self.output.append(f'void {name}(CPU *cpu)')
         self.output.append('{')
+        # Which lifted functions ran, in order, for when the process dies
+        # somewhere in 600 generated functions with no usable host backtrace.
+        # A no-op macro unless the project builds with RECOMP_TRACE.
+        self.output.append(f'    RECOMP_ENTER("{name}");')
         if want_entry_goto:
             self.output.append(f'    goto {_label(entry_addr, name)}; '
                                f'/* secondary entry @ +0x{entry_addr:X} */')
