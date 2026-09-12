@@ -157,6 +157,35 @@ document claimed.** That number came from a different measurement and does not
 reproduce against the map. Item 1 as originally written was aimed at the small
 half of the problem.
 
+### What E9 seeding actually did
+
+Re-running the current disassembler on the same binary — the E9 fix in, nothing
+else changed — makes the point sharper than the split/invented breakdown alone:
+
+| | before E9 | after E9 |
+|---|---:|---:|
+| recall | 78.48% | **97.72%** |
+| false negatives | 7,351 | **780** |
+| precision | 77.06% | 71.48% |
+| split | 7,364 | 12,695 |
+| invented | 617 | 622 |
+| F1 | 77.76% | 82.57% |
+
+Recall went from missing one function in five to missing one in forty-four.
+That is the largest single recovery improvement in this repo's history, and it
+cost four lines.
+
+**And it reads as a precision regression.** 77.06% → 71.48%, because finding
+all those tail-called functions also found all the tail *jumps* into other
+functions' bodies, and every one of those became another catalog entry claiming
+to be a function start. Splits grew by 5,331; invented did not move at all
+(617 → 622), which is the clearest possible evidence that the two numbers are
+measuring different things and only one of them is a defect.
+
+A maintainer watching precision alone would have seen a 5.6-point drop and
+reverted the best change the tool has had. That is the actual cost of the
+missing category, and it is why item 0 below is item 0.
+
 Four things were then checked, because "7,364 splits" has several possible
 causes and they need different fixes:
 
@@ -198,9 +227,10 @@ it is a field, not a redesign.
    or outside every one (suspect — a body pointing at nothing). An alias landing
    exactly on a reference start is counted separately again, because that is a
    real function demoted, and a demoted start is not reported as found.
-3. **`probes_as_function_body` still lands**, because 617 invented functions are
-   still 617 functions' worth of decoded garbage, and the probe is ~40 lines and
-   carries its own self-test. It is just no longer item 1.
+3. **`probes_as_function_body` still lands**, but it is worth far less than
+   predicted: 283 false positives removed, only 2 of them invented. Forty lines
+   at zero measured recall cost is still a good trade. It is just no longer
+   item 1, and it never deserved to be.
 
 The rest of the queue keeps its order. The lesson is the one this repo keeps
 re-learning: the number a tool reports about itself is not a measurement, and
@@ -247,9 +277,27 @@ the same trade xboxrecomp makes, and for the same reason its docstring gives:
 the alternative is a stub that returns immediately, silently skipping the
 epilogue and leaking the caller's frame.
 
-**Verify**: precision against the map, with aliases excluded, versus the 77.06%
-baseline. Plus `score_recovery.py --selftest`, which now asserts that an alias
-inside a known function does not touch precision.
+**Verified, end to end on the oracle binary** (same reference, same scorer,
+the new catalog a strict subset of the old -- 0 entries added, 302 removed):
+
+| | baseline | after |
+|---|---:|---:|
+| function starts | 46,696 | 38,559 |
+| split | 12,473 | 4,338 |
+| invented | 844 | 842 |
+| **precision** | 71.48% | **86.57%** |
+| recall | 97.72% | 97.72% |
+| **F1** | 82.57% | **91.80%** |
+
+7,845 alias entries, and **every one of them inside a known function** -- zero
+landed outside one, which is the result that says the category is real rather
+than a convenient place to put the numbers that were embarrassing. Recall does
+not move at all, so nothing was reclassified out of existence.
+
+`score_recovery.py --selftest` asserts that an alias inside a known function
+does not touch precision, that one outside every function is still counted, and
+that an alias landing on a reference start reads as a demoted function rather
+than a found one.
 
 ---
 
@@ -267,11 +315,19 @@ that happen to look like a code address become a function.
 `find_branch_targets` has the same shape: a linear `E8`/`E9` byte scan that
 cannot tell an opcode from the middle of an immediate.
 
-**Scale, measured rather than assumed.** Against the map this is **617 invented
-function starts**, not the 2,905 an earlier draft of this document claimed --
-that figure came from a different measurement and does not reproduce here. 617
-is still 617 functions' worth of decoded garbage, and the fix is about forty
-lines, so it lands. It is simply not the largest thing wrong.
+**Scale, measured end to end, and smaller than any estimate of it.** The probe
+rejects 302 data-pointer candidates on the oracle binary. Scored, that is 283
+false positives removed -- of which **2** are invented and the rest are splits.
+Invented false positives barely move: 844 before, 842 after.
+
+An earlier draft of this document said 2,905; a later one said 617. Neither
+survived the run. The 844 invented starts are real, but they do not come from
+the data-pointer scan, so this is not what removes them.
+
+It still lands, because 283 junk entries for forty lines at **zero measured
+recall cost** is a good trade. It is simply not, and was never, the largest
+thing wrong -- and it took three estimates and one end-to-end run to say that
+honestly.
 
 The comment in `find_data_code_pointers` says "false positives just become dead
 functions -- harmless". That is true for the *build* and false for everything
@@ -300,62 +356,79 @@ runs off the section end without a terminator fails.
 
 ---
 
-### 2. Jump-table resync -- `engine.resync_jump_tables` · ~60 lines
+### 2. Jump-table resync · **not applicable -- measured, then dropped**
 
-**Source**: `xboxrecomp/tools/disasm/engine.py:229`, plus `functions._table_after`
-and the `jump_tables` bookkeeping inside `_find_function_end`.
+xboxrecomp needs this because its `linear_sweep` decodes straight through an
+inline switch table and comes out the far side out of phase, eating the
+function's epilogue. **pcrecomp cannot have that bug.** `disassemble_function`
+is recursive descent from function starts only; it treats an indirect `jmp` as
+a block terminator and recovers the arms through `jump_table_targets`, so it
+never decodes a table as instructions in the first place. The architectures
+differ and the fix does not transfer.
 
-**The defect.** MSVC parks a switch's jump table *inline*, on the fall-through
-path, immediately after the dispatching `jmp dword ptr [reg*4 + disp]`. Any
-linear scan over that region decodes code pointers as instructions and comes out
-the far side out of phase.
+The evidence, since the queue below predicted otherwise:
 
-`disasm32.py` partly dodges this by accident -- `disassemble_function` treats the
-indirect jump as a terminator and reaches the post-table code through the switch
-arms, so the epilogue usually survives. But **`find_branch_targets` does not**.
-It is a raw byte scan, it walks straight through every table in the image, and
-every `E8`/`E9` byte sitting inside a code pointer becomes a fake call target.
-Tables are a significant share of the invented functions in item 1.
+- 2,417 functions scored a short end. 1,984 (82%) had nothing but padding in
+  the gap and were already correct; see the reference-building note in
+  `score_recovery.py`.
+- Of the 433 real ones, 98% had a jump table at the cut, which looked like
+  confirmation. It was not. Sampling 150 of them and asking *what branches into
+  the gap* -- direct targets, conditional targets, and resolved table arms --
+  the answer was **nothing, in 150 of 150**. The gaps are dword jump tables and
+  the MSVC byte index maps that pair with them. Data. The function's own end
+  simply excludes trailing switch data, which is the correct reading of "end of
+  the last instruction".
+- The one place a table could still hurt is `find_branch_targets`, which byte-
+  scans for `E8`/`E9` and walks through tables. Gating it on
+  `probes_as_function_body` would reject **1 of 844** invented false positives,
+  so there is nothing there either.
 
-**The fix.** Measure each table (entries must point inside the *same* section,
-which is what bounds the walk), record the range as data, and have both the byte
-scans and the function-end walk step over it rather than through it.
+Worth keeping the finding rather than the code: the short-end number is a
+definition difference twice over, and after correcting for both, pcrecomp's
+function ends are 95.56% exact against the map.
 
-Note the war story in that docstring: `memcpy` and `memmove` each carry a
-tail-copy table, the desync ate their `pop esi / pop edi`, and a C++
-static-initialiser loop using esi as cursor and edi as limit had both clobbered
-by its own callees and stopped after 8% of the constructor list. "Silently loses
-registers inside the CRT" is the failure mode, and it does not look like a
-disassembler bug from where you find it.
+### 3. Function-end bounding · **attempted, measured worse, reverted**
 
-**Verify**: count tables resynced on a switch-heavy binary, and confirm no
-instruction outside a table range is deleted.
+Real defect, no net-positive fix found yet.
 
----
+`func.end` is `max(block.end)`, and a function's blocks are not necessarily
+contiguous: pass 1 follows an unconditional jump as internal control flow
+whenever the target is within `0x100000` of the start -- a distance test
+standing in for a structural one. So a **ten-byte thunk** at `0x0043F770`,
+whose `jmp` lands 225 KB away, reports an end 943,579 bytes past its own start.
+95 functions of 30,731 (0.3%) are wrong this way.
 
-### 3. Section-end function bounding · ~15 lines
+Three fixes were implemented and measured on a 2,000-function sample. All three
+are worse than doing nothing:
 
-**Source**: `xboxrecomp/tools/disasm/functions.py:973` (`_find_function_end`).
+| approach | exact ends |
+|---|---:|
+| **leave it alone** | **95.55%** |
+| end at the first hole between blocks (strict contiguity) | 93.70% |
+| ...allowing a 256-byte hole | 94.00% |
+| ...4 KB | 93.95% |
+| ...64 KB | 93.95% |
+| ...256 KB | 95.25% |
 
-**The defect.** `disasm32.py` uses `abs(target - start_va) < 0x100000` to decide
-whether a branch target is internal control flow or a tail call, and takes
-`max(block.end)` as the function end. Two different questions answered with one
-constant.
+Strict contiguity fixes 94 of the 95 and breaks about twice as many, because
+**IDA's `end` is the end of a function's last chunk, not of a contiguous
+range** -- IDA models functions as having distant tails, and `max(block.end)`
+happens to model that better than any contiguous rule does. No gap threshold
+recovers the loss; the sweep above is monotonic in the wrong direction.
 
-xboxrecomp separates them. The upper bound is **the section end, or the next
-known function start**, whichever is lower; `0x100000` survives only as the
-fallback when the section end is unknown. It then tracks `max_target` -- the
-highest branch target that must be inside the function -- and refuses to stop at
-a `ret` until it has decoded *past* it, because MSVC routinely emits
-`jmp <backward>` and parks a conditional branch's target after it.
+The structural alternative -- refuse to follow a `jmp` whose target is itself a
+known function start, which is what xboxrecomp's next-known-function bound
+amounts to -- separates only **25 of the 95**. The other 70 jump into addresses
+nothing else calls a function.
 
-**Do not** simply widen pcrecomp's `0x100000`. That was nearly done while fixing
-the E9 bug, and it would have merged every tail-called function into its caller.
+So the distance guard stays for now. A correct fix has to distinguish "a chunk
+of this function" from "a tail call into another one", and neither distance,
+nor gap size, nor the current candidate set answers that. It is a call-graph
+question. Revisit after `rtti` and `vtable_scanner` improve the set of addresses
+known to be function starts.
 
-**Verify**: function sizes against a linker map. Ends should stop overshooting
-into the next function and stop truncating at out-of-line tails.
-
----
+**Do not** simply widen the `0x100000` guard. That was nearly done while fixing
+the E9 bug and would have merged every tail-called function into its caller.
 
 ### 4. `seed_from_log` · 157 lines · **cheapest win on the list**
 
@@ -554,8 +627,14 @@ each should merge rather than one winning.
       measured "false positives" were this.
 - [x] 1. `probes_as_*` candidate validation -- `probes_as_function_body`,
       gating the data-pointer scan, with a self-test.
-- [ ] 2. `resync_jump_tables`
-- [ ] 3. Section-end function bounding
+- [x] Range scoring in `score_recovery.py` -- function ends, not just starts,
+      which items 2 and 3 needed and nothing had. Baseline: 95.56% exact.
+- [~] 2. `resync_jump_tables` -- **not applicable.** pcrecomp's recursive
+      descent never decodes through a table. Measured: nothing branches into
+      any of 150 sampled short-end gaps; they are switch data.
+- [~] 3. Function-end bounding -- **real defect (95 functions), every fix
+      measured worse than leaving it.** Reverted. Needs a call-graph answer,
+      not a distance or gap one.
 - [ ] 4. `seed_from_log`
 - [ ] 5. `rtti`
 - [ ] 6. `func_id/vtable_scanner`
