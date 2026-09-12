@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-"""Extract all Win32 API imports from SoF game executables."""
-import struct, os
+"""Extract the Win32 API imports of one or more PE modules.
+
+    python extract_imports.py game.exe gamex86.dll ...
+    python extract_imports.py install_dir/
+
+Per-module import lists plus a cross-module summary marking every API that
+more than one module pulls in -- the shared-surface view that says which
+shims to write first when a game ships six DLLs.
+"""
+import struct, os, sys, glob
 
 def parse_pe_imports(filepath):
     """Parse PE import table and return {dll_name: [func_names]}."""
@@ -109,27 +117,34 @@ def parse_pe_imports(filepath):
 
     return imports
 
-# Analyze all game executables
-game_dir = r'D:\recomp\pc\sof\_work\game'
-executables = [
-    'SoF.exe',
-    'gamex86.dll',
-    'ref_gl.dll',
-    'player.dll',
-    'Defsnd.dll',
-    'EAXSnd.dll',
-    'A3Dsnd.dll',
-]
+def collect(args):
+    """Expand the command line into module paths: files, or every PE in a dir."""
+    paths = []
+    for a in args:
+        if os.path.isdir(a):
+            for ext in ('exe', 'dll', 'ocx'):
+                paths += sorted(glob.glob(os.path.join(a, '*.' + ext)))
+        else:
+            paths.append(a)
+    return paths
+
+
+if len(sys.argv) < 2:
+    print(f"Usage: {sys.argv[0]} <module.exe|dll> [more...] | <install_dir>")
+    raise SystemExit(1)
 
 all_imports = {}
 
-for exe_name in executables:
-    path = os.path.join(game_dir, exe_name)
+for path in collect(sys.argv[1:]):
+    exe_name = os.path.basename(path)
     if not os.path.exists(path):
         print(f"SKIP: {exe_name} not found")
         continue
 
     imports = parse_pe_imports(path)
+    if not imports:
+        print(f"SKIP: {exe_name} is not a PE32 with an import table")
+        continue
     all_imports[exe_name] = imports
 
     print(f"\n{'='*70}")
