@@ -33,6 +33,32 @@ that carry an end address (IDA exports, PDBs) get the better breakdown.
     python score_recovery.py --reference ida_funcs.json --candidate funcs.json
     python score_recovery.py --selftest
 
+Where the reference carries end addresses, function *ends* are scored too, over
+the true positives only -- an end is meaningless for an address where no
+function starts. A wrong end is a different failure from a wrong start and the
+scan can be perfect at one and bad at the other:
+
+  short     the recovered function stops before the real one does, so its tail
+            was never lifted. When the tail is the epilogue, every caller
+            silently loses whatever the prologue saved.
+  long      it runs past the real end and swallows what follows.
+
+Make both sides mean the same thing by "end" before trusting the end numbers.
+A disassembler's end is the end of the last instruction it decoded. IDA's runs
+to the start of the next function, so it includes the linker's alignment
+padding, and comparing the two directly makes correct functions look truncated.
+
+That is not a rounding error. On Trespasser, 2,417 functions scored short
+against untrimmed ends and 1,984 of them -- 82% -- had nothing but 0xCC and
+0x90 in the gap. They were right. The 433 that remained were real, and 98% of
+those were embedded jump tables, which is a genuine defect worth chasing. Left
+uncorrected, the reference buried a 433-function signal under four times as
+much noise.
+
+So walk each reference end back over trailing 0xCC and 0x90 when you build it.
+Not 0x00: that is a legal encoding () and trimming it eats real
+code.
+
 A reference is a second opinion, not truth, unless it came from symbols.
 Where the two disagree, go look before believing either.
 """
@@ -99,6 +125,7 @@ def classify(reference, candidate):
 
     cand_set = set(cand_starts)
     tp = [s for s in cand_starts if s in ref_set]
+    end_counts = _score_ends(tp, reference, candidate)
     fp = [s for s in cand_starts if s not in ref_set]
     # An alias sitting exactly on a reference start is a real function we
     # mislabelled -- worth its own number, since it means a genuine start was
@@ -123,6 +150,42 @@ def classify(reference, candidate):
         'aliases': len(cand_alias), 'alias_inside_known': alias_inside,
         'alias_on_reference_start': len(alias_on_start),
         'has_ranges': bool(ranges),
+        **end_counts,
+    }
+
+
+def _score_ends(tp, reference, candidate):
+    """End accuracy over the true positives.
+
+    Scored only where both sides carry an end. Aliases are excluded: an alias
+    deliberately runs to the end of the function containing it, so its end is
+    not a claim about anything and matching it would mean nothing.
+    """
+    ref_end = {a: e for a, e, _ in reference if e is not None and e > a}
+    cand_end = {a: e for a, e, k in candidate
+                if k != 'alias' and e is not None and e > a}
+
+    exact = short = long_ = 0
+    short_by = []
+    for a in tp:
+        want, got = ref_end.get(a), cand_end.get(a)
+        if want is None or got is None:
+            continue
+        if got == want:
+            exact += 1
+        elif got < want:
+            short += 1
+            short_by.append(want - got)
+        else:
+            long_ += 1
+
+    scored = exact + short + long_
+    short_by.sort()
+    return {
+        'ends_scored': scored,
+        'end_exact': exact, 'end_short': short, 'end_long': long_,
+        'end_short_median_bytes': (short_by[len(short_by) // 2] if short_by else 0),
+        'end_short_max_bytes': (short_by[-1] if short_by else 0),
     }
 
 
@@ -179,6 +242,26 @@ def demo():
     assert c6['alias_on_reference_start'] == 1, c6
     assert c6['false_negatives'] == 2, f"both starts still unfound: {c6}"
 
+    # Ends: one exact, one stopping 0x40 short of the real end.
+    c7 = classify(ref, [(0x1000, 0x1100, 'start'), (0x1100, 0x11C0, 'start')])
+    assert c7['ends_scored'] == 2, c7
+    assert c7['end_exact'] == 1 and c7['end_short'] == 1 and c7['end_long'] == 0, c7
+    assert c7['end_short_median_bytes'] == 0x40, c7
+
+    # An end past the real one is the other failure and must not read as short.
+    c8 = classify(ref, [(0x1000, 0x1180, 'start')])
+    assert c8['end_long'] == 1 and c8['end_short'] == 0, c8
+
+    # A candidate with no end at all is simply not scored, rather than counted
+    # as a perfect or a broken one.
+    c9 = classify(ref, [(0x1000, None, 'start')])
+    assert c9['ends_scored'] == 0, c9
+    assert c9['true_positives'] == 1, "no end is not a missing function"
+
+    # An alias end is not a claim about anything and is never scored.
+    c10 = classify(ref, [(0x1000, 0x1100, 'start'), (0x1040, 0x1100, 'alias')])
+    assert c10['ends_scored'] == 1, c10
+
     print('selftest ok')
 
 
@@ -227,6 +310,15 @@ def main():
             print(f"      on a reference start     "
                   f"{counts['alias_on_reference_start']:>9,}  (a real function demoted)")
     print(f"\n  precision {p:>8.2%}\n  recall    {r:>8.2%}\n  F1        {f1:>8.2%}")
+
+    if counts['ends_scored']:
+        n = counts['ends_scored']
+        print(f"\n  function ends scored {n:>9,}  (true positives with an end on both sides)")
+        print(f"      exact        {counts['end_exact']:>9,}  ({counts['end_exact'] / n:.2%})")
+        print(f"      short        {counts['end_short']:>9,}  (tail never lifted; "
+              f"median {counts['end_short_median_bytes']:,} bytes, "
+              f"max {counts['end_short_max_bytes']:,})")
+        print(f"      long         {counts['end_long']:>9,}  (ran past the real end)")
 
     if args.output:
         with open(args.output, 'w') as f:
