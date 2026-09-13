@@ -876,6 +876,26 @@ class Lifter:
                 out.append(f"L_{ins.address:08X}:")
             for line in self.translate(ins, labels):
                 out.append(f"    {line:<60} /* {ins.address:08X}: {ins.mnemonic} {ins.op_str} */")
+
+        # A body whose last instruction is not a transfer falls THROUGH into
+        # whatever follows it, and on x86 that is a real control transfer - so
+        # the C function must make it one rather than just return. Returning
+        # instead skips the callee's `ret`, leaves esp four bytes low, and the
+        # caller resumes reading its own frame one slot out. That is the worst
+        # class of bug this project can produce: nothing faults, and every
+        # value after it is off by one slot.
+        #
+        # It happens whenever the extent is shorter than the real function:
+        # a bounds file that disagrees, a catalog clamped to the next function
+        # start (disasm32.clamp_extents), or a decode that stopped early on
+        # bytes capstone would not take.
+        # `repz ret` is a plain ret with an F3 prefix, so compare the last word
+        # of the mnemonic, not the whole thing.
+        last = insns[-1].mnemonic.split()[-1] if insns else None
+        if last not in ("ret", "retn", "retf", "jmp", "iret", "iretd", "hlt"):
+            out.append(f"    /* extent ends mid-function: fall through */")
+            out.append(f"    dispatch(c, 0x{end:08X}u); return;")
+
         out.append("}")
         return "\n".join(out)
 
