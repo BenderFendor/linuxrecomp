@@ -280,6 +280,24 @@ def _selftest():
     out2 = lift_function_linear(Lifter(iat_map={}), 'sub_00401000', i2, l2, base)
     assert '_ljump' not in out2 and 'switch (_itail_tgt)' not in out2, out2
 
+    # MSVC's float comparison, which is the shape that matters: the branch is
+    # taken on `ah`, not on the compare, so `fnstsw` has to produce a real
+    # status word. Emitted as a comment it left `ah` stale and every float
+    # comparison in the binary branched on whatever was in it.
+    #
+    #   fld dword [ebp+8] / fcomp dword [ebp+0xc] / fnstsw ax / test ah,0x41 / ret
+    fcmp = bytes([0xD9, 0x45, 0x08,
+                  0xD8, 0x5D, 0x0C,
+                  0xDF, 0xE0,
+                  0xF6, 0xC4, 0x41,
+                  0xC3])
+    i3, l3 = linear_disassemble_function(md, fcmp, base, base, base + len(fcmp))
+    out3 = lift_function_linear(Lifter(iat_map={}), 'sub_00401000', i3, l3, base)
+    assert '_fpu_cmp' in out3, out3
+    assert 'fnstsw - FPU status to ax' not in out3, 'fnstsw is still a comment'
+    assert '0x4000u' in out3 and '0x0100u' in out3, out3
+    assert 'eax = (eax & 0xFFFF0000u)' in out3, out3
+
     print('generate.py self-test OK')
 
 

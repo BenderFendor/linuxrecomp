@@ -1485,8 +1485,40 @@ class Lifter:
             self._flag_seq += 1
 
         elif m == 'fnstsw' or m == 'fstsw':
-            lines.append(f"/* fnstsw - FPU status to ax */ {comment}")
-            # After fcom+fnstsw, the test ah pattern follows
+            # The x87 status word, built from the last compare.
+            #
+            # MSVC's float comparison is `fcom*; fnstsw ax; test ah, 0x41; jcc`,
+            # and this was a comment -- so `ah` kept whatever happened to be in
+            # it. With ah = 0, `test ah, 0x41` always set ZF and the `je` was
+            # always taken. In Force Commander that made sub_006AB3B0 -- a
+            # convergence loop that subtracts a constant until the value crosses
+            # a threshold -- spin forever, and there are 5,369 fnstsw sites in
+            # that one binary, every one of them a float comparison branching on
+            # a stale register.
+            #
+            # The `setter == 'fcom'` path below handles the case where the jcc
+            # follows the compare directly; it cannot help here, because the
+            # intervening `test` legitimately takes over the flag state. The
+            # status word has to be real.
+            #
+            # C0 is bit 8, C2 bit 10, C3 bit 14. With no NaN modelling only the
+            # three ordered outcomes arise:
+            #     st0 <  src -> C0=1  -> 0x0100, ah = 0x01
+            #     st0 == src -> C3=1  -> 0x4000, ah = 0x40
+            #     st0 >  src ->       -> 0x0000, ah = 0x00
+            # which is exactly what `test ah, 0x41` is written to distinguish.
+            sw = ("(_fpu_cmp < 0 ? 0x0100u : "
+                  "_fpu_cmp == 0 ? 0x4000u : 0x0000u)")
+            if ops and ops[0].type == X86_OP_REG:
+                lines.append(f"eax = (eax & 0xFFFF0000u) | {sw}; {comment}")
+            elif ops and ops[0].type == X86_OP_MEM:
+                addr = self._fmt_mem_addr(ops[0].mem)
+                lines.append(f"MEM16({addr}) = (uint16_t){sw}; {comment}")
+            else:
+                lines.append(f"eax = (eax & 0xFFFF0000u) | {sw}; {comment}")
+            # The flag state is left alone on purpose: `fnstsw` changes no
+            # flags, so a following `sahf` (2 sites in Focom.exe) still finds
+            # the 'fcom' state and the unsigned jcc after it maps correctly.
 
         elif m == 'sahf':
             lines.append(f"/* sahf - load flags from ah */ {comment}")
