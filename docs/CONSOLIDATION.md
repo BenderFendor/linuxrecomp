@@ -656,22 +656,66 @@ far*)`) -- and not for the `ONWIN32.EXE` the project actually lifts. A
 different grammar and a different binary, so it is a separate piece of work
 rather than a regex tweak.
 
-### 8. `debug_symbols` · 256 lines
+### 8. `debug_symbols` · **done** · and the expected result was backwards
 
-**Source**: `xboxrecomp/tools/debug_symbols/recover.py`.
+**Source**: `xboxrecomp/tools/debug_symbols/recover.py`. Ported as
+`tools/pe/debug_symbols.py`.
 
-Debug builds keep their asserts, and each assert bakes `__FILE__` into the
-binary as a string referenced from the function containing it. Two passes --
-direct attribution by string xref, then interpolation across unattributed runs
-whose endpoints agree on the same file -- map function addresses back to their
-original source files.
+An `assert` bakes `__FILE__` into the binary and references it from the function
+containing it, so the strings say which source file each function came from.
+Trespasser's *release* build carries 90 of them -- `AIMain.cpp`, `Brain.cpp`,
+`WorldDBase.cpp` -- which is the usual story: some subsystem was built with
+asserts on and nobody noticed.
 
-Emits `{address: name}`, the same shape the naming merge already consumes.
+The Xbox version consumes a `strings.json` with cross-references already
+computed. pcrecomp has no such file, so the references are found here by
+scanning each function's bytes for the address of a string, unaligned, because
+`push offset aFoo` puts the address one byte into a five-byte instruction.
 
-Applies to any assert-heavy or debug PE build. Worth checking which discs in the
-collection shipped one; historically several did by accident.
+Result on Trespasser: **4,488 of 46,853 functions attributed (9.6%)** -- 410
+observed directly, 4,078 filled by interpolation.
 
----
+### The two passes are equally trustworthy, which is not what anyone expects
+
+Trespasser's MAP records the object file every function was linked from, so the
+attribution can be scored rather than admired. The obvious hypothesis is that a
+direct `__FILE__` reference is near-certain and interpolation is the risky
+guess. Measured:
+
+| | agreement with the MAP |
+|---|---:|
+| direct (function references the string itself) | 267 / 276 (**96.7%**) |
+| interpolated (bracketed by two agreeing neighbours) | 3,363 / 3,467 (**97.0%**) |
+
+Interpolation is very slightly **better**. Not because it is clever, but
+because a direct reference proves less than it appears to: it shows an assert's
+`__FILE__` sits in this function's bytes, not that the function was compiled
+from that file, and inlining a callee drags its asserts along with it.
+Interpolation only fills runs whose two ends already agree, which turns out to
+be the stronger filter.
+
+An earlier draft of this entry asserted 99.5% for direct and 96.7% for
+interpolated. Those numbers were written before the measurement and were wrong.
+They are recorded here because inventing a plausible number for the thing you
+have not checked is precisely the habit this whole exercise exists to break.
+
+Both figures are good enough to use and neither is authoritative, so the output
+records **how** each attribution was reached -- the same distinction
+`entry_kind` draws for function starts, for the same reason: an observation and
+an inference that look identical in a file will be treated identically by
+whoever reads it.
+
+The 3% that disagree are interpolation bridging an object-file boundary whose
+two ends happened to match: `uiwnd.obj` ... `uidlgs.obj` ... `uiwnd.obj` fills
+the middle with `uiwnd.cpp`. That is the failure this method has, and it is
+bounded by how often a single file's functions are split around another's.
+
+### What it is worth
+
+It does not name a single function. It says which *file* 4,488 of them came
+from, which turns an undifferentiated wall of `sub_004A1C30` into something
+with a shape -- and tells you which functions are worth reverse-engineering in
+one sitting, because they were written in one.
 
 ### 9. `conformance` · 2,532 lines · the big one, assess before porting
 
@@ -787,7 +831,10 @@ each should merge rather than one winning.
 - [x] 7. `symbols/map_names` -- ported to `tools/pe/map_names.py`. 100%
       agreement with an independent parser on 34,159 addresses and names;
       `port` round-trips at 431/431. Borland/16-bit maps are not covered.
-- [ ] 8. `debug_symbols`
+- [x] 8. `debug_symbols` -- ported to `tools/pe/debug_symbols.py`. 4,488 of
+      46,853 Trespasser functions attributed to a source file at ~97% accuracy
+      against the MAP. Direct and interpolated attribution are equally
+      accurate, which contradicted the expectation.
 - [ ] 9. `conformance` -- assess against `lift/difftest.py` first
 - [ ] 10. `abi_analysis`, `split`
 - [ ] 11. Disassembler tests, ported alongside each item
