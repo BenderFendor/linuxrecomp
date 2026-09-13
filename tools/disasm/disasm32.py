@@ -730,7 +730,7 @@ class Disassembler:
         return functions
 
 
-def clamp_extents(functions, code_end):
+def clamp_extents(functions, code_end, starts=None):
     """No function extends past the next function's entry. Returns how many
     had to be shortened.
 
@@ -756,12 +756,17 @@ def clamp_extents(functions, code_end):
     a lift nobody can build.
 
     Accepts the {addr: Function} that find_functions returns, or the plain
-    {addr: size} a project keeps in a catalog; returns the same shape mutated.
+    {addr: size} a project keeps in a catalog. In the second shape there is no
+    entry_kind to read, so pass `starts` - the addresses that are function
+    starts - or every entry acts as a limit for every other and an alias
+    truncates the function it sits inside. Mutates and returns in place.
     """
     import bisect
 
-    starts = sorted(a for a, f in functions.items()
-                    if getattr(f, "entry_kind", "start") == "start")
+    if starts is None:
+        starts = [a for a, f in functions.items()
+                  if getattr(f, "entry_kind", "start") == "start"]
+    starts = sorted(starts)
     moved = 0
     for addr, func in functions.items():
         size = func.size if hasattr(func, "size") else func
