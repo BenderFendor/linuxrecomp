@@ -50,6 +50,16 @@ R8H = {"ah":"eax","ch":"ecx","dh":"edx","bh":"ebx"}
 # storage only, and do not take part in addressing.
 SEG = {"cs","ds","es","fs","gs","ss"}
 
+# String instructions, and the prefixes that may legitimately precede one. An
+# F3/F2 prefix on anything else is not a REP - see translate().
+REP_PREFIXES = frozenset(("rep", "repe", "repz", "repne", "repnz"))
+STRING_OPS = frozenset((
+    "movsb", "movsw", "movsd", "stosb", "stosw", "stosd",
+    "scasb", "scasw", "scasd", "lodsb", "lodsw", "lodsd",
+    "cmpsb", "cmpsw", "cmpsd", "insb", "insw", "insd",
+    "outsb", "outsw", "outsd",
+))
+
 # ---- SSE ----
 # Scalar ops, by mnemonic, to the C operator they are. The packed forms of
 # these are deliberately absent: they need per-lane code and are rare enough in
@@ -218,21 +228,37 @@ class Lifter:
         if d or not terms: terms.append(f"0x{d:08X}u")
         return "(" + " + ".join(terms) + ")"
 
+    def _bad_size(self, insn, op, what):
+        """A memory operand these cannot express. Raised rather than guessed at,
+        and named rather than left as a bare KeyError: the size is the whole
+        diagnosis. 6 is an m16:32 far pointer, 10 an x87 extended double - both
+        real, both needing their own handling in translate() rather than a
+        width-indexed accessor here."""
+        return NotImplementedError(
+            "%s: %d-byte memory operand at %#x (%s %s) - %s"
+            % (what, op.size, insn.address, insn.mnemonic, insn.op_str,
+               "far pointer (m16:32)" if op.size == 6 else
+               "x87 extended (m80)" if op.size == 10 else "unsupported width"))
+
     def rd(self, insn, op):
         sz = op.size
         if self.seg_name(op) == "fs":   # TIB-relative (SEH chain etc.) -> real fs
             off = self.seg_off(insn, op)
+            if sz not in (1, 2, 4): raise self._bad_size(insn, op, "rd fs:")
             return {1:f"__readfsbyte({off})",2:f"__readfsword({off})",4:f"__readfsdword({off})"}[sz]
         a = self.addr_expr(insn, op)
+        if sz not in (1, 2, 4): raise self._bad_size(insn, op, "rd")
         return {1:f"rd8({a})", 2:f"rd16({a})", 4:f"rd32({a})"}[sz]
 
     def wr(self, insn, op, val):
         sz = op.size
         if self.seg_name(op) == "fs":
             off = self.seg_off(insn, op)
+            if sz not in (1, 2, 4): raise self._bad_size(insn, op, "wr fs:")
             return {1:f"__writefsbyte({off}, {val});",2:f"__writefsword({off}, (unsigned short)({val}));",
                     4:f"__writefsdword({off}, {val});"}[sz]
         a = self.addr_expr(insn, op)
+        if sz not in (1, 2, 4): raise self._bad_size(insn, op, "wr")
         return {1:f"wr8({a}, {val});", 2:f"wr16({a}, {val});", 4:f"wr32({a}, {val});"}[sz]
 
     def src(self, insn, op):
@@ -427,7 +453,16 @@ class Lifter:
 
         # string ops (assume DF=0 / forward; rep prefix loops on ECX)
         parts = m.split()
-        if parts[0] in ("rep","repe","repz","repne","repnz") or parts[0] in ("movsb","movsd","movsw","stosb","stosd","stosw","scasb","scasd","scasw","lodsb","lodsd","lodsw","cmpsb","cmpsd","cmpsw"):
+        # An F3 prefix is only a REP on a string instruction. On anything else
+        # it is a hint, and the one that matters is `repz ret` (F3 C3) - AMD's
+        # branch-prediction idiom for a plain `ret`, which MSVC emits at every
+        # branch target that returns. Strip the prefix and let the real handler
+        # for the base mnemonic have it. Without this the block below indexed
+        # base[-1] and died on the 't' of "ret".
+        if parts[0] in REP_PREFIXES and len(parts) > 1 and parts[1] not in STRING_OPS:
+            m = parts[1]
+            parts = [m]
+        if parts[0] in REP_PREFIXES or parts[0] in STRING_OPS:
             rep = parts[0] if len(parts) > 1 else None
             base = parts[1] if rep else parts[0]
             esz = {"b":1,"w":2,"d":4}[base[-1]]
@@ -460,6 +495,16 @@ class Lifter:
             return [self.wr(insn, d, "pop32(c)")]
 
         # control flow
+        if m in ("jmp", "call") and ops and ops[0].type == X86_OP_MEM \
+                and ops[0].size == 6:
+            # `jmp/call fword ptr [...]` - an m16:32 far pointer. The CPU model
+            # is flat and has one code segment, so there is no correct
+            # translation: loading CS is the whole point of the instruction.
+            # An honest abort beats reading four of the six bytes and jumping
+            # somewhere plausible. In a 32-bit PE this is almost always a
+            # WOW64/segment transition in code the program never reaches, or a
+            # data run the catalog mistook for a function.
+            return [f"/* TODO far {m} m16:32 */ abort();"]
         if m == "jmp":
             t = ops[0]
             if t.type == X86_OP_IMM and t.imm in labels:
@@ -517,6 +562,17 @@ class Lifter:
     def fpu(self, insn):
         m = insn.mnemonic; ops = insn.operands
         memop = ops[0] if ops and ops[0].type == X86_OP_MEM else None
+
+        # An x87 register here is a `double`, and that is a deliberate model
+        # choice: a real x87 register is wider than the values it holds, so
+        # widening costs nothing for the loads and stores a compiler emits.
+        # It does cost something for the ones it does not. `fld tbyte` reads a
+        # genuine 80-bit extended double, `fbld`/`fbstp` read and write packed
+        # BCD, and `fldenv`/`fnstenv`/`fsave`/`frstor` move the whole 28-byte
+        # FPU environment. None of those fit, and reading eight of ten bytes as
+        # a double produces a number that looks plausible and is not.
+        if memop is not None and memop.size in (10, 28, 94, 108):
+            return [f"/* TODO x87 m{memop.size * 8}: {m} {insn.op_str} */ abort();"]
 
         if m in ("fld",):
             if memop: return [f"fpush(c, {self._fmem(insn, memop, 'f')});"]
