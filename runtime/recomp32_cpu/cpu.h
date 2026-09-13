@@ -25,6 +25,28 @@
 #include <intrin.h>   /* __readfsdword/__writefsdword: TIB-relative (fs:) access for SEH */
 #endif
 
+/* ---- SSE register file ----
+ *
+ * One storage, several views - which is how the silicon works, and why this is
+ * a union rather than eight float[4]. `movaps` moves a bit pattern, `pxor`
+ * works on integers and `addss` works on floats, all through the same 128
+ * bits; a float-only model corrupts the first two the moment a game stores a
+ * mask in an XMM register, which every SSE-era game does.
+ *
+ * Scalar single precision is `float` here and NOT `double` like the x87 stack
+ * below it. That difference is deliberate. An x87 register really is wider
+ * than the values it holds, so widening it costs nothing - but SSE single
+ * genuinely IS 32-bit, and computing `addss` in double rounds once where the
+ * hardware rounds twice. The results differ in the low bits, and in a game
+ * that feeds them to a coordinate transform the difference is visible. */
+typedef union {
+    float    f32[4];
+    double   f64[2];
+    uint32_t u32[4];
+    uint64_t u64[2];
+    int32_t  i32[4];
+} XMM;
+
 typedef struct {
     uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;
     uint32_t eip;
@@ -33,6 +55,8 @@ typedef struct {
     /* x87: register-stack of doubles. st0 == st[fpu_top]; push pre-decrements. */
     double   st[8];
     int      fpu_top;
+    /* SSE: xmm0..xmm7. A 32-bit target has no xmm8-15. */
+    XMM      xmm[8];
     uint32_t fpu_sw;   /* status word: only C0/C1/C2/C3 condition bits modelled */
     /* Segment registers: stored, but NOT used in address computation. The
      * memory model below is flat - a register holds a real 32-bit address - so
@@ -285,6 +309,62 @@ static inline void fcompare(CPU *c, double a, double b) {
 static inline void do_sahf(CPU *c, uint8_t ah) {
     c->cf = ah & 1; c->pf = (ah >> 2) & 1; c->af = (ah >> 4) & 1;
     c->zf = (ah >> 6) & 1; c->sf = (ah >> 7) & 1;
+}
+
+/* ---- SSE ----
+ *
+ * Enough of SSE/SSE2 for a Pentium 4-era game: scalar float and double, the
+ * packed moves and bitwise ops, and the compares. Packed arithmetic beyond
+ * that is not here yet - it lifts to a TODO rather than silently wrong code.
+ */
+
+/* Memory operands. Separate from the x87 rdf32/rdf64 above because those
+ * widen to double for the 80-bit stack, and these must not. memcpy because an
+ * SSE memory operand is frequently unaligned (movups exists for a reason). */
+static inline float  rdss(uint32_t a) { float  f; memcpy(&f, (void *)(uintptr_t)a, 4); return f; }
+static inline double rdsd(uint32_t a) { double d; memcpy(&d, (void *)(uintptr_t)a, 8); return d; }
+static inline XMM    rdxm(uint32_t a) { XMM x;    memcpy(&x, (void *)(uintptr_t)a, 16); return x; }
+static inline void   wrss(uint32_t a, float  v) { memcpy((void *)(uintptr_t)a, &v, 4); }
+static inline void   wrsd(uint32_t a, double v) { memcpy((void *)(uintptr_t)a, &v, 8); }
+static inline void   wrxm(uint32_t a, XMM    v) { memcpy((void *)(uintptr_t)a, &v, 16); }
+
+/* MOVSS/MOVSD loading from memory zero the rest of the register; the
+ * register-to-register forms leave the high lanes alone. Getting that
+ * backwards is invisible until something reads the high lanes, which is why
+ * it is a named helper and not an open-coded assignment. */
+static inline void sse_load_ss(XMM *d, float  v) { d->u64[0] = 0; d->u64[1] = 0; d->f32[0] = v; }
+static inline void sse_load_sd(XMM *d, double v) { d->u64[0] = 0; d->u64[1] = 0; d->f64[0] = v; }
+
+/* UCOMISS/COMISS/UCOMISD/COMISD: the comparison lands in ZF/PF/CF, and clears
+ * OF/SF/AF. An unordered compare - either operand NaN - sets all three, which
+ * is exactly what makes `ucomiss; jp` a NaN test and `ucomiss; jbe` mean
+ * "below or equal, or unordered". Note the flags are the UNSIGNED set: the
+ * compiler emits `ja`/`jbe` after a float compare, never `jg`/`jle`. */
+static inline void sse_compare(CPU *c, double a, double b) {
+    c->of = 0; c->sf = 0; c->af = 0;
+    if (a != a || b != b) { c->zf = 1; c->pf = 1; c->cf = 1; }   /* unordered */
+    else                  { c->zf = (a == b); c->pf = 0; c->cf = (a < b); }
+}
+
+/* MINSS/MAXSS are not fmin/fmax. The manual defines them as
+ *     if (dst OP src) then dst else src
+ * and that "else src" is load-bearing in two cases fmin gets the other way
+ * round: when the operands are equal - which includes +0.0 against -0.0, so
+ * min(+0,-0) is -0 but min(-0,+0) is +0 - and when either is NaN, where the
+ * comparison is false and the SECOND operand wins. Written in that exact
+ * shape, C's own "any compare with NaN is false" rule delivers both for free.
+ * Writing it the other way round, `(src < dst) ? src : dst`, looks identical
+ * and is wrong on both. */
+static inline float  sse_minf(float  d, float  s) { return (d < s) ? d : s; }
+static inline float  sse_maxf(float  d, float  s) { return (d > s) ? d : s; }
+static inline double sse_mind(double d, double s) { return (d < s) ? d : s; }
+static inline double sse_maxd(double d, double s) { return (d > s) ? d : s; }
+
+/* CVTTSS2SI and friends yield the "integer indefinite" value when the source
+ * does not fit in 32 bits, where the equivalent C cast is undefined behaviour
+ * and may trap. One comparison buys a defined answer that matches hardware. */
+static inline int32_t sse_cvtt_i32(double v) {
+    return (v >= -2147483648.0 && v < 2147483648.0) ? (int32_t)v : (int32_t)0x80000000;
 }
 
 #endif /* PCRECOMP_CPU_H */

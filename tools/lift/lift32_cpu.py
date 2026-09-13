@@ -50,6 +50,55 @@ R8H = {"ah":"eax","ch":"ecx","dh":"edx","bh":"ebx"}
 # storage only, and do not take part in addressing.
 SEG = {"cs","ds","es","fs","gs","ss"}
 
+# ---- SSE ----
+# Scalar ops, by mnemonic, to the C operator they are. The packed forms of
+# these are deliberately absent: they need per-lane code and are rare enough in
+# real binaries that a TODO is better than a plausible-looking wrong lane.
+SSE_ARITH = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
+
+# Bitwise ops on the whole 128 bits. andn is `~dst & src`, note the order.
+SSE_BITWISE = {
+    "andps": "&", "andpd": "&", "pand": "&",
+    "orps":  "|", "orpd":  "|", "por":  "|",
+    "xorps": "^", "xorpd": "^", "pxor": "^",
+    "andnps": "andn", "andnpd": "andn", "pandn": "andn",
+}
+
+# CMPccSS/SD. These do not set flags - they write an all-ones or all-zeros mask
+# into the destination lane, so the result can be ANDed as a branchless select.
+# Every predicate is written so C's "any comparison with NaN is false" rule
+# gives the unordered behaviour the hardware has.
+SSE_CMP_PRED = {
+    "eq":    "(_a == _b)",
+    "lt":    "(_a < _b)",
+    "le":    "(_a <= _b)",
+    "unord": "(_a != _a || _b != _b)",
+    "neq":   "!(_a == _b)",
+    "nlt":   "!(_a < _b)",
+    "nle":   "!(_a <= _b)",
+    "ord":   "!(_a != _a || _b != _b)",
+}
+SSE_CMP_RE = re.compile(r"^cmp(%s)(ss|sd)$" % "|".join(SSE_CMP_PRED))
+
+# Moves of the whole register. Aligned and unaligned differ only in whether the
+# hardware faults on a misaligned address; both memcpy here.
+SSE_MOV128 = frozenset({"movaps", "movups", "movapd", "movupd", "movdqa", "movdqu"})
+
+# Mnemonics that are SSE only when an XMM register is involved. `movsd` is also
+# "move string dword"; `movq`/`movd` and every `p*` op below are also MMX, where
+# the operands are mm0-7 and 64 bits wide. Routing these by name alone
+# mistranslates string loops and MMX code into nonsense that still compiles.
+SSE_AMBIGUOUS = frozenset({"movsd", "movq", "movd", "pxor", "pand", "por", "pandn"})
+
+SSE_MNEMONICS = (
+    SSE_MOV128 | SSE_AMBIGUOUS | frozenset(SSE_BITWISE)
+    | frozenset({"movss", "sqrtss", "sqrtsd", "minss", "maxss", "minsd", "maxsd",
+                 "ucomiss", "comiss", "ucomisd", "comisd",
+                 "cvtsi2ss", "cvtsi2sd", "cvttss2si", "cvttsd2si",
+                 "cvtss2si", "cvtsd2si", "cvtss2sd", "cvtsd2ss"})
+    | frozenset(o + w for o in SSE_ARITH for w in ("ss", "sd"))
+)
+
 def reg_read(name):
     if name in R32: return f"c->{name}"
     if name in R16: return f"R16(c->{R16[name]})"
@@ -224,6 +273,24 @@ class Lifter:
 
         if m[0] == "f":
             return self.fpu(insn)
+        if self.is_sse(insn):
+            return self.sse(insn)
+
+        # Prefetches are hints. They move no data and set no flags, so the
+        # correct translation really is nothing at all - and leaving them as a
+        # TODO aborts a game in the middle of code that was working.
+        if m.startswith("prefetch"):
+            return ["/* prefetch: hint only */"]
+
+        # cmovcc. Same conditions as Jcc, so the table is already written.
+        # Note x86 reads the source operand unconditionally - an unmapped
+        # address faults whether the move happens or not - but a C `if` reading
+        # a live address is the shape every caller actually relies on.
+        if m.startswith("cmov"):
+            cond = self._cond("j" + m[4:])
+            if cond:
+                d, sop = ops[0], ops[1]
+                return [f"if ({cond}) {{ {self.dst_write(insn, d, self.src(insn, sop))} }}"]
         if m == "sahf":
             return ["do_sahf(c, R8H(c->eax));"]
         if m == "lahf":
@@ -532,6 +599,144 @@ class Lifter:
         if m in ("fldenv", "fnstenv"):
             return [f"/* {m} ignored (no FP exceptions modelled) */"]
         return [f"/* TODO fpu {m} {insn.op_str} */ abort();"]
+
+    # ---- SSE ----
+    def _is_xmm(self, op):
+        return op.type == X86_OP_REG and self.md.reg_name(op.reg).startswith("xmm")
+
+    def _xi(self, op):
+        """xmm register index. 32-bit code has xmm0..xmm7 and no more."""
+        name = self.md.reg_name(op.reg) if op.type == X86_OP_REG else "<mem>"
+        if not name.startswith("xmm") or not name[3:].isdigit():
+            raise NotImplementedError("not an xmm operand: %s" % name)
+        return int(name[3:])
+
+    def is_sse(self, insn):
+        m = insn.mnemonic
+        if m not in SSE_MNEMONICS and not SSE_CMP_RE.match(m):
+            return False
+        if m in SSE_AMBIGUOUS:
+            return any(self._is_xmm(o) for o in insn.operands)
+        return True
+
+    def _ss(self, insn, op):
+        """operand as a float (scalar single)"""
+        if self._is_xmm(op): return f"c->xmm[{self._xi(op)}].f32[0]"
+        return f"rdss({self.addr_expr(insn, op)})"
+
+    def _sd(self, insn, op):
+        """operand as a double (scalar double)"""
+        if self._is_xmm(op): return f"c->xmm[{self._xi(op)}].f64[0]"
+        return f"rdsd({self.addr_expr(insn, op)})"
+
+    def _xm(self, insn, op):
+        """operand as a whole 128-bit register value"""
+        if self._is_xmm(op): return f"c->xmm[{self._xi(op)}]"
+        return f"rdxm({self.addr_expr(insn, op)})"
+
+    def sse(self, insn):
+        m = insn.mnemonic
+        ops = insn.operands
+        d = ops[0]
+        s = ops[1] if len(ops) > 1 else None
+
+        # ---- scalar moves ----
+        # Loading from memory zeroes the rest of the register; the
+        # register-to-register form moves only the low lane. See sse_load_ss.
+        if m in ("movss", "movsd"):
+            wide = m == "movsd"
+            rd_ = self._sd if wide else self._ss
+            if self._is_xmm(d) and self._is_xmm(s):
+                return [f"{rd_(insn, d)} = {rd_(insn, s)};"]
+            if self._is_xmm(d):
+                return [f"sse_load_s{'d' if wide else 's'}(&c->xmm[{self._xi(d)}], "
+                        f"{rd_(insn, s)});"]
+            st = "wrsd" if wide else "wrss"
+            return [f"{st}({self.addr_expr(insn, d)}, {rd_(insn, s)});"]
+
+        # movd/movq: the integer-lane moves. Same asymmetry as above.
+        if m == "movd":
+            if self._is_xmm(d):
+                return [f"c->xmm[{self._xi(d)}].u64[0] = {self.src(insn, s)};"
+                        f" c->xmm[{self._xi(d)}].u64[1] = 0;"]
+            return [self.dst_write(insn, d, f"c->xmm[{self._xi(s)}].u32[0]")]
+        if m == "movq":
+            if self._is_xmm(d) and self._is_xmm(s):
+                return [f"c->xmm[{self._xi(d)}].u64[0] = c->xmm[{self._xi(s)}].u64[0];"
+                        f" c->xmm[{self._xi(d)}].u64[1] = 0;"]
+            if self._is_xmm(d):
+                return [f"c->xmm[{self._xi(d)}].u64[0] = "
+                        f"rdxm({self.addr_expr(insn, s)}).u64[0];"
+                        f" c->xmm[{self._xi(d)}].u64[1] = 0;"]
+            return [f"wrsd({self.addr_expr(insn, d)}, c->xmm[{self._xi(s)}].f64[0]);"]
+
+        # ---- 128-bit moves ----
+        if m in SSE_MOV128:
+            if self._is_xmm(d):
+                return [f"c->xmm[{self._xi(d)}] = {self._xm(insn, s)};"]
+            return [f"wrxm({self.addr_expr(insn, d)}, c->xmm[{self._xi(s)}]);"]
+
+        # ---- bitwise, on the whole register ----
+        if m in SSE_BITWISE:
+            op = SSE_BITWISE[m]
+            n = self._xi(d)
+            lanes = (f"c->xmm[{n}].u64[0] = ~c->xmm[{n}].u64[0] & _s.u64[0];"
+                     f" c->xmm[{n}].u64[1] = ~c->xmm[{n}].u64[1] & _s.u64[1];"
+                     if op == "andn" else
+                     f"c->xmm[{n}].u64[0] {op}= _s.u64[0];"
+                     f" c->xmm[{n}].u64[1] {op}= _s.u64[1];")
+            return [f"{{ XMM _s = {self._xm(insn, s)}; {lanes} }}"]
+
+        # ---- scalar arithmetic ----
+        if m[:-2] in SSE_ARITH and m[-2:] in ("ss", "sd"):
+            wide = m[-2:] == "sd"
+            rd_ = self._sd if wide else self._ss
+            return [f"{rd_(insn, d)} = {rd_(insn, d)} {SSE_ARITH[m[:-2]]} {rd_(insn, s)};"]
+        if m in ("sqrtss", "sqrtsd"):
+            wide = m == "sqrtsd"
+            rd_ = self._sd if wide else self._ss
+            fn = "sqrt" if wide else "sqrtf"
+            return [f"{rd_(insn, d)} = {fn}({rd_(insn, s)});"]
+        if m in ("minss", "maxss", "minsd", "maxsd"):
+            wide = m.endswith("sd")
+            rd_ = self._sd if wide else self._ss
+            fn = f"sse_{m[:3]}{'d' if wide else 'f'}"
+            return [f"{rd_(insn, d)} = {fn}({rd_(insn, d)}, {rd_(insn, s)});"]
+
+        # ---- compares that set flags ----
+        if m in ("ucomiss", "comiss", "ucomisd", "comisd"):
+            rd_ = self._sd if m.endswith("sd") else self._ss
+            return [f"sse_compare(c, {rd_(insn, d)}, {rd_(insn, s)});"]
+
+        # ---- compares that write a mask ----
+        mm = SSE_CMP_RE.match(m)
+        if mm:
+            pred, width = mm.group(1), mm.group(2)
+            wide = width == "sd"
+            rd_ = self._sd if wide else self._ss
+            ctype = "double" if wide else "float"
+            lane = f"c->xmm[{self._xi(d)}].u64[0]" if wide else f"c->xmm[{self._xi(d)}].u32[0]"
+            ones = "~(uint64_t)0" if wide else "0xFFFFFFFFu"
+            zero = "(uint64_t)0" if wide else "0u"
+            return [f"{{ {ctype} _a = {rd_(insn, d)}, _b = {rd_(insn, s)};"
+                    f" {lane} = {SSE_CMP_PRED[pred]} ? {ones} : {zero}; }}"]
+
+        # ---- conversions ----
+        if m in ("cvtsi2ss", "cvtsi2sd"):          # int32 -> float, low lane only
+            lane = self._sd if m.endswith("sd") else self._ss
+            return [f"{lane(insn, d)} = (int32_t)({self.src(insn, s)});"]
+        if m in ("cvttss2si", "cvttsd2si"):        # float -> int32, truncating
+            rd_ = self._sd if m.startswith("cvttsd") else self._ss
+            return [self.dst_write(insn, d, f"sse_cvtt_i32({rd_(insn, s)})")]
+        if m in ("cvtss2si", "cvtsd2si"):          # float -> int32, to nearest
+            rd_ = self._sd if m.startswith("cvtsd") else self._ss
+            return [self.dst_write(insn, d, f"sse_cvtt_i32(nearbyint({rd_(insn, s)}))")]
+        if m == "cvtss2sd":
+            return [f"c->xmm[{self._xi(d)}].f64[0] = {self._ss(insn, s)};"]
+        if m == "cvtsd2ss":
+            return [f"c->xmm[{self._xi(d)}].f32[0] = (float)({self._sd(insn, s)});"]
+
+        return [f"/* TODO sse {m} {insn.op_str} */ abort();"]
 
     def _read_dst(self, insn, op):
         # read a dst operand (for read-modify-write)
