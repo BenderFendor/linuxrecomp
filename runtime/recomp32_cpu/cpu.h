@@ -108,6 +108,15 @@ static inline void eflags_unpack(CPU *c, uint32_t v) {
 static inline void push32(CPU *c, uint32_t v) { c->esp -= 4; wr32(STACK_BASE(c) + c->esp, v); }
 static inline uint32_t pop32(CPU *c) { uint32_t v = rd32(STACK_BASE(c) + c->esp); c->esp += 4; return v; }
 
+/* An instruction the lifter could not express. Plain abort() by default, so a
+ * project that includes only cpu.h is unchanged; a runtime that can say
+ * something useful - which guest address, which mnemonic, how it got there -
+ * defines RECOMP_TODO before including this. A bare abort() in two million
+ * lines becomes __fastfail in a release build, which no handler sees. */
+#ifndef RECOMP_TODO
+#define RECOMP_TODO(va, text) abort()
+#endif
+
 /* ---- absolute image references: abs VA at preferred base -> live address ---- */
 extern uint32_t g_image_delta;   /* live_base - PE ImageBase (0 if loaded where it wanted) */
 #define GVA(abs) ((uint32_t)((abs) + g_image_delta))

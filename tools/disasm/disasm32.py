@@ -494,7 +494,8 @@ class Disassembler:
         return targets
 
     def find_data_code_pointers(self, code_start: int, code_end: int,
-                                covered: set, queued: set) -> set:
+                                covered: set, queued: set,
+                                interior: bytearray = None) -> set:
         """Function pointers that exist only in data.
 
         A vtable slot, a callback table or a message-handler array can hold the
@@ -506,6 +507,16 @@ class Disassembler:
         (GTA1's handler table starts at 0x4B4AD1), and an aligned-only scan
         misses them entirely.
 
+        `interior` is a byte per address in the code range, non-zero where a
+        byte is INSIDE an instruction some already-decoded function owns. A
+        pointer landing there is not a function start and cannot be one: the
+        decode from that byte is a different instruction stream than the one
+        the program runs. It still passes probes_as_function_body, because
+        garbage that decodes cleanly to a `ret` is exactly what the middle of
+        real code looks like -- on Mario Kart, 0x007BBF1B is the second byte of
+        `mov ebp, esp`, decodes as `in al, dx`, reaches a `ret` forty bytes
+        later, and killed the boot when a truncated neighbour fell into it.
+
         Every hit is then corroborated by decoding it -- see
         probes_as_function_body. Without that the scan accepts any four bytes
         that happen to look like a code address: a float, a string fragment,
@@ -516,7 +527,7 @@ class Disassembler:
         codegen on decoded garbage.
         """
         found = set()
-        probed = rejected = 0
+        probed = rejected = mid = 0
         for s in self.sections:
             if s.is_code:
                 continue
@@ -530,14 +541,18 @@ class Disassembler:
                     continue
                 if va in covered or va in queued or va in found:
                     continue
+                if interior is not None and interior[va - code_start]:
+                    mid += 1
+                    continue
                 probed += 1
                 if not self.probes_as_function_body(va):
                     rejected += 1
                     continue
                 found.add(va)
-        if probed:
+        if probed or mid:
             print(f"[*] Data scan: probed {probed} pointer targets, "
-                  f"rejected {rejected} that do not decode as code")
+                  f"rejected {rejected} that do not decode as code "
+                  f"and {mid} that land inside an instruction")
         return found
 
     def find_functions(self, code_start: int, code_end: int, iat_map: dict = None,
@@ -590,6 +605,7 @@ class Disassembler:
         # are silently missing and show up at runtime as unresolved ITAIL/ICALL.
         functions = {}
         covered = set()          # every instruction start address across all funcs
+        interior = bytearray(max(0, code_end - code_start))   # ...and every byte within one
         owner = {}               # instruction address -> the function that decoded it
         alias_entries = set()    # entry points inside another function's body
         queue = list(all_targets)
@@ -609,6 +625,13 @@ class Disassembler:
                 for ins in b.instructions:
                     covered.add(ins.address)
                     owner.setdefault(ins.address, addr)
+                    # Every byte after the first is inside this instruction, and
+                    # so cannot be the start of anything. A bytearray and not a
+                    # set: an image this size has tens of millions of interior
+                    # bytes and a set of them costs more than the image.
+                    for k in range(ins.address + 1, ins.address + ins.size):
+                        if code_start <= k < code_end:
+                            interior[k - code_start] = 1
             return func
 
         round_no = 0
@@ -715,7 +738,8 @@ class Disassembler:
           if data_scanned:
               break
           data_scanned = True
-          ptrs = self.find_data_code_pointers(code_start, code_end, covered, queued)
+          ptrs = self.find_data_code_pointers(code_start, code_end, covered, queued,
+                                              interior)
           if not ptrs:
               break
           print(f"[*] Data scan: {len(ptrs)} functions reachable only via data pointers...")

@@ -130,6 +130,21 @@ def reg_size(name):
     if name in R16 or name in SEG: return 2
     return 1
 
+def _todo(va, what):
+    """An instruction the lifter cannot express.
+
+    A bare `abort()` in two million lines of generated C says nothing at all -
+    and in a release build MSVC turns it into `__fastfail`, which no exception
+    handler sees, so the process vanishes with 0xC0000409 and an empty log. It
+    took a memory-mapped dispatch trail to find the last one.
+
+    RECOMP_TODO carries the address and the mnemonic to whatever the runtime
+    wants to do with them. cpu.h defines it as plain abort() unless the runtime
+    says otherwise, so nothing that already includes cpu.h changes.
+    """
+    return 'RECOMP_TODO(0x%08X, "%s");' % (va, what.replace('"', "'").strip())
+
+
 class Lifter:
     def __init__(self, dll_path, image_size, read_va=None):
         self.image_lo = IMAGE_BASE
@@ -482,7 +497,7 @@ class Lifter:
                 if rep in ("repne","repnz"):return [f"while (c->ecx) {{ c->ecx--; {cmp} if (c->zf) break; }}"]
                 return [cmp]
             else:
-                return [f"/* TODO string {m} {insn.op_str} */ abort();"]
+                return [_todo(ea, f"string {m} {insn.op_str}")]
             if rep: return [f"while (c->ecx) {{ {body} c->ecx--; }}"]
             return [body]
 
@@ -504,7 +519,7 @@ class Lifter:
             # somewhere plausible. In a 32-bit PE this is almost always a
             # WOW64/segment transition in code the program never reaches, or a
             # data run the catalog mistook for a function.
-            return [f"/* TODO far {m} m16:32 */ abort();"]
+            return [_todo(ea, f"far {m} m16:32")]
         if m == "jmp":
             t = ops[0]
             if t.type == X86_OP_IMM and t.imm in labels:
@@ -549,18 +564,18 @@ class Lifter:
             return [f"c->esp += {4 + n}; return;"]
         if m.startswith("j"):
             cond = self._cond(m)
-            if cond is None: return [f"/* TODO {m} */ abort();"]
+            if cond is None: return [_todo(ea, m)]
             t = ops[0]
             if t.type == X86_OP_IMM and t.imm in labels:
                 return [f"if ({cond}) goto L_{t.imm:08X};"]
             if t.type == X86_OP_IMM:        # conditional jump to another function (shared epilogue)
                 return [f"if ({cond}) {{ dispatch(c, 0x{t.imm:08X}u); return; }}"]
-            return [f"/* TODO jcc {m} {insn.op_str} */ abort();"]
+            return [_todo(ea, f"jcc {m} {insn.op_str}")]
         if m in ("nop","hint_nop"): return ["/* nop */"]
         if m == "leave":
             return ["c->esp = c->ebp; c->ebp = pop32(c);"]
 
-        return [f"/* TODO {m} {insn.op_str} */ abort();"]
+        return [_todo(ea, f"{m} {insn.op_str}")]
 
     # ---- x87 FPU ----
     def _st_idx(self, op):
@@ -585,7 +600,7 @@ class Lifter:
         # FPU environment. None of those fit, and reading eight of ten bytes as
         # a double produces a number that looks plausible and is not.
         if memop is not None and memop.size in (10, 28, 94, 108):
-            return [f"/* TODO x87 m{memop.size * 8}: {m} {insn.op_str} */ abort();"]
+            return [_todo(insn.address, f"x87 m{memop.size * 8}: {m} {insn.op_str}")]
 
         if m in ("fld",):
             if memop: return [f"fpush(c, {self._fmem(insn, memop, 'f')});"]
@@ -684,7 +699,7 @@ class Lifter:
             return [f"/* {m} ignored */"]
         if m in ("fldenv", "fnstenv"):
             return [f"/* {m} ignored (no FP exceptions modelled) */"]
-        return [f"/* TODO fpu {m} {insn.op_str} */ abort();"]
+        return [_todo(insn.address, f"fpu {m} {insn.op_str}")]
 
     # ---- SSE ----
     def _is_xmm(self, op):
@@ -822,7 +837,7 @@ class Lifter:
         if m == "cvtsd2ss":
             return [f"c->xmm[{self._xi(d)}].f32[0] = (float)({self._sd(insn, s)});"]
 
-        return [f"/* TODO sse {m} {insn.op_str} */ abort();"]
+        return [_todo(insn.address, f"sse {m} {insn.op_str}")]
 
     def _read_dst(self, insn, op):
         # read a dst operand (for read-modify-write)
