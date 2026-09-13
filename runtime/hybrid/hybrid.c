@@ -15,9 +15,20 @@
  * ============================================================ */
 
 /* MSVC inline asm cannot address locals once esp/ebp are switched, so the
- * marshalling slots are file-scope. They are saved and restored around each
- * call, which is what makes this reentrant (RULE 2). */
-static uint32_t T_eax, T_ecx, T_edx, T_ebx, T_esi, T_edi, T_ebp, T_espp4,
+ * marshalling slots cannot be locals. They are saved and restored around each
+ * call, which is what makes this reentrant (RULE 2) - and they are
+ * thread-local, which is what makes it thread-safe, and is not optional once a
+ * game has worker threads.
+ *
+ * Reentrancy and thread-safety are different problems here and both are real.
+ * The save/restore handles one call nested inside another on the SAME thread.
+ * It does nothing for two threads in hybrid_call_machine at once, which hand
+ * each other's registers to each other's target and restore each other's host
+ * esp on the way out. Nothing faults where that happens; the process wanders
+ * off some time later. Mario Kart spawns six threads during engine startup and
+ * every one of them calls back into lifted code. */
+static __declspec(thread)
+       uint32_t T_eax, T_ecx, T_edx, T_ebx, T_esi, T_edi, T_ebp, T_espp4,
                 T_tgt, T_fesp, T_sesp;
 
 #pragma warning(disable:4731)   /* we clobber ebp deliberately; push/pop restores it */
@@ -99,11 +110,21 @@ void hybrid_call_machine(hybrid_regs *r, uint32_t target)
  */
 
 static hybrid_invoke_fn g_invoke;
-static uint8_t  *g_arena;
-static uint32_t  g_arena_top, g_frame;
+static uint32_t  g_frame, g_arena_bytes;
 static uint8_t  *g_pool;
 static size_t    g_pool_off, g_pool_size;
 static unsigned long g_r2l_calls;
+
+/* One emulated-frame arena per thread.
+ *
+ * The frame cannot live on the real stack - the host's own C frames keep
+ * descending on it while the lifted code runs, and the two would interleave -
+ * and it cannot be one shared arena either, because two threads calling back
+ * at once would carve overlapping frames out of it and quietly corrupt each
+ * other's locals. Allocated on the thread's first crossing; a thread that
+ * never calls back never pays for one. */
+static __declspec(thread) uint8_t  *t_arena;
+static __declspec(thread) uint32_t  t_arena_top;
 
 #define R2L_STUB_BYTES 16
 #define R2L_ARGS_COPIED 16      /* enough for any sane calling convention */
@@ -111,17 +132,25 @@ static unsigned long g_r2l_calls;
 static uint64_t __cdecl r2l_helper(uint32_t ova, uint32_t this_, uint32_t *real_args,
                                    uint32_t ebx, uint32_t esi, uint32_t edi, uint32_t ebp)
 {
-    uint32_t save = g_arena_top;
-    uint32_t argsp;
+    uint32_t save, argsp;
     hybrid_regs r;
     uint64_t ret;
     int i;
 
     /* The frame goes on a private arena, NOT on the real stack: the host's own
      * C frames (dispatch, the lifted function bodies) keep descending on the
-     * real stack while the lifted code runs, and the two would interleave. */
-    g_arena_top -= g_frame;
-    argsp = g_arena_top + g_frame - 0x100;
+     * real stack while the lifted code runs, and the two would interleave.
+     * Per thread, so two threads crossing at once do not carve overlapping
+     * frames out of the same one. */
+    if (!t_arena) {
+        t_arena = (uint8_t *)VirtualAlloc(NULL, g_arena_bytes,
+                                          MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!t_arena) return 0;
+        t_arena_top = (uint32_t)(uintptr_t)(t_arena + g_arena_bytes);
+    }
+    save = t_arena_top;
+    t_arena_top -= g_frame;
+    argsp = t_arena_top + g_frame - 0x100;
 
     for (i = 0; i < R2L_ARGS_COPIED; i++)
         *(uint32_t *)(uintptr_t)(argsp + 4 + i * 4) = real_args[i];
@@ -134,10 +163,10 @@ static uint64_t __cdecl r2l_helper(uint32_t ova, uint32_t this_, uint32_t *real_
     r.ecx = this_; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
     r.esp = argsp;
 
-    g_r2l_calls++;
+    InterlockedIncrement((volatile LONG *)&g_r2l_calls);
     ret = g_invoke(ova, &r, real_args);
 
-    g_arena_top = save;
+    t_arena_top = save;
     return ret;
 }
 
@@ -173,10 +202,9 @@ int hybrid_init(hybrid_invoke_fn invoke, uint32_t frame_bytes, uint32_t arena_by
     if (!arena_bytes) arena_bytes = 8u << 20;
     g_invoke = invoke;
     g_frame  = frame_bytes;
-    g_arena  = (uint8_t *)VirtualAlloc(NULL, arena_bytes, MEM_RESERVE | MEM_COMMIT,
-                                       PAGE_READWRITE);
-    if (!g_arena) return 0;
-    g_arena_top = (uint32_t)(uintptr_t)(g_arena + arena_bytes);
+    /* Not allocated here: each thread takes its own on first crossing, and the
+     * thread that calls hybrid_init is often not one of them. */
+    g_arena_bytes = arena_bytes;
     g_pool_size = 0x200000u;
     g_pool = (uint8_t *)VirtualAlloc(NULL, g_pool_size, MEM_RESERVE | MEM_COMMIT,
                                      PAGE_EXECUTE_READWRITE);
@@ -186,9 +214,16 @@ int hybrid_init(hybrid_invoke_fn invoke, uint32_t frame_bytes, uint32_t arena_by
 uint32_t hybrid_thunk(uint32_t ova)
 {
     uint8_t *s;
-    if (!g_pool || g_pool_off + R2L_STUB_BYTES > g_pool_size) return 0;
-    s = g_pool + g_pool_off;
-    g_pool_off += R2L_STUB_BYTES;
+    size_t off;
+    if (!g_pool) return 0;
+    /* The pool is shared and append-only, so a bump is all the synchronisation
+     * it needs - but it does need that much: two threads minting a thunk at
+     * once would otherwise write two stubs over each other and both return the
+     * same address. */
+    off = (size_t)InterlockedExchangeAdd((volatile LONG *)&g_pool_off,
+                                         R2L_STUB_BYTES);
+    if (off + R2L_STUB_BYTES > g_pool_size) return 0;
+    s = g_pool + off;
     s[0] = 0xB8; *(uint32_t *)(s + 1) = ova;                          /* mov eax, ova */
     s[5] = 0xE9; *(int32_t *)(s + 6) =
         (int32_t)((uint8_t *)r2l_common - (s + 10));                  /* jmp r2l_common */
