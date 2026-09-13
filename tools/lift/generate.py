@@ -7,15 +7,25 @@ sweep through the entire code section and splits by known function boundaries.
 
 import sys
 import os
+import re
 import time
 import json
-import struct
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# The lifter and the PE reader are siblings under tools/, not a package. This
+# file used to import them as `tools.pe_analyze` / `tools.lifter`, which have
+# never been the paths -- so it did not import at all, and every project forked
+# it instead of using it.
+_TOOLS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _d in ('pe', 'lift'):
+    _p = os.path.join(_TOOLS, _d)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-from tools.pe_analyze import analyze_pe, build_iat_map
-from tools.lifter import Lifter
+import lift32
+from pe_analyze import analyze_pe, build_iat_map
+from lift32 import Lifter
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32
+from capstone.x86 import X86_OP_IMM
 
 
 COND_JUMPS = {
@@ -118,39 +128,89 @@ def linear_disassemble_function(md, code_data, code_start, func_start, func_end)
     return instructions, leaders
 
 
+# The x87 condition-code helper the lifter emits for fcom-family compares.
+FPU_CMP = {'EQ': '==', 'NE': '!=', 'B': '<', 'BE': '<=', 'A': '>', 'AE': '>=',
+           'L': '<', 'LE': '<=', 'G': '>', 'GE': '>='}
+
+
 def lift_function_linear(lifter, name, instructions, leaders, func_start):
-    """Lift a linearly-disassembled function to C code."""
-    lines = []
-    lines.append(f'void {name}(void) {{')
-    lines.append(f'    uint32_t ebp = 0;')
-    lines.append(f'    double _st[8] = {{0}};')
-    lines.append(f'    int _fp_top = 0;')
-    lines.append(f'    int _fpu_cmp = 0;')
-    lines.append(f'    uint32_t _cf = 0;')
-    lines.append(f'    int _df = 1;')
-    lines.append(f'    uint32_t _flag_a = 0, _flag_b = 0;')
-    lines.append(f'    uint32_t _flag_k = FK_NONE;')
-    lines.append(f'    uint16_t _fpu_cw = 0x037F;')
-    lines.append(f'')
+    """Lift a linearly-disassembled function to C code.
+
+    The preamble comes from `lift32.FUNCTION_LOCALS`, not from a list written
+    out here. That list used to be hand-copied into every project driver, and
+    every copy went stale the moment the lifter started using a new local --
+    which is why lift32 declares the contract and this asks for it.
+
+    Two of the declarations this function used to emit were not merely stale,
+    they were wrong, and both failed quietly:
+
+      * `double _st[8]` / `int _fp_top` / `uint16_t _fpu_cw`. recomp_types.h
+        defines `_st` as `g_st`, so those lines expanded to locals *named*
+        g_st/g_fp_top/g_fpu_cw that shadowed the globals. The x87 stack is
+        shared across calls -- MSVC returns a float in st0 -- so a private copy
+        per function silently drops every floating-point return value.
+      * `uint32_t ebp = 0`. An optimising compiler splits one function's blocks
+        across the image and jumps between them, and each block addresses the
+        same frame through ebp. Lifted as separate bodies, a private ebp starts
+        each at 0 and the first `[ebp-0x20]` reads 0xFFFFFFE0.
+    """
+    va = func_start & 0xFFFFFFFF
+    lines = [f'void {name}(void) {{']
+    for decl in lift32.FUNCTION_LOCALS:
+        lines.append(f'    {decl}')
+    lines.append(f'    RECOMP_ENTER(0x{va:08X}u);')
+    lines.append('')
 
     lifter._flag_state = None
 
-    for insn in instructions:
-        # Emit label if this is a block leader
-        if insn.address in leaders:
-            lines.append(f'L_{insn.address:08X}:')
+    # An indirect jump inside a function (a switch/jump table) can compute a
+    # target that lands on ANY instruction in it, so when one is present every
+    # instruction needs a label for the local dispatch below to reach.
+    has_indirect = any(i.is_uncond_jump and i.get_branch_target() is None
+                       for i in instructions)
 
-        # Lift the instruction
-        lifted = lifter.lift_instruction(insn)
-        for line in lifted:
+    for insn in instructions:
+        if has_indirect or insn.address in leaders:
+            lines.append(f'L_{insn.address:08X}:')
+        for line in lifter.lift_instruction(insn):
             lines.append(f'    {line}')
 
     # Ensure function doesn't fall off the end without return
     if instructions and not instructions[-1].is_ret:
         lines.append('    return; /* end of function */')
 
+    # Intra-function indirect jumps lift to RECOMP_ITAIL(expr), but the global
+    # dispatch table only knows function *entries* -- it cannot resolve a label
+    # inside this body, so every switch statement would break. Route indirect
+    # tails through a local label dispatch first and fall back to the global one
+    # for genuine cross-function tail calls.
+    body = '\n'.join(lines)
+    defined = sorted(set(re.findall(r'(?m)^\s*(L_[0-9A-Fa-f]{8})\s*:', body)))
+    indirect = [i for i, l in enumerate(lines)
+                if 'RECOMP_ITAIL(' in l and 'RECOMP_ITAIL(0x' not in l]
+    if indirect and defined:
+        for i in indirect:
+            m = re.search(r'RECOMP_ITAIL\((.+?)\);\s*return;', lines[i])
+            if m:
+                lines[i] = ('    { _itail_tgt = (uint32_t)(%s); goto _ljump; }'
+                            % m.group(1))
+        lines.append('  _ljump:')
+        lines.append('    switch (_itail_tgt) {')
+        for lbl in defined:
+            lines.append(f'      case 0x{int(lbl[2:], 16):08X}u: goto {lbl};')
+        lines.append('      default: RECOMP_ITAIL(_itail_tgt); return;')
+        lines.append('    }')
+
+    # A `goto L_x` whose label is outside this body (the disassembly split a
+    # function the compiler did not) has to become a real tail call.
+    refed = set(re.findall(r'goto\s+(L_[0-9A-Fa-f]{8})', '\n'.join(lines)))
+    for lbl in sorted(refed - set(defined)):
+        lines.append(f'    {lbl}: RECOMP_ITAIL(0x{int(lbl[2:], 16):08X}u); return;')
+
     lines.append('}')
-    return '\n'.join(lines)
+    out = '\n'.join(lines)
+    return re.sub(r'CMP_(\w+)\(_fpu_cmp\)',
+                  lambda m: f'((_fpu_cmp) {FPU_CMP.get(m.group(1), "==")} 0)', out)
 
 
 def write_chunk(output_dir, file_idx, funcs):
@@ -170,7 +230,63 @@ def write_chunk(output_dir, file_idx, funcs):
             f.write('\n\n')
 
 
+def _selftest():
+    """Lift a hand-assembled function and check the emitted C.
+
+    This file spent its whole life unimportable -- `from tools.pe_analyze import
+    ...` was never a valid path -- so every project forked it instead. A test
+    that merely imports it would already have caught that, which is most of why
+    this exists.
+    """
+    md = Cs(CS_ARCH_X86, CS_MODE_32)
+    md.detail = True
+
+    #   push ebp / mov ebp,esp / mov eax,[ebp+8] / jmp eax   (indirect tail)
+    code = bytes([0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08, 0xFF, 0xE0])
+    base = 0x00401000
+    insns, leaders = linear_disassemble_function(
+        md, code, base, base, base + len(code))
+    assert insns, 'nothing disassembled'
+    assert any(i.is_uncond_jump and i.get_branch_target() is None for i in insns),         'the indirect jmp was not recognised'
+
+    out = lift_function_linear(Lifter(iat_map={}), 'sub_00401000',
+                              insns, leaders, base)
+
+    # The preamble is the contract lift32 publishes, and nothing more.
+    for decl in lift32.FUNCTION_LOCALS:
+        assert decl in out, 'missing declared local: %s' % decl
+
+    # The two declarations that used to be emitted here and were wrong. Both
+    # expand through recomp_types.h macros, so a local of the same name shadows
+    # the global and the breakage is silent.
+    for bad in ('double _st[8]', 'int _fp_top = 0', 'uint16_t _fpu_cw',
+                'uint32_t ebp = 0'):
+        assert bad not in out, 'emitted a shadowing declaration: %s' % bad
+
+    assert 'RECOMP_ENTER(0x00401000u);' in out, out
+
+    # An indirect jump must route through the local label dispatch, so a switch
+    # arm inside this same function is reachable; the global dispatch table only
+    # knows function entries and would fail to resolve it.
+    assert '_ljump:' in out and 'switch (_itail_tgt)' in out, out
+    assert 'default: RECOMP_ITAIL(_itail_tgt);' in out, out
+    # ...and with an indirect jump present, every instruction gets a label.
+    labels = re.findall(r'(?m)^\s*(L_[0-9A-Fa-f]{8})\s*:', out)
+    assert len(labels) >= len(insns) - 1, (len(labels), len(insns))
+
+    # A straight-line function needs no dispatch machinery at all.
+    ret = bytes([0x33, 0xC0, 0xC3])            # xor eax,eax / ret
+    i2, l2 = linear_disassemble_function(md, ret, base, base, base + len(ret))
+    out2 = lift_function_linear(Lifter(iat_map={}), 'sub_00401000', i2, l2, base)
+    assert '_ljump' not in out2 and 'switch (_itail_tgt)' not in out2, out2
+
+    print('generate.py self-test OK')
+
+
 def main():
+    if '--selftest' in sys.argv:
+        _selftest()
+        return
     exe_path = sys.argv[1] if len(sys.argv) > 1 else 'config/xwingalliance_decrypted.exe'
     output_dir = sys.argv[2] if len(sys.argv) > 2 else 'src/game/recomp/gen'
     split_size = int(sys.argv[3]) if len(sys.argv) > 3 else 500
