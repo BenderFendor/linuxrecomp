@@ -56,15 +56,29 @@ class Section:
 
     @property
     def effective_size(self) -> int:
-        """Section size in memory, tolerating linkers that leave VirtualSize 0.
+        """Section size in memory, tolerating linkers that leave VirtualSize 0
+        and linkers that put real content past it.
 
         Watcom (e.g. Nocturne, linker 2.18) writes VirtualSize = 0 in every
         section header and puts the real size in SizeOfRawData. Trusting
         VirtualSize there yields a zero-length code range and silently breaks
-        anything that walks sections. Every size/range computation goes through
-        here so the fallback applies once, not per caller.
+        anything that walks sections.
+
+        The other direction matters just as much, and is easier to miss because
+        nothing looks wrong. The Windows loader maps whichever of the two is
+        LARGER, so a byte past VirtualSize but inside SizeOfRawData is mapped,
+        executable, and reachable - and MSVC does put code there. Mario Kart
+        Arcade GP DX's entry point is a thunk to `mainCRTStartup` at 0x0081CDB2,
+        which is 0x36 bytes past its .text VirtualSize of 0x0081CD7C and inside
+        the raw tail that ends at 0x0081CE00. A code range stopping at
+        VirtualSize excludes the first function the program runs, and the
+        symptom is an unresolved dispatch on the very first call - a long way
+        from anything that mentions section headers.
+
+        Every size/range computation goes through here so the rule applies
+        once, not per caller.
         """
-        return self.virtual_size or self.raw_size
+        return max(self.virtual_size, self.raw_size) or self.raw_size
 
     @property
     def va_end(self) -> int:
@@ -659,10 +673,48 @@ def scan_directory(directory: str, do_hashes: bool = True):
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+def _selftest():
+    """A section's mapped extent, which is what a code range is built from.
+
+    All three cases produce a plausible-looking number and only one of them is
+    right, which is why this is pinned rather than left to read correctly.
+    """
+    def sec(vsize, raw):
+        return Section(name='.text', virtual_address=0x1000, virtual_size=vsize,
+                       raw_offset=0x400, raw_size=raw, characteristics=0x60000020)
+
+    # The ordinary case: VirtualSize is the smaller and is authoritative for
+    # where the content ends; the raw tail is file padding.
+    assert sec(0x41BD7C, 0x41BE00).effective_size == 0x41BE00
+
+    # Watcom (Nocturne, linker 2.18) writes VirtualSize = 0 in every header and
+    # puts the real size in SizeOfRawData. Trusting VirtualSize gives a
+    # zero-length code range and silently breaks everything downstream.
+    assert sec(0, 0x8000).effective_size == 0x8000
+
+    # And the direction that is easy to miss because nothing looks wrong: the
+    # loader maps whichever is LARGER, so content past VirtualSize is mapped,
+    # executable and reachable. Mario Kart Arcade GP DX's entry point is a
+    # thunk to mainCRTStartup 0x36 bytes past its .text VirtualSize. A range
+    # stopping there excludes the first function the program runs.
+    assert sec(0x100, 0x8000).effective_size == 0x8000
+    assert sec(0x1000, 0x1000).va_end == 0x2000
+
+    assert sec(0x41BD7C, 0x41BE00).is_code
+    assert not sec(0x100, 0x100).is_data
+
+    print("pe_analyze.py self-test OK")
+
+
 if __name__ == '__main__':
+    if sys.argv[1:2] == ['--selftest']:
+        _selftest()
+        sys.exit(0)
+
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} <pe_file> [--json out.json] [--hash]")
         print(f"       {sys.argv[0]} --all <directory> [--hash]")
+        print(f"       {sys.argv[0]} --selftest")
         sys.exit(1)
 
     do_hashes = '--hash' in sys.argv
