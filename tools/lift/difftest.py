@@ -197,6 +197,74 @@ CASES = [
     # A shift of zero writes no flags at all, and the guard on the shift's flag
     # publication now says exactly that.
     Case('shift.by-zero', bytes.fromhex('f9c1e000'), {'eax': 0}, undef=('OF', 'AF')),
+    # --- rep movs/stos honour the direction flag ---
+    #
+    # The rep forms used to ignore DF entirely: always a forward memcpy, always
+    # incrementing. With `std` set a real CPU walks DOWN from esi/edi, so the
+    # lifted copy read and wrote from the wrong end and ran off past its
+    # buffer. MechCommander Gold's VFX_pane_copy takes that path for an
+    # overlapping blit, and it was overwriting the object after its
+    # destination -- a live C++ object, vtable and all.
+    Case('movsb.rep-backward', bytes.fromhex('fdf3a4'),      # std; rep movsb
+         {'ecx': 4, 'esi': SCRATCH + 3, 'edi': SCRATCH + 0x103},
+         mem={SCRATCH: b'ABCD'}),
+    Case('movsd.rep-backward', bytes.fromhex('fdf3a5'),      # std; rep movsd
+         {'ecx': 2, 'esi': SCRATCH + 4, 'edi': SCRATCH + 0x104},
+         mem={SCRATCH: b'ABCDEFGH'}),
+    Case('movsb.rep-forward', bytes.fromhex('fcf3a4'),       # cld; rep movsb
+         {'ecx': 4, 'esi': SCRATCH, 'edi': SCRATCH + 0x100},
+         mem={SCRATCH: b'ABCD'}),
+    Case('stosb.rep-backward', bytes.fromhex('fdf3aa'),      # std; rep stosb
+         {'eax': 0x5A, 'ecx': 4, 'edi': SCRATCH + 0x103}),
+    Case('stosd.rep-backward', bytes.fromhex('fdf3ab'),      # std; rep stosd
+         {'eax': 0x11223344, 'ecx': 2, 'edi': SCRATCH + 0x104}),
+
+    # --- string compare / scan, every width ---
+    #
+    # Only the byte forms were implemented, so `repe cmpsd` lifted to an empty
+    # statement -- and that is the aligned fast path in the MSVC 6 memcmp, which
+    # then returned whatever was in eax. Two identical buffers compared as
+    # different, and MechCommander Gold's config parser found none of its keys
+    # in a file it had read perfectly.
+    Case('cmpsd.repe-equal', bytes.fromhex('f3a7'),          # repe cmpsd
+         {'ecx': 2},
+         mem={SCRATCH: b'ABCDEFGH', SCRATCH + 0x100: b'ABCDEFGH'}),
+    Case('cmpsd.repe-differs', bytes.fromhex('f3a7'),
+         {'ecx': 2},
+         mem={SCRATCH: b'ABCDEFGH', SCRATCH + 0x100: b'ABCDwxyz'}),
+    Case('cmpsw.repe-differs', bytes.fromhex('f366a7'),      # repe cmpsw
+         {'ecx': 3},
+         mem={SCRATCH: b'ABCDEF', SCRATCH + 0x100: b'ABxxEF'}),
+    Case('cmpsb.repe-equal', bytes.fromhex('f3a6'),          # repe cmpsb
+         {'ecx': 4},
+         mem={SCRATCH: b'ABCD', SCRATCH + 0x100: b'ABCD'}, undef=('AF',)),
+    Case('cmpsd.single', bytes.fromhex('a7'),                # cmpsd, no prefix
+         mem={SCRATCH: b'ABCD', SCRATCH + 0x100: b'ABCE'}),
+    # The count and the pointers advance for the element that ENDS the loop too,
+    # which is what `repne scasb; not ecx; dec ecx` depends on for strlen.
+    Case('scasb.repne-found', bytes.fromhex('f2ae'),         # repne scasb
+         {'eax': 0x41, 'ecx': 4},
+         mem={SCRATCH + 0x100: b'xyAB'}, undef=('AF',)),
+    Case('scasd.repne-found', bytes.fromhex('f2af'),         # repne scasd
+         {'eax': 0x44434241, 'ecx': 3},
+         mem={SCRATCH + 0x100: b'zzzzABCDwwww'}),
+
+    # x86 masks a shift count to 5 bits before doing anything, so `shl eax,0x6e`
+    # shifts by 14. Emitting the raw immediate shifted a uint32_t by more than
+    # its width, which is undefined in C -- the compiler may hold the operand,
+    # zero it, or use the low bits, and those disagree. MechCommander Gold has
+    # 172 of these.
+    Case('shl.count-masked', bytes.fromhex('c1e06e'),            # shl eax, 0x6e -> 14
+         {'eax': 0x0000FFFF}, undef=('OF', 'AF')),
+    Case('shr.count-masked', bytes.fromhex('c1e825'),            # shr eax, 0x25 -> 5
+         {'eax': 0xDEADBEEF}, undef=('OF', 'AF')),
+    Case('sar.count-masked', bytes.fromhex('c1f8ff'),            # sar eax, 0xff -> 31
+         {'eax': 0x80000000}, undef=('OF', 'AF')),
+    # ...and a count that masks to zero is a true no-op: CF has to survive it,
+    # which is also the case that made the carry read one bit past the operand.
+    Case('shl.count-masks-to-zero', bytes.fromhex('f9c1e0a0'),   # stc; shl eax, 0xa0 -> 0
+         {'eax': 0x12345678}, undef=('OF', 'AF')),
+
     # The carry a shift writes has to reach its consumer. `shr ecx,1` leaves the
     # odd bit in CF and the next branch decides whether a trailing byte gets
     # copied -- which is the background blitter's entire inner loop.
@@ -326,6 +394,43 @@ CASES = [
          {'ebp': 0x12345678}),
     Case('pop16.keeps-high-half', bytes.fromhex('6650665b'),      # push ax; pop bx
          {'eax': 0x0000BEEF, 'ebx': 0xDEAD0000}),
+
+    # --- setcc / cmovcc after test, which used to read the wrong macro -------
+    #
+    # `test a, b` leaves CF=0 and OF=0 and sets ZF/SF from `a & b`, so an
+    # ordering condition after it is a comparison of that result against ZERO.
+    # The jcc forms were mapped to the TEST_* macros; the setcc and cmovcc forms
+    # were looked up under their own spelling, missed, and fell back to
+    # CMP_LE(a, b) -- a comparison of the two operands. For the `test r, r`
+    # idiom that reads `r <= r`, true for every value in the register, so
+    # `setle al` returned 1 no matter what. MechCommander's
+    # PacketFile::seekPacket builds its return code out of exactly that and so
+    # failed on every call, which is what kept the campaign from loading.
+    #
+    # The sign of the register is the whole point, so each is run three ways.
+    Case('setle.after-test.positive', bytes.fromhex('85db0f9ec0'),  # test ebx,ebx; setle al
+         {'ebx': 0x0000002C, 'eax': 0}),
+    Case('setle.after-test.zero', bytes.fromhex('85db0f9ec0'),
+         {'ebx': 0, 'eax': 0}),
+    Case('setle.after-test.negative', bytes.fromhex('85db0f9ec0'),
+         {'ebx': 0xFFFFFFF0, 'eax': 0}),
+    Case('setg.after-test.positive', bytes.fromhex('85db0f9fc0'),   # setg al
+         {'ebx': 0x0000002C, 'eax': 0}),
+    Case('setl.after-test.negative', bytes.fromhex('85db0f9cc0'),   # setl al
+         {'ebx': 0xFFFFFFF0, 'eax': 0}),
+    Case('setge.after-test.zero', bytes.fromhex('85db0f9dc0'),      # setge al
+         {'ebx': 0, 'eax': 0}),
+    # The whole tail of seekPacket: setle, dec, and, add -- the return code is
+    # 0 only when the AND result is above zero, and 0xBADF0004 otherwise.
+    Case('seekpacket.tail.ok', bytes.fromhex('31c085db0f9ec04825fcff2045050400dfba'),
+         {'ebx': 0x0000002C}),
+    Case('seekpacket.tail.fail', bytes.fromhex('31c085db0f9ec04825fcff2045050400dfba'),
+         {'ebx': 0}),
+    # `and` sets the same flags from the same value, so it takes the same path.
+    Case('setle.after-and.positive', bytes.fromhex('21c80f9ec2'),   # and eax,ecx; setle dl
+         {'eax': 0xFF, 'ecx': 0x2C, 'edx': 0}),
+    Case('cmovle.after-test.positive', bytes.fromhex('85db0f4ec1'), # test ebx,ebx; cmovle eax,ecx
+         {'ebx': 0x0000002C, 'eax': 0x11111111, 'ecx': 0x22222222}),
 ]
 
 

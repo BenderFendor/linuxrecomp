@@ -377,6 +377,25 @@ class Lifter:
         """Format LEA (just the address calculation, no memory access)."""
         return self._fmt_mem_addr(mem)
 
+    @staticmethod
+    def _string_cmp_base(insn, m):
+        """The cmps/scas mnemonic, if this really is a string instruction.
+
+        `cmpsd` is also an SSE mnemonic (CMPSD xmm, xmm, imm8), so the mnemonic
+        alone cannot decide. The opcode can: string compare is A6/A7 and string
+        scan is AE/AF, after any prefixes. Returns None for anything else.
+        """
+        base = m.split()[-1]
+        if base not in ('cmpsb', 'cmpsw', 'cmpsd', 'scasb', 'scasw', 'scasd'):
+            return None
+        prefixes = {0xF0, 0xF2, 0xF3, 0x66, 0x67,
+                    0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65}
+        for byte in insn.bytes:
+            if byte in prefixes:
+                continue
+            return base if byte in (0xA6, 0xA7, 0xAE, 0xAF) else None
+        return None
+
     def _shift_count(self, op):
         """x86 masks a shift count to its low 5 bits before doing anything --
         for BYTE and WORD operands too, not just DWORD. `shl dword [ecx], 0x6e`
@@ -511,10 +530,23 @@ class Lifter:
 
         cmp_macro, test_macro, desc = entry
 
+        # setcc and cmovcc carry exactly the condition of the matching jcc, so
+        # normalise to that spelling ONCE. Every table below is keyed on the
+        # jcc form, and looking one up with the raw mnemonic silently misses:
+        # `jle` after a test got TEST_LE and `setle` after the same test got
+        # CMP_LE, which compares the two operands instead of the AND result --
+        # for `test ebx, ebx` that is `ebx <= ebx`, true for every value. That
+        # is how PacketFile::seekPacket came to fail on every call.
+        if mnem.startswith('cmov'):
+            jform = 'j' + mnem[4:]
+        elif mnem.startswith('set'):
+            jform = 'j' + mnem[3:]
+        else:
+            jform = mnem
+
         if self._flag_state is None:
             # Reached from blocks with different flag-setters: decide at runtime.
-            jcc = mnem.replace('cmov', 'j', 1) if mnem.startswith('cmov') else                   ('j' + mnem[3:] if mnem.startswith('set') else mnem)
-            cc = COND_CODE.get(jcc)
+            cc = COND_CODE.get(jform)
             if cc:
                 return f"recomp_cond(_flag_k, _flag_a, _flag_b, {cc})"
             return f"/* no flag state for {mnem} */ _cf"
@@ -523,18 +555,19 @@ class Lifter:
 
         if setter == 'cmp':
             return f"{cmp_macro}({ops})"
-        elif setter == 'test':
-            # After `test`, CF=0 and OF=0, so the unsigned/signed-ordering jccs
-            # reduce to ZF/SF tests against the AND result -- NOT cmp(a,b) (which
-            # would compare the two operands as if subtracted). Map them directly.
+        elif setter in ('test', 'and'):
+            # After `test` (and `and`, whose result is the same value), CF=0 and
+            # OF=0, so the unsigned/signed-ordering jccs reduce to ZF/SF tests
+            # against the AND result -- NOT cmp(a,b), which would compare the two
+            # operands as if subtracted. Map them directly.
             test_only = {
                 'jbe': f"TEST_Z({ops})",  'ja':  f"TEST_NZ({ops})",   # CF=0: jbe==je, ja==jne
                 'jb':  "0",               'jae': "1",                 # CF=0: jb never, jae always
                 'jg':  f"TEST_G({ops})",  'jle': f"TEST_LE({ops})",
                 'jge': f"TEST_NS({ops})", 'jl':  f"TEST_S({ops})",
             }
-            if jcc_mnemonic in test_only:
-                return test_only[jcc_mnemonic]
+            if jform in test_only:
+                return test_only[jform]
             if test_macro:
                 return f"{test_macro}({ops})"
             return f"{cmp_macro}({ops})"
@@ -542,8 +575,12 @@ class Lifter:
             # sub and cmp leave the same flags, and the CMP_* macros are written
             # as a subtraction, so the pairing is exact.
             return f"/* sub result */ {cmp_macro}({ops})"
-        elif setter in ('and', 'or', 'xor'):
-            # Logical ops clear CF, set ZF/SF based on result
+        elif setter in ('or', 'xor'):
+            # Logical ops clear CF and set ZF/SF from the result. `and` is
+            # handled above, where the TEST_* macros compute exactly its result.
+            # ponytail: or/xor keep the old pairing -- TEST_* computes `a & b`,
+            # which is NOT their result, so an ordering jcc after one of them is
+            # still approximate. Give them their own macros if one ever shows up.
             if test_macro:
                 return f"/* {setter} result */ {test_macro}({ops})"
             return f"/* {setter} result */ {cmp_macro}({ops})"
@@ -717,6 +754,10 @@ class Lifter:
                 a = self._fmt_read(ops[0])
                 b = self._fmt_read(ops[1])
                 lines.append(self._flag_capture(a, b, op_bits(ops[0])))
+                # sub writes CF too -- same reasoning as cmp above. Publish it
+                # before the write-back, while _flag_a/_flag_b still hold the
+                # operands rather than the result.
+                lines.append("_cf = (uint32_t)CMP_B(_flag_a, _flag_b);")
                 lines.append(f"{self._fmt_write(ops[0], f'{a} - {b}')}; {comment}")
                 self._flag_state = ('sub', "_flag_a, _flag_b")
 
@@ -968,6 +1009,21 @@ class Lifter:
                 b = self._fmt_read(ops[1])
                 lines.append(f"/* cmp {a}, {b} */ {comment}")
                 lines.append(self._flag_capture(a, b, op_bits(ops[0])))
+                # cmp writes CF, and something later reads it. The lazy triple
+                # serves the jcc/setcc that ask by condition, but `sbb r, r` and
+                # `adc` read the running _cf directly -- and that used to hold
+                # whatever an unrelated earlier instruction left there.
+                #
+                # `cmp; sbb eax,eax` is how the MSVC 6 CRT turns a comparison
+                # into -1/0/+1: both memcmp and strcmp end that way, and with a
+                # stale carry memcmp called two identical buffers different.
+                # MechCommander's config parser is built on those, so it found
+                # none of its keys in a file it had read correctly.
+                #
+                # CMP_B is the borrow at the operand's width, which is exactly
+                # CF, and _flag_a/_flag_b are already width-aligned by the
+                # capture above.
+                lines.append("_cf = (uint32_t)CMP_B(_flag_a, _flag_b);")
                 self._flag_state = ('cmp', "_flag_a, _flag_b")
             self._flag_seq += 1
 
@@ -1080,8 +1136,23 @@ class Lifter:
                    'lodsb': 1, 'lodsw': 2, 'lodsd': 4}[base]
             if base.startswith('movs'):
                 if rep:
-                    lines.append(f"memcpy((void*)ADDR(edi), (void*)ADDR(esi), ecx * {esz}u); {comment}")
-                    lines.append(f"esi += ecx * {esz}u; edi += ecx * {esz}u; ecx = 0;")
+                    # DF decides the direction, and the rep forms used to ignore
+                    # it -- they always copied forward and always incremented.
+                    # With `std` set a real CPU walks DOWN from esi/edi, so the
+                    # lifted copy read and wrote from the wrong end and ran off
+                    # into whatever followed. VFX_pane_copy takes exactly that
+                    # path for an overlapping blit, and it smashed the object
+                    # sitting after its destination.
+                    #
+                    # memmove, not memcpy: overlap is the whole reason the
+                    # backward form exists.
+                    lines.append(
+                        f"{{ uint32_t _n = ecx, _b = _n * {esz}u; {comment}"
+                        f" if (_df > 0) {{ memmove((void*)ADDR(edi),"
+                        f" (void*)ADDR(esi), _b); esi += _b; edi += _b; }}"
+                        f" else {{ memmove((void*)ADDR(edi - _b + {esz}u),"
+                        f" (void*)ADDR(esi - _b + {esz}u), _b);"
+                        f" esi -= _b; edi -= _b; }} ecx = 0; }}")
                 elif esz == 1:
                     lines.append(f"MEM8(edi) = MEM8(esi); esi += _df; edi += _df; {comment}")
                 elif esz == 2:
@@ -1089,15 +1160,18 @@ class Lifter:
                 else:
                     lines.append(f"MEM32(edi) = MEM32(esi); esi += _df * 4; edi += _df * 4; {comment}")
             elif base.startswith('stos'):
-                if rep and esz == 1:
-                    lines.append(f"memset((void*)ADDR(edi), LO8(eax), ecx); {comment}")
-                    lines.append(f"edi += ecx; ecx = 0;")
-                elif rep and esz == 2:
-                    lines.append(f"MEMSET16((void*)ADDR(edi), (uint16_t)LO16(eax), ecx); {comment}")
-                    lines.append(f"edi += ecx * 2u; ecx = 0;")
-                elif rep:
-                    lines.append(f"MEMSET32((void*)ADDR(edi), eax, ecx); {comment}")
-                    lines.append(f"edi += ecx * 4; ecx = 0;")
+                if rep:
+                    # Same direction-flag story as movs. The fill value is
+                    # uniform, so only the start address and the pointer update
+                    # change -- but they change by the whole span.
+                    fill = {1: "memset((void*)ADDR(%s), LO8(eax), _n)",
+                            2: "MEMSET16((void*)ADDR(%s), (uint16_t)LO16(eax), _n)",
+                            4: "MEMSET32((void*)ADDR(%s), eax, _n)"}[esz]
+                    lines.append(
+                        f"{{ uint32_t _n = ecx, _b = _n * {esz}u; {comment}"
+                        f" if (_df > 0) {{ {fill % 'edi'}; edi += _b; }}"
+                        f" else {{ {fill % f'edi - _b + {esz}u'}; edi -= _b; }}"
+                        f" ecx = 0; }}")
                 elif esz == 1:
                     lines.append(f"MEM8(edi) = LO8(eax); edi += _df; {comment}")
                 elif esz == 2:
@@ -1112,32 +1186,47 @@ class Lifter:
                 else:
                     lines.append(f"eax = MEM32(esi); esi += _df * 4; {comment}")
 
-        elif m == 'scasb':
-            # Compare AL with [EDI] (capture flags BEFORE advancing EDI).
-            lines.append(f"_flag_a = LO8(eax); _flag_b = MEM8(edi); edi += _df; {comment}")
-            self._flag_state = ('cmp', "_flag_a, _flag_b")
-            self._flag_seq += 1
-
-        elif m in ('repne scasb', 'repnz scasb'):
-            # repne scasb: scan [EDI] for AL. Real x86 decrements ECX and advances
-            # EDI for EACH byte processed (incl. the match) and stops on match --
-            # a do-while, not a pre-test. (A pre-test loop miscomputes the strlen
-            # idiom `repne scasb; not ecx; dec ecx` for an empty string as -1.)
-            # ZF=1 iff a match was found, for a following je/jne.
-            lines.append(f"{{ uint32_t _t = LO8(eax); "
-                         f"while (ecx) {{ _t = MEM8(edi); edi += _df; ecx--; "
-                         f"if (LO8(eax) == _t) break; }} "
-                         f"_flag_a = LO8(eax); _flag_b = _t; }} {comment}")
-            self._flag_state = ('cmp', "_flag_a, _flag_b")
-            self._flag_seq += 1
-
-        elif m in ('repe cmpsb', 'repz cmpsb'):
-            # repe cmpsb: compare [ESI] vs [EDI] while equal; stop on first mismatch
-            # or ECX==0. Flags reflect the last byte pair (for strcmp's jcc).
-            lines.append(f"{{ uint32_t _a = 0, _b = 0; "
-                         f"while (ecx) {{ _a = MEM8(esi); _b = MEM8(edi); "
-                         f"esi += _df; edi += _df; ecx--; if (_a != _b) break; }} "
-                         f"_flag_a = _a; _flag_b = _b; }} {comment}")
+        # --- String compare and scan: cmps/scas, every width, with or without
+        # a rep prefix.
+        #
+        # Only the byte forms existed, so `repe cmpsd` lifted to an empty
+        # statement -- and that is the aligned fast path in the MSVC 6 memcmp.
+        # memcmp then returned whatever happened to be in eax, so two identical
+        # buffers compared as different, and MechCommander's config parser found
+        # none of its keys in a file it had read perfectly.
+        #
+        # Two semantics matter. The count is decremented and the pointers
+        # advanced for EVERY element processed, including the one that ends the
+        # loop -- a do-while, not a pre-test, or the strlen idiom
+        # `repne scasb; not ecx; dec ecx` reports -1 for an empty string. And
+        # the flags must reflect the LAST pair compared, because that is what
+        # the following jcc asks about.
+        elif Lifter._string_cmp_base(insn, m):
+            base = Lifter._string_cmp_base(insn, m)
+            parts = m.split()
+            rep = parts[0] if len(parts) > 1 else ''
+            size = {'b': 1, 'w': 2, 'd': 4}[base[-1]]
+            mem = {1: 'MEM8', 2: 'MEM16', 4: 'MEM32'}[size]
+            step = '_df' if size == 1 else f'(_df * {size})'
+            if base.startswith('cmps'):
+                load = (f"_a = {mem}(esi); _b = {mem}(edi); "
+                        f"esi += {step}; edi += {step};")
+            else:
+                acc = {1: 'LO8(eax)', 2: 'LO16(eax)', 4: 'eax'}[size]
+                load = f"_a = {acc}; _b = {mem}(edi); edi += {step};"
+            if rep in ('rep', 'repe', 'repz'):
+                stop = '_a != _b'          # repeat while equal
+            elif rep in ('repne', 'repnz'):
+                stop = '_a == _b'          # repeat while different
+            else:
+                stop = None
+            if stop is None:
+                lines.append(f"{{ uint32_t _a, _b; {load} "
+                             f"_flag_a = _a; _flag_b = _b; }} {comment}")
+            else:
+                lines.append(f"{{ uint32_t _a = 0, _b = 0; "
+                             f"while (ecx) {{ {load} ecx--; if ({stop}) break; }} "
+                             f"_flag_a = _a; _flag_b = _b; }} {comment}")
             self._flag_state = ('cmp', "_flag_a, _flag_b")
             self._flag_seq += 1
 
