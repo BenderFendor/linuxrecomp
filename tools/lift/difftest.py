@@ -205,6 +205,36 @@ CASES = [
     Case('shl.publishes-cf', bytes.fromhex('d1e019c9'),          # shl eax,1; sbb ecx,ecx
          {'eax': 0x80000000, 'ecx': 0}, undef=('OF', 'AF')),
 
+    # --- the jcc/setcc PAIRING, which comparing flags never tested ---
+    #
+    # Everything above compares recomp_eflags() against hardware EFLAGS, and
+    # that derivation was right all along. What it could not see is the OTHER
+    # path: when the lifter knows the flag-setter statically it emits a CMP_*
+    # macro instead, and those macros SUBTRACT. Paired with an add or an inc,
+    # which added, the condition asked a different question entirely.
+    #
+    # `inc eax; jne` is how you ask "was that -1?". Against a subtracting macro
+    # it asked "was that 1?", and Treasure Cove (1996) put up "Could not find
+    # Resource File!" over a resource DLL it had just opened successfully.
+    #
+    # setcc goes through the same pairing and lands in a register, so a wrong
+    # answer shows up as a wrong value rather than only as a flag.
+    Case('inc.paired.sete-true', bytes.fromhex('400f94c3'),      # inc eax; sete bl
+         {'eax': 0xFFFFFFFF, 'ebx': 0}),
+    Case('inc.paired.sete-false', bytes.fromhex('400f94c3'),     # inc eax; sete bl
+         {'eax': 1, 'ebx': 0}),
+    Case('add.paired.sete', bytes.fromhex('01c80f94c3'),         # add eax,ecx; sete bl
+         {'eax': 1, 'ecx': 0xFFFFFFFF, 'ebx': 0}),
+    Case('add.paired.setb', bytes.fromhex('01c80f92c3'),         # add eax,ecx; setb bl
+         {'eax': 0xFFFFFFFF, 'ecx': 2, 'ebx': 0}),
+    Case('add.paired.setl', bytes.fromhex('01c80f9cc3'),         # add eax,ecx; setl bl
+         {'eax': 0x7FFFFFFF, 'ecx': 1, 'ebx': 0}),
+    # dec and sub pair with a subtracting macro correctly; guard that.
+    Case('dec.paired.sete', bytes.fromhex('480f94c3'),           # dec eax; sete bl
+         {'eax': 1, 'ebx': 0}),
+    Case('sub.paired.setl', bytes.fromhex('29c80f9cc3'),         # sub eax,ecx; setl bl
+         {'eax': 1, 'ecx': 2, 'ebx': 0}),
+
     # --- and so must the instructions whose whole job IS the carry ---
     #
     # Borland's strcpy and strcat are one routine entered at two addresses, clc

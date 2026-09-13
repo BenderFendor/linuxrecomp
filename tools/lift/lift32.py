@@ -377,6 +377,56 @@ class Lifter:
         """Format LEA (just the address calculation, no memory access)."""
         return self._fmt_mem_addr(mem)
 
+    def _shift_count(self, op):
+        """x86 masks a shift count to its low 5 bits before doing anything --
+        for BYTE and WORD operands too, not just DWORD. `shl dword [ecx], 0x6e`
+        shifts by 14, not by 110.
+
+        Emitting the raw immediate made the generated C shift by more than the
+        width of the type, which is undefined behaviour: the compiler is free to
+        keep the operand unchanged, produce zero, or use only the low bits, and
+        those disagree. MechCommander Gold has 172 such sites.
+
+        Returns (expression, constant) -- the constant is None for a count that
+        is only known at runtime (`shl eax, cl`), and folding it when it IS known
+        matters, because a compiler still type-checks the unreachable half of a
+        ternary and warns about the negative shift inside it.
+        """
+        if op.type == X86_OP_IMM:
+            n = op.imm & 31
+            return f"{n}u", n
+        return f"(({self._fmt_read(op)}) & 31)", None
+
+    def _shift_out_cf(self, a, count, n, width, kind):
+        """CF is the last bit shifted out of the operand.
+
+        A masked count can still exceed the operand width (`shl byte, 21` is a
+        legal encoding), which leaves no such bit. Intel documents CF as
+        undefined there for SHL/SHR, so zero is conformant and, unlike
+        `a >> (8 - 21)`, is not undefined behaviour in C. SAR is the exception:
+        its result is all sign bits, and so is its carry.
+        """
+        top = width - 1
+        if n == 0:
+            # `shl dword [edx], 0xa0` masks to zero. A shift of zero touches
+            # nothing at all, so CF keeps its value -- and asking for "the bit
+            # shifted out" would index one past the operand (>> 32).
+            return "_cf"
+        if n is not None:                       # count folded at generation time
+            if kind == 'left':
+                return f"((({a}) >> {width - n}) & 1u)" if n <= width else "0u"
+            if kind == 'right':
+                return f"((({a}) >> {n - 1}) & 1u)" if n <= width else "0u"
+            return f"((({a}) >> {n - 1 if n <= width else top}) & 1u)"
+        if kind == 'left':
+            return (f"(({count}) <= {width} ? "
+                    f"((({a}) >> ({width} - ({count}))) & 1u) : 0u)")
+        if kind == 'right':
+            return (f"(({count}) <= {width} ? "
+                    f"((({a}) >> (({count}) - 1)) & 1u) : 0u)")
+        return (f"(({count}) <= {width} ? ((({a}) >> (({count}) - 1)) & 1u) "
+                f": ((({a}) >> {top}) & 1u))")
+
     def _shift_flags(self, res, count, width):
         """Publish a shift's flags: CF from _cf, ZF/SF from the result.
 
@@ -488,16 +538,37 @@ class Lifter:
             if test_macro:
                 return f"{test_macro}({ops})"
             return f"{cmp_macro}({ops})"
-        elif setter in ('sub', 'add'):
-            # Result-based condition
-            return f"/* {setter} result */ {cmp_macro}({ops})"
+        elif setter == 'sub':
+            # sub and cmp leave the same flags, and the CMP_* macros are written
+            # as a subtraction, so the pairing is exact.
+            return f"/* sub result */ {cmp_macro}({ops})"
         elif setter in ('and', 'or', 'xor'):
             # Logical ops clear CF, set ZF/SF based on result
             if test_macro:
                 return f"/* {setter} result */ {test_macro}({ops})"
             return f"/* {setter} result */ {cmp_macro}({ops})"
-        elif setter in ('dec', 'inc'):
-            return f"/* {setter} result */ {cmp_macro}({ops})"
+        elif setter == 'dec':
+            # dec's operands are (value, 1) and its result is value - 1, which
+            # is what a CMP_* macro computes. Same as sub.
+            return f"/* dec result */ {cmp_macro}({ops})"
+        elif setter in ('add', 'inc'):
+            # NOT the CMP_* macros: those subtract, and these added.
+            #
+            # `inc eax; jne` is the ordinary way to ask "was that -1?" -- the
+            # increment makes it zero -- and paired with a subtracting macro it
+            # asked "was that 1?" instead. Treasure Cove opens its resource DLL,
+            # tests the handle exactly that way, and put up "Could not find
+            # Resource File!" over a file it had just opened successfully.
+            #
+            # There is no macro to reach for: ZF and SF could be written against
+            # the sum, but CF and OF need both operands and the direction. The
+            # runtime derivation already knows all of that from FK_ADD/FK_INC.
+            jcc = (mnem.replace('cmov', 'j', 1) if mnem.startswith('cmov')
+                   else ('j' + mnem[3:] if mnem.startswith('set') else mnem))
+            cc = COND_CODE.get(jcc)
+            if cc:
+                return f"/* {setter} result */ recomp_cond(_flag_k, {ops}, {cc})"
+            return f"/* {setter}: unmapped {mnem} */ 0"
         elif setter == 'fcom':
             # fcom/fcomp + fnstsw + sahf loads C0->CF and C3->ZF, so MSVC tests the
             # FPU comparison with the UNSIGNED jccs. `ops` is the -1/0/1 result.
@@ -765,10 +836,10 @@ class Lifter:
         elif m == 'shl' or m == 'sal':
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
-                b = self._fmt_read(ops[1])
+                b, bn = self._shift_count(ops[1])
                 res = f"({a} << {b})"
                 w = op_bits(ops[0])
-                lines.append(f"if ({b}) _cf = ((({a}) >> ({w} - ({b}))) & 1u); {comment}")
+                lines.append(f"if ({b}) _cf = {self._shift_out_cf(a, b, bn, w, 'left')}; {comment}")
                 lines.append(self._shift_flags(res, b, w))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} << {b}')}; {comment}")
                 self._flag_state = None
@@ -776,44 +847,73 @@ class Lifter:
         elif m == 'shr':
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
-                b = self._fmt_read(ops[1])
+                b, bn = self._shift_count(ops[1])
+                w = op_bits(ops[0])
                 res = f"({a} >> {b})"
-                lines.append(f"if ({b}) _cf = ((({a}) >> (({b}) - 1)) & 1u); {comment}")
-                lines.append(self._shift_flags(res, b, op_bits(ops[0])))
+                lines.append(f"if ({b}) _cf = {self._shift_out_cf(a, b, bn, w, 'right')}; {comment}")
+                lines.append(self._shift_flags(res, b, w))
                 lines.append(f"{self._fmt_write(ops[0], f'{a} >> {b}')}; {comment}")
                 self._flag_state = None
 
         elif m == 'sar':
             if len(ops) == 2:
                 a = self._fmt_read(ops[0])
-                b = self._fmt_read(ops[1])
+                b, bn = self._shift_count(ops[1])
+                w = op_bits(ops[0])
                 res = f"((uint32_t)((int32_t){a} >> {b}))"
                 # sar must publish CF for a following rcr (the clip's `sar;rcr` lerp).
-                lines.append(f"if ({b}) _cf = ((({a}) >> (({b}) - 1)) & 1u); {comment}")
-                lines.append(self._shift_flags(res, b, op_bits(ops[0])))
+                lines.append(f"if ({b}) _cf = {self._shift_out_cf(a, b, bn, w, 'arith')}; {comment}")
+                lines.append(self._shift_flags(res, b, w))
                 lines.append(f"{self._fmt_write(ops[0], f'(uint32_t)((int32_t){a} >> {b})')};")
                 self._flag_state = None
 
         # shld/shrd: double-precision shift (64-bit window across dst:src). Used pervasively
         # for 64-bit / fixed-point math; leaving them unimplemented silently dropped the
         # write -> garbage 3D vertex/clip math. CF = last bit shifted out of dst.
+        # The count is masked to 5 bits here too, and a masked count that still
+        # reaches the operand width leaves the result undefined on x86 -- so
+        # hold dst rather than shift a uint32_t by a negative amount.
         elif m == 'shrd':
             if len(ops) == 3:
-                d = self._fmt_read(ops[0]); s = self._fmt_read(ops[1]); c = self._fmt_read(ops[2])
+                d = self._fmt_read(ops[0]); s = self._fmt_read(ops[1])
+                c, cn = self._shift_count(ops[2])
                 w = op_bits(ops[0])
-                expr = f"(({c}) ? ((({d}) >> ({c})) | ((uint32_t)({s}) << ({w} - ({c})))) : ({d}))"
-                lines.append(f"if ({c}) _cf = ((({d}) >> (({c}) - 1)) & 1u); {comment}")
-                lines.append(self._shift_flags(expr, c, op_bits(ops[0])))
+                live = f"({c}) && ({c}) < {w}" if cn is None else (
+                    "1" if 0 < cn < w else "0")
+                if live == "0":
+                    # Statically dead. Emitting the ternary anyway would leave
+                    # `{w} - {c}` as a negative constant in the unreachable half,
+                    # which the compiler still type-checks and warns about.
+                    lines.append(f"/* shrd by {c}: undefined, dst held */ {comment}")
+                    self._flag_state = None
+                    return lines
+                expr = (f"(({live}) ? ((({d}) >> ({c})) | "
+                        f"((uint32_t)({s}) << ({w} - ({c})))) : ({d}))")
+                lines.append(f"if ({live}) _cf = "
+                             f"{self._shift_out_cf(d, c, cn, w, 'right')}; {comment}")
+                lines.append(self._shift_flags(expr, live, w))
                 lines.append(f"{self._fmt_write(ops[0], expr)};")
                 self._flag_state = None
 
         elif m == 'shld':
             if len(ops) == 3:
-                d = self._fmt_read(ops[0]); s = self._fmt_read(ops[1]); c = self._fmt_read(ops[2])
+                d = self._fmt_read(ops[0]); s = self._fmt_read(ops[1])
+                c, cn = self._shift_count(ops[2])
                 w = op_bits(ops[0])
-                expr = f"(({c}) ? ((({d}) << ({c})) | ((uint32_t)({s}) >> ({w} - ({c})))) : ({d}))"
-                lines.append(f"if ({c}) _cf = ((({d}) >> ({w} - ({c}))) & 1u); {comment}")
-                lines.append(self._shift_flags(expr, c, w))
+                live = f"({c}) && ({c}) < {w}" if cn is None else (
+                    "1" if 0 < cn < w else "0")
+                if live == "0":
+                    # Statically dead. Emitting the ternary anyway would leave
+                    # `{w} - {c}` as a negative constant in the unreachable half,
+                    # which the compiler still type-checks and warns about.
+                    lines.append(f"/* shld by {c}: undefined, dst held */ {comment}")
+                    self._flag_state = None
+                    return lines
+                expr = (f"(({live}) ? ((({d}) << ({c})) | "
+                        f"((uint32_t)({s}) >> ({w} - ({c})))) : ({d}))")
+                lines.append(f"if ({live}) _cf = "
+                             f"{self._shift_out_cf(d, c, cn, w, 'left')}; {comment}")
+                lines.append(self._shift_flags(expr, live, w))
                 lines.append(f"{self._fmt_write(ops[0], expr)};")
                 self._flag_state = None
 
