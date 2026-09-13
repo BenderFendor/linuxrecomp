@@ -21,9 +21,35 @@ count the compiler computed from the real header. Four bytes per 32-bit slot.
 Imports referenced by ordinal are resolved against the system copy of the DLL's
 export table first, then looked up by name.
 
+That covers plain Win32. A real game's import table has three more kinds, and
+an SDK-only lookup returns None for every one of them -- on Star Wars: Force
+Commander it resolved 135 of 307:
+
+  * **Third-party stdcall DLLs.** `mss32.dll` (Miles) imports
+    `_AIL_waveOutOpen@16`. The count is already *in the name the binary asked
+    for*, and no import library is needed to read it.
+  * **cdecl.** Every `MSVCRT.dll` import -- `fopen`, `memmove`, `_ftol`. A cdecl
+    callee pops **nothing**; the caller cleans up. The answer is 0, and it is
+    not a guess.
+
+    Telling cdecl from stdcall cannot be done by looking for `@N` in the DLL's
+    export table, which is the obvious idea and is wrong: `KERNEL32.dll`
+    exports `Sleep` undecorated and `dinput.dll` exports `DirectInputCreateA`
+    undecorated, and both are stdcall. The `@N` lives in the *import library*,
+    not the export table. So the undecorated-export rule is restricted to the
+    C-runtime DLL families, which are cdecl by definition; anything else with
+    no import library stays None.
+  * **C++ mangled names.** `MSVCP60.dll` imports 85 `basic_string` and iostream
+    methods. The mangling encodes the calling convention, so the cdecl ones
+    (`YA`, `SA`) are certain; `__thiscall`/`__stdcall` members are not, because
+    the argument *byte* count needs the parameter types and a struct passed by
+    value has no knowable size. Those stay None on purpose.
+
 `lookup` returns None rather than guessing. Callers should refuse to emit an
 import they could not resolve: a placeholder count is the exact failure this
-module exists to prevent.
+module exists to prevent. `lookup_ex` returns *why*, so a caller can tell "cdecl,
+pops nothing" from "no idea" -- they need opposite handling and both used to
+arrive as None.
 
 Part of the pcrecomp toolbox.
 """
@@ -31,7 +57,8 @@ import glob
 import os
 import re
 
-__all__ = ['ArgcResolver', 'DEFAULT_SDK_GLOB', 'DEFAULT_SYSTEM_DIR']
+__all__ = ['ArgcResolver', 'mangled_convention',
+           'DEFAULT_SDK_GLOB', 'DEFAULT_SYSTEM_DIR']
 
 # 32-bit import libraries. On a 64-bit host the 32-bit system DLLs are the
 # SysWOW64 ones, despite the name.
@@ -40,6 +67,79 @@ DEFAULT_SYSTEM_DIR = r"C:\Windows\SysWOW64"
 
 _DECORATED = re.compile(rb'_([A-Za-z_][A-Za-z0-9_]*)@(\d+)')
 _ORDINAL = re.compile(r'ordinal_(\d+)$', re.I)
+
+# A name the binary already asked for in decorated form: `_AIL_waveOutOpen@16`.
+_SELF_DECORATED = re.compile(r'^_([A-Za-z_][A-Za-z0-9_]*)@(\d+)$')
+
+# DLLs whose exports are cdecl C runtime functions. `msvcrt.lib` is not in the
+# Windows SDK (it ships with the compiler), so for these the export table is the
+# only evidence available -- and for these it is sufficient, because a C runtime
+# does not export stdcall. Every other DLL exports WINAPI undecorated too, so
+# the same inference there would be wrong.
+_CRT_FAMILY = ('msvcrt', 'msvcr', 'msvcp', 'crtdll', 'ucrtbase', 'vcruntime',
+               'libcmt', 'atl', 'mfc')
+
+
+def _is_crt_dll(dll):
+    stem = os.path.splitext(dll)[0].lower()
+    return stem.startswith(_CRT_FAMILY)
+
+
+# MSVC function-modifier letter -> calling convention. It sits right after the
+# access/cv letters in a mangled name: `?f@@YAXXZ` is YA, `?f@@QAEXXZ` is QAE.
+_CONVENTION = {
+    'A': 'cdecl', 'B': 'cdecl',
+    'C': 'pascal', 'D': 'pascal',
+    'E': 'thiscall', 'F': 'thiscall',
+    'G': 'stdcall', 'H': 'stdcall',
+    'I': 'fastcall', 'J': 'fastcall',
+}
+
+# Access/storage letters that introduce a *member* function: the convention
+# letter follows one cv letter. `Y`/`Z` are free functions and `S`/`T` static
+# members, where the convention letter follows immediately.
+_MEMBER_ACCESS = set('QRSTUVWABCDEFGHIJKLMNOP')
+_FREE_ACCESS = set('YZ')
+
+
+def mangled_convention(name):
+    """Calling convention of an MSVC-mangled function, or None.
+
+    Only the convention is read, not the signature. That is deliberate: the
+    convention decides *whether* the callee pops anything, and for cdecl -- the
+    common case in an STL import table -- that settles the answer at 0 without
+    needing to size a single parameter.
+    """
+    if not name.startswith('?'):
+        return None
+    # `?name@scope@@3<type><cv>` is a data symbol, not a function. It is
+    # imported through its IAT slot like anything else, but it is never called,
+    # so it has no argument count and a caller must not emit a call shim.
+    for m in re.finditer(r'@@', name):
+        tail = name[m.end():]
+        if tail[:1] == '3':
+            return 'data'
+        if tail[:1] in ('2', '4', '5', '6', '7', '8', '9'):
+            return 'data'
+        if tail:
+            break
+    # Skip the qualified name: `?ident@scope@@` -- the signature starts after
+    # the `@@` that closes it. Templates contain `@@` too, so find the first
+    # `@@` that is followed by a plausible signature letter.
+    for m in re.finditer(r'@@', name):
+        sig = name[m.end():]
+        if not sig:
+            continue
+        a = sig[0]
+        if a in _FREE_ACCESS and len(sig) > 1:
+            return _CONVENTION.get(sig[1])
+        if a in ('S', 'T') and len(sig) > 1:
+            return _CONVENTION.get(sig[1])
+        if a in _MEMBER_ACCESS and len(sig) > 2:
+            conv = _CONVENTION.get(sig[2])
+            if conv:
+                return conv
+    return None
 
 
 class ArgcResolver:
@@ -107,9 +207,57 @@ class ArgcResolver:
             return name
         return self._ordinals(dll).get(int(m.group(1)), name)
 
+    def _exports(self, dll):
+        """Undecorated export names of the system copy of this DLL.
+
+        Used only to prove a name is cdecl: a stdcall export in a 32-bit DLL
+        carries `@N`, so a name present undecorated is not stdcall.
+        """
+        key = 'x' + dll.lower()
+        if key not in self._ord_cache:
+            self._ord_cache[key] = set(self._ordinals(dll).values())
+        return self._ord_cache[key]
+
+    def lookup_ex(self, dll, name):
+        """(argc, convention, source). argc is None when it is not derivable.
+
+        `convention` is 'stdcall', 'cdecl', 'thiscall', ... or None; `source`
+        names the evidence, so an unresolved import can be triaged instead of
+        just counted.
+        """
+        real = self.real_name(dll, name)
+
+        # 1. The binary already spelled the count: `_AIL_waveOutOpen@16`.
+        m = _SELF_DECORATED.match(real)
+        if m:
+            return int(m.group(2)) // 4, 'stdcall', 'decorated-name'
+
+        # 2. A C++ mangled name states its convention. cdecl pops nothing, so
+        #    that is an answer; the rest need parameter sizes we cannot get.
+        conv = mangled_convention(real)
+        if conv == 'data':
+            return 0, 'data', 'mangled-data-symbol'
+        if conv == 'cdecl':
+            return 0, 'cdecl', 'mangled-convention'
+        if conv is not None:
+            return None, conv, 'mangled-convention'
+
+        # 3. The SDK import library, which is authoritative for plain Win32.
+        argc = self._lib(dll).get(real)
+        if argc is not None:
+            return argc, 'stdcall', 'sdk-import-lib'
+
+        # 4. A C runtime DLL exports cdecl and nothing else, so an export it
+        #    names is cdecl and pops nothing. Restricted to that family on
+        #    purpose -- see the note in the module docstring.
+        if _is_crt_dll(dll) and real in self._exports(dll):
+            return 0, 'cdecl', 'crt-undecorated-export'
+
+        return None, None, 'unresolved'
+
     def lookup(self, dll, name):
         """Argument slot count, or None if it could not be derived."""
-        return self._lib(dll).get(self.real_name(dll, name))
+        return self.lookup_ex(dll, name)[0]
 
     def resolve_iat(self, iat):
         """Resolve a whole {va: (dll, name)} IAT map.
@@ -121,12 +269,26 @@ class ArgcResolver:
         rows, unresolved = [], []
         for va, (dll, name) in sorted(iat.items()):
             real = self.real_name(dll, name)
-            argc = self._lib(dll).get(real)
+            argc, conv, src = self.lookup_ex(dll, name)
             if argc is None:
                 unresolved.append((va, dll, name, real))
             else:
                 rows.append((va, dll, name, real, argc))
         return rows, unresolved
+
+    def resolve_iat_ex(self, iat):
+        """As resolve_iat, but every row carries its convention and evidence.
+
+        [(va, dll, name, real_name, argc, convention, source)], sorted by va.
+        Unresolved rows are included with argc None -- a caller that must refuse
+        them can, and one triaging an import table can see which kind they are.
+        """
+        out = []
+        for va, (dll, name) in sorted(iat.items()):
+            real = self.real_name(dll, name)
+            argc, conv, src = self.lookup_ex(dll, name)
+            out.append((va, dll, name, real, argc, conv, src))
+        return out
 
 
 def _selftest():
@@ -162,7 +324,77 @@ def _selftest():
     })
     assert rows == [(0x1000, 'KERNEL32.dll', 'Sleep', 'Sleep', 1)], rows
     assert len(unresolved) == 1 and unresolved[0][0] == 0x1004
-    print("stdcall_argc.py self-test OK (%d checks)" % (len(expected) + 5))
+
+    # --- the three kinds an SDK-only lookup used to miss -------------------
+
+    # Convention parsing is pure string work, so it is checked without a DLL.
+    conv_cases = {
+        # free function, __cdecl:  ?_Xran@std@@YAXXZ
+        '?_Xran@std@@YAXXZ': 'cdecl',
+        # public member, __thiscall: basic_string::max_size
+        '?max_size@?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QBEIXZ':
+            'thiscall',
+        # private member, __thiscall: basic_string::_Eos
+        '?_Eos@?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@AAEXI@Z':
+            'thiscall',
+        # operator+ as a free __cdecl function
+        '??Hstd@@YA?AV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@0@ABV10@0@Z':
+            'cdecl',
+        # static member, __cdecl: char_traits<char>::length
+        '?length@?$char_traits@D@std@@SAIPBD@Z': 'cdecl',
+        # a plain C name is not mangled at all
+        'fopen': None,
+        '_AIL_startup@0': None,
+    }
+    for nm, want in conv_cases.items():
+        got = mangled_convention(nm)
+        assert got == want, "%s: expected %r, got %r" % (nm[:40], want, got)
+
+    # 1. Self-decorated third-party stdcall: the count is in the name.
+    #    Miles imports these, and no import library for mss32 exists anywhere.
+    assert r.lookup_ex('mss32.dll', '_AIL_waveOutOpen@16')[:2] == (4, 'stdcall')
+    assert r.lookup_ex('mss32.dll', '_AIL_startup@0')[:2] == (0, 'stdcall')
+    assert r.lookup_ex('mss32.dll', '_AIL_set_named_sample_file@20')[0] == 5
+
+    # 2. cdecl from the mangled convention letter -> pops nothing.
+    assert r.lookup_ex('MSVCP60.dll', '?_Xran@std@@YAXXZ')[:2] == (0, 'cdecl')
+
+    # 3. __thiscall members stay unresolved, and say so rather than guessing.
+    argc, conv, src = r.lookup_ex(
+        'MSVCP60.dll',
+        '?_Eos@?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@AAEXI@Z')
+    assert argc is None and conv == 'thiscall', (argc, conv, src)
+
+    # 4. cdecl proven by a C-runtime export table. msvcrt.lib is not in the
+    #    Windows SDK, so this path is the only one available for MSVCRT.
+    for fn in ('fopen', 'memmove', 'sprintf', 'realloc', '_ftol'):
+        argc, conv, src = r.lookup_ex('MSVCRT.dll', fn)
+        assert (argc, conv) == (0, 'cdecl'), (fn, argc, conv, src)
+
+    # A stdcall export must NOT be mistaken for cdecl.
+    assert r.lookup_ex('KERNEL32.dll', 'Sleep')[:2] == (1, 'stdcall')
+
+    # And the regression that motivated narrowing the rule: DirectX DLLs export
+    # WINAPI functions undecorated, exactly like a C runtime does. dinput.lib is
+    # not in the modern SDK, so DirectInputCreateA has no import library -- it
+    # must come back unresolved, NOT as cdecl/0. Claiming 0 here would leave
+    # four argument slots on the simulated stack at every call.
+    argc, conv, src = r.lookup_ex('DINPUT.dll', 'DirectInputCreateA')
+    assert argc is None, ('DirectInputCreateA', argc, conv, src)
+    assert not _is_crt_dll('DINPUT.dll') and _is_crt_dll('MSVCRT.dll')
+    assert _is_crt_dll('MSVCP60.dll') and not _is_crt_dll('KERNEL32.dll')
+
+    # Mangled *data* symbols are imported but never called.
+    assert mangled_convention('?nothrow@std@@3Unothrow_t@1@B') == 'data'
+    assert r.lookup_ex('MSVCP60.dll', '?nothrow@std@@3Unothrow_t@1@B')[1] == 'data'
+
+    ex = r.resolve_iat_ex({0x10: ('mss32.dll', '_AIL_startup@0'),
+                           0x14: ('MSVCRT.dll', 'fopen')})
+    assert [row[4] for row in ex] == [0, 0], ex
+    assert [row[5] for row in ex] == ['stdcall', 'cdecl'], ex
+
+    print("stdcall_argc.py self-test OK (%d checks)"
+          % (len(expected) + 5 + len(conv_cases) + 18))
 
 
 if __name__ == '__main__':
