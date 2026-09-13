@@ -269,6 +269,7 @@ Use `templates/CMakeLists.txt.template` as a starting point. Key settings:
 
 - **main.c**: Entry point, VirtualAlloc memory mapping, VEH crash handler
 - **recomp_types.h**: Register globals, memory macros, condition macros, dispatch
+- **recomp_trace.c/.h**: the bring-up diagnostics that hang off `RECOMP_ENTER`
 
 ### Debugging
 
@@ -276,6 +277,32 @@ The runtime includes:
 - **VEH crash handler**: Catches access violations, dumps register state
 - **ICALL trace buffer**: Ring buffer of last 32 indirect calls (invaluable for debugging dispatch failures)
 - **Dispatch lookup logging**: Identifies unresolved function addresses
+
+`recomp_trace.c` is the other half, and it is a library, not scaffolding --
+every target needs the same handful of instruments and they are tedious to
+rewrite. Build the generated code with `-DRECOMP_TRACE`, add the file, and
+route unknown options through `recomp_trace_arg(argc, argv, i)`:
+
+| option | what it answers |
+|---|---|
+| `--calltrace FILE` | what ran, in order, per thread (buffered: 9 M calls in 10 s) |
+| `--firsthit LO HI` | did execution ever reach THIS subsystem, and in what order |
+| `--argtrace VA` | the sequence of ids that went through one dispatcher |
+| `--watch VA` | registers, stack arguments and the object under `ecx` |
+| `--watchspan LO HI` | move that object window to a member at +0x234 |
+| `--poison ADDR` | when did this dword change, and which shim was running |
+| `--poke ADDR VAL VA` | force a flag the program cleared, once past the code that cleared it |
+
+Two of those are worth spelling out. `--calltrace` is **buffered**: unbuffered,
+so that a crash could not take the tail with it, it was slower than the code it
+traced and so was never used -- the fault handler calls
+`recomp_trace_flush()` instead. And `--poke` exists because a retail build can
+still carry its original developers' assertion and logging machinery, gated on
+a byte that startup clears from a setting nobody has; poking the byte back is
+how you get the program to tell you what is wrong in its own words.
+
+A target with a diagnostic of its own (a watch that knows a class layout) sets
+`recomp_trace_extra` rather than forking the file.
 
 ### The Debug Loop
 
