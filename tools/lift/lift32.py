@@ -1617,7 +1617,11 @@ class Lifter:
             lines.append(f"/* nop */ {comment}")
 
         elif m == 'int3':
-            lines.append(f"/* int3 breakpoint */ {comment}")
+            # int3 is a trap, so nothing reaches the byte after it. Returning
+            # says so, and it matters: a body can continue past a padding run
+            # (see linear_disassemble_function's resume), and without this the
+            # unreachable fallthrough would run the next block's code.
+            lines.append(f"/* int3 breakpoint */ return; {comment}")
 
         elif m == 'cdq':
             lines.append(f"edx = ((int32_t)eax < 0) ? 0xFFFFFFFFu : 0; {comment}")

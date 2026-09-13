@@ -91,6 +91,9 @@ def find_entries(code_data, code_start, code_end):
     return sorted(call_targets | prologues)
 
 
+MAX_RESUMES = 64        # see the resume note in linear_disassemble_function
+
+
 def linear_disassemble_function(md, code_data, code_start, func_start, func_end):
     """
     Disassemble a function using linear sweep between known boundaries.
@@ -104,51 +107,97 @@ def linear_disassemble_function(md, code_data, code_start, func_start, func_end)
     raw = code_data[offset:offset + size]
     instructions = []
     leaders = {func_start}  # First instruction is always a leader
+    seen = set()            # addresses already decoded, so a resume cannot loop
+    pc = func_start
+    resumes = 0
 
-    for insn in md.disasm(raw, func_start):
-        li = LinearInstruction(insn)
-        instructions.append(li)
+    while pc is not None:
+        over = None        # target of the last uncond jmp decoded in this pass
+        hit_pad = False
+        for insn in md.disasm(raw[pc - func_start:], pc):
+            li = LinearInstruction(insn)
+            if li.address in seen:
+                break           # walked into a block already decoded
+            seen.add(li.address)
+            instructions.append(li)
 
-        if li.is_cond_jump:
-            target = li.get_branch_target()
-            if target and func_start <= target < func_end:
-                leaders.add(target)
-            leaders.add(li.end_address)  # fallthrough
-        elif li.is_uncond_jump:
-            target = li.get_branch_target()
-            if target and func_start <= target < func_end:
-                leaders.add(target)
-            # Next instruction (if any) is a new leader
-            leaders.add(li.end_address)
+            if li.is_cond_jump:
+                target = li.get_branch_target()
+                if target and func_start <= target < func_end:
+                    leaders.add(target)
+                leaders.add(li.end_address)  # fallthrough
+            elif li.is_uncond_jump:
+                target = li.get_branch_target()
+                if target and func_start <= target < func_end:
+                    leaders.add(target)
+                    over = target
+                # Next instruction (if any) is a new leader
+                leaders.add(li.end_address)
 
-        # int3 is inter-function padding -- but MSVC also emits it INSIDE a
-        # function, as the unreachable fallthrough of __assume(0) and of a
-        # range-checked switch:
+            # int3 is inter-function padding -- but MSVC also emits it INSIDE a
+            # function, as the unreachable fallthrough of __assume(0) and of a
+            # range-checked switch:
+            #
+            #     0077C86F  jbe  0x77c872
+            #     0077C871  int3
+            #     0077C872  <the rest of the function>
+            #
+            # Breaking at the first one truncated the body there. The extent
+            # walk had the right answer and 0x0077C872 was already a known
+            # leader, but the instructions were gone, so generate.py had a
+            # label it could not place, emitted a tail transfer instead, and
+            # RECOMP_ITAIL could not resolve a VA that was never lifted -- the
+            # transfer silently did nothing and the function fell through to
+            # its caller. In Force Commander that handed a null `this` to the
+            # DX7 pixel-pipe manager, several calls away, with one
+            # "ITAIL: unresolved VA" line as the only evidence.
+            #
+            # So an int3 ends the SWEEP when the instruction after it is not a
+            # leader -- nothing steps over it -- and the loop below then
+            # resumes at the next leader that has not been decoded yet.
+            if li.mnemonic == 'int3' and li.end_address not in leaders:
+                hit_pad = True
+                break
+
+        # Resume where the jump that stepped over the gap was going.
         #
-        #     0077C86F  jbe  0x77c872
-        #     0077C871  int3
-        #     0077C872  <the rest of the function>
+        # sub_0066E150 ends a block with `jmp 0x66e27d`, and what MSVC put in
+        # between is not padding -- it is one int3 followed by
+        # `mov eax, 0x66e277 / ret`, the EH state thunk for the try region.
+        # Stopping at the int3 dropped four leaders and every one came out as a
+        # RECOMP_ITAIL to a VA nobody lifted; the transfer silently did nothing
+        # and the function fell through to its caller.
         #
-        # Breaking at the first one truncated the body there. The extent walk
-        # had the right answer and 0x0077C872 was already a known leader, but
-        # the instructions were gone, so generate.py had a label it could not
-        # place, emitted a tail transfer instead, and RECOMP_ITAIL could not
-        # resolve a VA that was never lifted -- the transfer silently did
-        # nothing and the function fell through to its caller. In Force
-        # Commander that handed a null `this` to the DX7 pixel-pipe manager,
-        # several calls away, with one "ITAIL: unresolved VA" line as the only
-        # evidence.
+        # The bound is the whole difficulty, and three looser rules were
+        # measured and thrown away before this one:
         #
-        # So an int3 ends the body only when the instruction after it is not
-        # a leader -- i.e. nothing in this function jumps over it.
+        #   - continuing the linear sweep past the int3 decoded data as
+        #     instructions for the whole extent: one 400-function chunk came
+        #     out at 104 MB;
+        #   - resuming at the next undecoded leader looked tight, since leaders
+        #     come from decoded branches, but in the region of overlapping
+        #     entries around 0x005A5840 the leaders are themselves derived from
+        #     garbage and a chunk passed 60 MB still growing;
+        #   - resuming only across a run of 0xCC/0x90 does not fix the case it
+        #     was written for, because the gap is a code thunk.
         #
-        # "Any leader beyond it" was tried first and is far too loose: in a
-        # region of overlapping entries with a distant reachability bound it
-        # let the sweep run for thousands of instructions through data, and one
-        # 400-function chunk came out at 104 MB. The branch that steps over an
-        # int3 lands on the very next byte, so that is the test.
-        if li.mnemonic == 'int3' and li.end_address not in leaders:
-            break
+        # So resume at the target of the unconditional jump this pass last
+        # took, and only if that target has not been decoded. That is exactly
+        # "something stepped over this gap, and here is where it went", it needs
+        # no judgement about the extent, and it cannot invent a destination.
+        #
+        # ponytail: MAX_RESUMES caps the rest. Two gaps is the most any real
+        # body has shown; the symptom of needing more is a returning
+        # "ITAIL: unresolved VA".
+        pc = None
+        if hit_pad and over is not None and over not in seen                 and resumes < MAX_RESUMES:
+            pc = over
+            resumes += 1
+
+    # The emitter walks the list in order and places a label per leader, so the
+    # blocks have to come back sorted even though they were decoded out of
+    # order.
+    instructions.sort(key=lambda i: i.address)
 
     return instructions, leaders
 
@@ -321,6 +370,23 @@ def _selftest():
     pad = bytes([0x33, 0xC0, 0xC3, 0xCC, 0xCC, 0xCC])
     i4, _ = linear_disassemble_function(md, pad, base, base, base + len(pad))
     assert [i.mnemonic for i in i4] == ['xor', 'ret', 'int3'],         [i.mnemonic for i in i4]
+
+    # ...and a jmp OVER a padding run must not end the body either. MSVC left
+    # thirteen int3 between a `jmp` and its target in sub_0066E150, and
+    # stopping at the first one dropped four leaders, each of which came out as
+    # a RECOMP_ITAIL to a VA nobody lifted.
+    #   xor eax,eax / jmp +2 / int3 / int3 / ret
+    gap = bytes([0x33, 0xC0,               # xor eax, eax
+                 0xEB, 0x02,               # jmp +2  (over both int3)
+                 0xCC, 0xCC,               # padding
+                 0xC3])                    # ret
+    i5, l5 = linear_disassemble_function(md, gap, base, base, base + len(gap))
+    assert [i.mnemonic for i in i5] == ['xor', 'jmp', 'int3', 'ret'],         [i.mnemonic for i in i5]
+    assert base + 6 in l5, 'the jump target past the padding is not a leader'
+    out5 = lift_function_linear(Lifter(iat_map={}), 'sub_00401000', i5, l5, base)
+    assert 'RECOMP_ITAIL' not in out5, 'the block past the padding was dropped'
+    # ...and the int3 before the gap must not fall through into it.
+    assert 'int3 breakpoint */ return;' in out5, out5
 
     # A straight-line function needs no dispatch machinery at all.
     ret = bytes([0x33, 0xC0, 0xC3])            # xor eax,eax / ret
