@@ -516,9 +516,42 @@ graph, and 2,239 methods that stop being `sub_004A1C30` and start being
 `CBloodSplats__004A1C30` -- in under three seconds, at 99.4% verified accuracy.
 That is what makes lifted code readable and a crash stack worth reading.
 
-Its seeding value needs a binary with RTTI *and* poor recall. Note that Rise of
-Legends, the argument for item 6, is explicitly **not** that binary: it has no
-RTTI at all, which is why item 6 exists separately.
+Its seeding value needs a binary with RTTI *and* poor recall.
+
+### A second binary, and the same answer
+
+Star Wars: Force Commander (2000, MSVC 6, 3.9 MB of `.text`, STL-heavy C++ via
+MSVCP60) was the obvious candidate for "RTTI finally adds functions": it is
+larger than Trespasser in class count, it has no linker map, and its RTTI is
+completely intact -- **567 classes, 1,121 vtables, 5,436 virtual methods**.
+
+It does not add functions either.
+
+| | |
+|---|---:|
+| RTTI virtual methods | 5,436 |
+| already in the disassembler's catalog | **5,427** |
+| not found by `disasm32` | **9** |
+| ...of those, new functions rather than alternate entries | **0** |
+
+All nine land inside a body the sweep had already decoded. On a binary with
+34,674 recovered function starts and 98.8% byte coverage, RTTI's contribution
+to *recovery* is nine alternate entry points.
+
+This is now measured on two binaries that differ in almost every way that
+should matter -- one with a linker map and one without, one 7.8 MB and one 3.9,
+different studios, different C++ styles -- and the answer is the same both
+times. **Treat `rtti` and `vtable_scan` as symbol sources, not recovery
+passes.** The thing that finds the functions is E9 seeding plus the fixpoint,
+and it was already finding them.
+
+What Force Commander *did* get is names: 4,832 methods attributed to one of 567
+classes, plus 738 functions attributed to a source file, on a stripped retail
+binary with no symbols of any kind. 5,570 of 34,674 functions (16%) stop being
+`sub_004A1C30`.
+
+Note that Rise of Legends, the original argument for item 6, is explicitly
+**not** the binary that would settle this: it has no RTTI at all.
 
 ### 6. `func_id/vtable_scanner` · **done** · validated against RTTI
 
@@ -579,6 +612,15 @@ because E9 seeding already reaches them.
 Its case is the binary this cannot be tested on yet: Rise of Legends, 25,513
 functions reachable only through vtables and **no RTTI at all**, which is why
 this item was always separate from item 5 rather than superseded by it.
+
+**Second measurement, Force Commander.** Where RTTI is available it can be used
+as truth for the heuristic, which is what makes this worth re-running: the
+scanner found 4,982 of RTTI's 5,436 methods (**91.6%**), short of the 100% it
+scored on Trespasser because that run only counted vtables with three or more
+slots and this one counts them all. It also proposed 688 methods RTTI does not
+describe -- of which **109** were not in the catalog, so its recovery
+contribution on a 34,674-function binary is at most 109 addresses, and it is
+the more generous of the two passes.
 
 ### 7. `symbols/map_names` · **done** · the port got simpler and the heuristics got worse
 
