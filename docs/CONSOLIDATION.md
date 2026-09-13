@@ -598,7 +598,19 @@ Validated against Trespasser's `trespass.map`, cross-checked against the
 | addresses the other parser found | 34,159 |
 | agreeing | **34,159 (100%)** |
 | names agreeing on those | **34,159 (100%)** |
-| addresses only this parser found | 24 |
+| addresses only this parser found | 0 |
+
+An earlier version of this entry reported 24 extra addresses as a bonus. They
+were not. They were `__ehfuncinfo$` and `__ehhandler$` records whose Rva+Base
+the linker never resolved, landing in the PE header -- and the exact-image-base
+filter only caught some of them. See `drop_unplaced`: 1,377 such symbols on
+Trespasser, 478 of them flagged as functions. With those gone the two parsers
+agree exactly, on 34,528 function symbols and 34,159 distinct addresses, which
+is what the other parser's own statistics report.
+
+Finding extra results that the reference does not have should have read as a
+warning rather than a win. It did not, until the merge step put `sub_00400008`
+at the top of a name table and made it obvious.
 
 `port` carries *library* names from a donor with a MAP onto a target without
 one, by matching code byte for byte. Round-tripped -- Trespasser as its own
@@ -779,24 +791,55 @@ the lifter has MMX but the x87 stack was the gap that mattered, and SSE cases
 need the same memory-capture treatment to be worth anything. The corpus runner
 assumes a title library this repo does not have.
 
-### 10. `abi_analysis` · 544 lines · and `split` · 482 lines
+### 10. `abi_analysis` and `split` · **assessed, both declined**
 
-`abi_analysis` infers calling convention, parameter count, return hint and frame
-type per function. `pe/stdcall_argc.py` derives purge counts from SDK headers,
-which is exact but only covers imports; this covers *internal* functions, where
-nothing declares anything.
+**`abi_analysis` (544 lines): no consumer, and the answers it would give are
+worse than the ones already available.** It infers calling convention, parameter
+count and frame type heuristically. Every place pcrecomp needs that, it already
+has an exact answer:
 
-`split` emits one `.s` per function with the original bytes as `db` and the
-mnemonics as comments, so an undecompiled function still assembles to the
-original encoding -- the oracle a matching decomp is built on. x86 cannot
-round-trip mnemonics through an assembler the way MIPS can (`mov eax, ecx` has
-two encodings and which one MSVC picked is not recoverable), which is why the
-bytes are data and the listing rides alongside as a comment. pcrecomp has no
-decomp mode at all; this is what one would start from.
+| where ABI matters | how pcrecomp answers it |
+|---|---|
+| lifted -> lifted | it does not. `typedef void (*recomp_func_t)(void)` -- arguments live on the simulated stack and the global-register model never needs a signature |
+| import shims | `pe/stdcall_argc.py` reads the decorated `_Name@N` out of the SDK import libraries. That is the compiler's own computation, not an inference |
+| the hybrid real -> lifted boundary | measured at runtime. `hybrid.h` returns `arg_bytes_cleaned` as `final_esp - initial_esp - 4`, which is what the callee's `ret N` actually popped |
 
-Neither is urgent. Both are listed so they are not re-invented.
+Nothing in `tools/`, `docs/` or any project driver asks for an estimated
+parameter count. Porting this would replace exact answers with guesses in the
+one place -- the hybrid boundary -- where a wrong stack purge desynchronises
+everything after it.
 
----
+**`split` (482 lines): a workflow this repo does not have.** It emits one `.s`
+per function with the bytes as `db` and the disassembly alongside as a comment,
+so an undecompiled function still assembles to the original encoding. That is
+the oracle a *matching decompilation* is built on, and pcrecomp does not do
+matching decompilation -- it lifts to C that behaves the same, which is a
+different goal with a different definition of done. Building the scaffolding
+for a workflow nobody has asked for is how a toolbox gets heavy.
+
+Both stay listed so they are not re-invented from scratch by someone who
+assumes the gap was an oversight.
+
+### 10b. What the queue actually turned up instead: nothing merged the names
+
+Items 5, 7 and 8 each produced a symbol source, in three different JSON shapes,
+and nothing combined them -- so a project would pick one and discard the rest.
+Worse, `map_names.py`'s own docstring hands the sanitising job to "the naming
+merge", which did not exist.
+
+`tools/pe/merge_names.py` closes it: sources in precedence order, first claim
+per address wins, and a report of what each contributed -- which immediately
+showed `rtti` contributing **0** names to Trespasser, because the MAP already
+covers every address RTTI knows. That is the tool earning its keep on the first
+run: a source that adds nothing should be dropped, and now it says so.
+
+The real work is sanitising. A MAP gives `_SmackOpen@12` and
+`??0CColour@@QAE@HHH@Z`; none of it is a C identifier. Overloads must stay
+apart, so the signature is kept -- `f_QAE_XZ` and `f_QAE_HH_Z` are ugly and
+correct. But `@` and `_` both sanitise to `_`, so symbols differing only in
+separator collide, and on Trespasser **4,217 of 53,242 names (8%)** needed
+their address appended to stay unique. Letting one silently win produces C that
+does not compile, or compiles and calls the wrong function.
 
 ### 11. Tests
 
@@ -869,7 +912,12 @@ each should merge rather than one winning.
       rather than ported. x87 stack depth is now compared (it never was), the
       control word is pinned to PC=53, and 16 x87 cases exist to exercise both.
       SSE cases and the Xbox corpus runner were left behind.
-- [ ] 10. `abi_analysis`, `split`
+- [~] 10. `abi_analysis` -- **declined.** No consumer, and pcrecomp already
+      has exact answers where ABI matters (SDK import libs, runtime esp delta).
+- [~] 10. `split` -- **declined.** It is the oracle for a matching decomp, and
+      this repo does not do matching decomps.
+- [x] 10b. `merge_names.py` -- the gap items 5/7/8 actually left: three symbol
+      sources, three shapes, nothing combining or sanitising them.
 - [ ] 11. Disassembler tests, ported alongside each item
 
 **Still not a shared repo.** A `pcrecomp-core` extraction is a conversation for

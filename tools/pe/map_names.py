@@ -129,10 +129,11 @@ def parse_map(path):
         while tail and len(tail[0]) == 1 and tail[0].isalpha():
             flags.append(tail.pop(0))
         lib = tail[0] if tail else ""
-        # __ehfuncinfo$ / __ehhandler$ records carry an offset the linker never
-        # resolved and an Rva+Base equal to the image base. They describe
-        # exception data, not a function, and taking them at face value places
-        # a symbol on the image base itself.
+        # __ehfuncinfo$ / __ehhandler$ / __unwindfunclet$ records carry an
+        # offset the linker never resolved, so their Rva+Base lands at or just
+        # past the image base -- inside the PE header, where no code is. See
+        # drop_unplaced, which removes them properly; this only catches the
+        # exact-base case cheaply, before the PE is even open.
         if base is not None and rva_base == base:
             continue
         syms.append(Symbol(rva_base, name, "f" in flags, lib))
@@ -144,6 +145,30 @@ def parse_map(path):
             entry = (int(m.group(1), 16), int(m.group(2), 16))
             break
     return syms, entry, base
+
+
+def drop_unplaced(syms, info):
+    """Symbols whose address is inside a real section, and a count of the rest.
+
+    MSVC emits exception-data records -- `__ehfuncinfo$...`, `__ehhandler$...`,
+    `__unwindfunclet$...` -- whose Rva+Base the linker never resolved. They land
+    in the first few hundred bytes above the image base, which is the PE header:
+    no section covers it and no code lives there. On Trespasser that is 1,377
+    symbols in 0x00400008-0x00400348, **478 of them flagged as functions**, and
+    taken at face value they name the DOS stub after a destructor's unwind
+    table.
+
+    Anything outside every section is dropped rather than argued with.
+    """
+    bounds = [(info.image_base + s.virtual_address,
+               info.image_base + s.virtual_address + s.virtual_size)
+              for s in info.sections]
+
+    def placed(va):
+        return any(lo <= va < hi for lo, hi in bounds)
+
+    kept = [s for s in syms if placed(s.va)]
+    return kept, len(syms) - len(kept)
 
 
 def check_identity(entry, exe_path):
@@ -304,6 +329,7 @@ def main(argv=None):
         ap.error("need a mode: resolve or port (or --selftest)")
 
     if args.mode == "resolve":
+        from pe_analyze import analyze_pe      # noqa: E402
         syms, entry, base = parse_map(args.map)
         ok, msg = check_identity(entry, args.exe)
         print(f"[*] {msg}")
@@ -311,6 +337,10 @@ def main(argv=None):
             print("[!] refusing to write. Pass --force if you are certain.",
                   file=sys.stderr)
             return 1
+        syms, unplaced = drop_unplaced(syms, analyze_pe(args.exe))
+        if unplaced:
+            print(f"[*] dropped {unplaced:,} symbols that land outside every "
+                  f"section (unresolved exception-data records)")
         if args.functions_only:
             syms = [s for s in syms if s.is_func]
         names = {f"0x{s.va:08X}": s.name for s in syms}
@@ -334,6 +364,8 @@ def main(argv=None):
         return 1
 
     lib_re = None if args.all_symbols else re.compile(args.lib or DEFAULT_LIBS)
+    from pe_analyze import analyze_pe          # noqa: E402
+    syms, _ = drop_unplaced(syms, analyze_pe(args.donor))
     sigs, dropped = signatures(args.donor, syms, args.sig_len, lib_re)
     if not sigs:
         print("[!] no signatures. The donor's MAP has no functions from a "
@@ -415,6 +447,22 @@ def demo():
     # symbol onto the PE header.
     assert not any(s.va == base for s in syms), \
         "a symbol must never land on the image base"
+
+    # And the general form: anything in the PE header is dropped, whatever its
+    # offset, because no section covers it.
+    class _Sec:
+        def __init__(self, va, size):
+            self.virtual_address, self.virtual_size = va, size
+
+    class _Info:
+        image_base = 0x00400000
+        sections = [_Sec(0x1000, 0x1000)]
+
+    probe = [Symbol(0x00400008, "__ehfuncinfo$x", True, "o.obj"),
+             Symbol(0x00401100, "_real", True, "o.obj")]
+    kept, dropped_n = drop_unplaced(probe, _Info())
+    assert [k.name for k in kept] == ["_real"], kept
+    assert dropped_n == 1, dropped_n
 
     # The entry point comes back unresolved, because resolving it needs the
     # PE's section table rather than the MAP's own Start column.
