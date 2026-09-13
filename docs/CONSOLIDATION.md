@@ -520,23 +520,65 @@ Its seeding value needs a binary with RTTI *and* poor recall. Note that Rise of
 Legends, the argument for item 6, is explicitly **not** that binary: it has no
 RTTI at all, which is why item 6 exists separately.
 
-### 6. `func_id/vtable_scanner` · 325 lines
+### 6. `func_id/vtable_scanner` · **done** · validated against RTTI
 
-**Source**: `xboxrecomp/tools/func_id/vtable_scanner.py`.
+**Source**: `xboxrecomp/tools/func_id/vtable_scanner.py`. Ported as
+`tools/cpp/vtable_scan.py`.
 
-The principled version of item 1's unaligned pointer scan: look for **runs of
-three or more consecutive code pointers** in `.rdata`/`.data` rather than
-isolated hits. A run is a vtable; an isolated hit is usually noise. It also finds
-the `this`-adjusting thunks that live between `ret`s and are reachable only
-through a vtable ICALL -- precisely the functions the detector misses.
+Finds vtables structurally -- **runs of three or more consecutive code pointers
+in a data section** -- so it works on the binaries `rtti.py` cannot help, which
+is most of them. This is the principled version of
+`find_data_code_pointers`: a *run* of code addresses is a far stronger signal
+than an isolated word, which is why that scan invents so much and this one does
+not.
 
-Rise of Legends is the argument: **25,513 functions reachable only through
-vtables, and no RTTI** to lean on. A recovery pass that cannot follow a vtable
-misses most of that binary, and item 5 returns nothing there.
+Trespasser is a rare chance to check a heuristic against truth, because RTTI
+describes its vtables exactly:
 
-Runs after RTTI, which supersedes it wherever RTTI exists.
+| | |
+|---|---:|
+| RTTI vtables with 3+ slots (findable) | 359 |
+| found by the heuristic | **359 (100%)** |
+| slots pointing at real linker-map functions | **12,655 / 12,907 (98.0%)** |
 
----
+It also finds **216 vtables in `.rdata` that RTTI does not describe** -- classes
+compiled without RTTI, and plain function tables -- and 85.3% of *their* slots
+are real map functions too. So the extras are mostly real, not noise.
+
+**Section choice did almost all of the damage, and then all of the good.**
+Scanning every non-code section gave 1,104 candidates. Measuring what fraction
+of each section's slots were real functions sorted them instantly:
+
+| section | candidates | slots that are real functions |
+|---|---:|---:|
+| `.rdata` | 575 | **85.3%** |
+| `.data` | 12 | 0.0% |
+| `.idata` | 51 | 0.0% (it is the import thunk table) |
+| `.rsrc` | 466 | 1.2% (resource blobs that look like addresses) |
+
+`.rsrc` alone was 42% of all candidates and almost entirely noise. Excluding
+sections whose contents are *defined to be something else* drops the count to
+587 with no loss of recall.
+
+Note the shape of that fix. The obvious move is to whitelist `.rdata` and
+`.data` -- and that is exactly the assumption that made the RTTI port find zero
+vtables in charmap.exe, which keeps them in `.text`. So this excludes by known
+purpose and scans anything it does not recognise, with `--include-code` for the
+merged-`.text` case.
+
+**Known blind spot, measured rather than guessed:** 90 of Trespasser's 449 real
+vtables have fewer than three slots and are structurally invisible here. Lowering
+the threshold to two would find them and drown the result in ordinary data.
+
+**What it is worth, honestly.** On Trespasser: nothing in recovery. Of 3,489
+probe-gated method addresses, 3,462 are already in the catalog, and of the 27
+that are not, 26 are alternate entries inside known functions and one is a
+false positive. It recovers **0 of the 780** functions the catalog is missing --
+because E9 seeding already reaches them.
+
+Its case is the binary this cannot be tested on yet: Rise of Legends, 25,513
+functions reachable only through vtables and **no RTTI at all**, which is why
+this item was always separate from item 5 rather than superseded by it.
 
 ### 7. `symbols/map_names` · 263 lines · worth more on PC than on Xbox
 
@@ -691,7 +733,9 @@ each should merge rather than one winning.
 - [x] 5. `rtti` -- ported to `tools/cpp/rtti.py`. 100% of recovered method
       addresses are exact linker-map function starts, 99.4% of class
       attributions agree with the map. Worth names, not new functions.
-- [ ] 6. `func_id/vtable_scanner`
+- [x] 6. `func_id/vtable_scanner` -- ported to `tools/cpp/vtable_scan.py`.
+      100% recall against RTTI's own vtables, 98.0% of slots are real map
+      functions. Section filtering, not the run heuristic, was what mattered.
 - [ ] 7. `symbols/map_names`
 - [ ] 8. `debug_symbols`
 - [ ] 9. `conformance` -- assess against `lift/difftest.py` first
