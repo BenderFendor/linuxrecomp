@@ -121,6 +121,28 @@ int main(void)
     eq("cvttss2si 1e18 indefinite", (uint32_t)sse_cvtt_i32(1e18), 0x80000000u);
     eq("cvttss2si NaN indefinite", (uint32_t)sse_cvtt_i32(NAN), 0x80000000u);
 
+    /* x87 compares. Both forms of the same comparison, and the four outcomes
+     * each - the unordered one above all, because it is the only case where
+     * "not greater" and "less" differ, and a model that folds NaN into one of
+     * the ordered answers makes a game take the wrong branch exactly when a
+     * value has already gone wrong. The status-word bits are C3|C2|C0 of a
+     * 0x4700 mask; the EFLAGS mapping is not the integer one. */
+    fcompare(&c, 2.0, 1.0);  eq("fcom greater  -> sw", c.fpu_sw & 0x4700u, 0x0000u);
+    fcompare(&c, 1.0, 2.0);  eq("fcom less     -> C0", c.fpu_sw & 0x4700u, 0x0100u);
+    fcompare(&c, 1.0, 1.0);  eq("fcom equal    -> C3", c.fpu_sw & 0x4700u, 0x4000u);
+    fcompare(&c, NAN, 1.0);  eq("fcom unord -> C3|C2|C0", c.fpu_sw & 0x4700u, 0x4700u);
+
+#define FLAGS3(cc) (((cc).zf << 2) | ((cc).pf << 1) | (cc).cf)
+    fcompare_eflags(&c, 2.0, 1.0); eq("fcomi greater  -> 000", FLAGS3(c), 0u);
+    fcompare_eflags(&c, 1.0, 2.0); eq("fcomi less     -> CF",  FLAGS3(c), 1u);
+    fcompare_eflags(&c, 1.0, 1.0); eq("fcomi equal    -> ZF",  FLAGS3(c), 4u);
+    fcompare_eflags(&c, NAN, 1.0); eq("fcomi unord -> ZF|PF|CF", FLAGS3(c), 7u);
+    /* and it must clear OF/SF/AF, which an integer compare would have set */
+    c.of = c.sf = c.af = 1;
+    fcompare_eflags(&c, 1.0, 2.0);
+    eq("fcomi clears OF|SF|AF", (uint32_t)(c.of | c.sf | c.af), 0u);
+#undef FLAGS3
+
     if (fails == 0)
         printf("cpu_selftest: all checks passed\n");
     return fails != 0;

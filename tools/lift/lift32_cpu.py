@@ -636,13 +636,30 @@ class Lifter:
             out = [f"fcompare(c, *fst(c, 0), {self._fmem(insn, memop, 'i')});"]
             if m == "ficomp": out.append("fpop(c);")
             return out
-        if m in ("fcom","fcomp","fcompp"):
+        # fcom and fucom are the same comparison. They differ only in which
+        # NaNs raise an invalid-operation exception - a QNaN is quiet for
+        # fucom and not for fcom - and this model does not raise FP exceptions
+        # at all, so the translation is identical. Which matters a great deal
+        # in practice: MSVC emits `fucompp; fnstsw ax; test ah` for an ordinary
+        # float comparison, so the unordered forms are the common ones. In one
+        # game (Mario Kart Arcade GP DX) `fucompp` alone was 40,796 of the
+        # 50,555 instructions the lifter could not express - 81% of the entire
+        # gap was this one mnemonic, missing because only `fcompp` was listed.
+        if m in ("fcom", "fcomp", "fcompp", "fucom", "fucomp", "fucompp"):
             if memop: src = self._fmem(insn, memop, "f")
             elif ops: src = f"*fst(c, {self._st_idx(ops[0])})"
             else: src = "*fst(c, 1)"
             out = [f"fcompare(c, *fst(c, 0), {src});"]
-            if m == "fcomp": out.append("fpop(c);")
-            if m == "fcompp": out += ["fpop(c);", "fpop(c);"]
+            if m in ("fcomp", "fucomp"): out.append("fpop(c);")
+            if m in ("fcompp", "fucompp"): out += ["fpop(c);", "fpop(c);"]
+            return out
+        # The P6 forms put the result in EFLAGS instead of the status word, so
+        # the compiler can branch on it directly without `fnstsw`. Capstone
+        # spells the popping ones both ways (`fcomip` and `fcompi`).
+        if m in ("fcomi", "fucomi", "fcomip", "fucomip", "fcompi", "fucompi"):
+            src = f"*fst(c, {self._st_idx(ops[-1])})" if ops else "*fst(c, 1)"
+            out = [f"fcompare_eflags(c, *fst(c, 0), {src});"]
+            if m != "fcomi" and m != "fucomi": out.append("fpop(c);")
             return out
         if m == "fnstsw":
             if ops and ops[0].type == X86_OP_REG:   # ax

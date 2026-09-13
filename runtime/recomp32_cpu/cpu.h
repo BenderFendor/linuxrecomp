@@ -305,6 +305,18 @@ static inline void fcompare(CPU *c, double a, double b) {
     else             sw |= 0x4700u;          /* unordered: C3|C2|C0 */
     c->fpu_sw = sw;
 }
+/* fcomi/fucomi: the same comparison, into EFLAGS instead of the status word.
+ * The P6 forms exist so a compiler can branch on a float compare without
+ * going through `fnstsw ax; test ah`. Note the mapping is not the integer
+ * one: "unordered" is ZF=PF=CF=1, which is why `jp` after an fcomi is the
+ * NaN test, and OF/SF/AF are cleared. */
+static inline void fcompare_eflags(CPU *c, double a, double b) {
+    c->of = c->sf = c->af = 0;
+    if      (a > b)  { c->zf = 0; c->pf = 0; c->cf = 0; }
+    else if (a < b)  { c->zf = 0; c->pf = 0; c->cf = 1; }
+    else if (a == b) { c->zf = 1; c->pf = 0; c->cf = 0; }
+    else             { c->zf = 1; c->pf = 1; c->cf = 1; }
+}
 /* sahf: load AH into CF,PF,AF,ZF,SF */
 static inline void do_sahf(CPU *c, uint8_t ah) {
     c->cf = ah & 1; c->pf = (ah >> 2) & 1; c->af = (ah >> 4) & 1;
