@@ -139,10 +139,15 @@ def linear_disassemble_function(md, code_data, code_start, func_start, func_end)
         # several calls away, with one "ITAIL: unresolved VA" line as the only
         # evidence.
         #
-        # So an int3 ends the body only when nothing this function branches to
-        # lies beyond it. That also covers a RUN of int3 padding before a
-        # jumped-over continuation, which a lookahead of one would not.
-        if li.mnemonic == 'int3' and not any(l > li.address for l in leaders):
+        # So an int3 ends the body only when the instruction after it is not
+        # a leader -- i.e. nothing in this function jumps over it.
+        #
+        # "Any leader beyond it" was tried first and is far too loose: in a
+        # region of overlapping entries with a distant reachability bound it
+        # let the sweep run for thousands of instructions through data, and one
+        # 400-function chunk came out at 104 MB. The branch that steps over an
+        # int3 lands on the very next byte, so that is the test.
+        if li.mnemonic == 'int3' and li.end_address not in leaders:
             break
 
     return instructions, leaders
