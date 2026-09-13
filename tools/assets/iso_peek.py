@@ -124,14 +124,20 @@ def main():
     files = walk(reader, args.verbose)
 
     if args.extract:
-        hits = [f for f in files
-                if fnmatch.fnmatch(f[0].upper(), args.extract.upper())
-                or f[0].upper().endswith('/' + args.extract.upper())
-                or f[0].upper() == args.extract.upper()]
+        want = args.extract.upper()
+        # An exact path wins outright. Otherwise match a glob, or a bare
+        # filename anywhere on the disc -- but only report that ambiguous if
+        # the exact form did not already settle it. A demo directory carrying
+        # a cut-down copy of the same name is the normal case, not a puzzle.
+        exact = [f for f in files if f[0].upper() == want]
+        hits = exact or [f for f in files
+                         if fnmatch.fnmatch(f[0].upper(), want)
+                         or f[0].upper().endswith('/' + want)]
         if not hits:
             raise SystemExit("no such file on the disc: %s" % args.extract)
         if len(hits) > 1:
-            raise SystemExit("ambiguous (%s)" % ', '.join(h[0] for h in hits[:6]))
+            raise SystemExit("ambiguous -- name one of these exactly:\n  %s"
+                             % '\n  '.join(h[0] for h in hits[:8]))
         path, off, size = hits[0]
         dest = args.out or os.path.basename(path)
         with open(dest, 'wb') as f:
