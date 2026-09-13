@@ -40,6 +40,9 @@ repo is a scar from one specific binary, and the entry below names it.
 | `cpp/*` | Black & White | Mangling, demangling and vtable parsing across MSVC and Metrowerks |
 | `drm/safedisc_dump.py`, `inject_and_run.c` | X-Wing Alliance, Black & White | SafeDisc v1 and v2+ |
 | `assets/isextract.py` | Soldier of Fortune | InstallShield, including multi-volume |
+| `assets/isextract.py` v6+ layout | One Must Fall: Battlegrounds | v7 and v9 discs; the flat 0x57 descriptor array |
+| `pe/catalog.py` MZ sniffing | One Must Fall: Battlegrounds | The engine ships its modules as `.ModuleDLL` |
+| `pe/analyze_sections.py` evidence ranking | One Must Fall: Battlegrounds | A 4-byte marker inside a mangled C++ name is not DRM |
 | `assets/extract_wise.py` | Operation Neptune | Wise installer overlays |
 | `assets/bin2iso.js`, `extract_cab.sh` | Black & White | BIN/CUE and InstallShield CAB |
 | `formats/*` | Encarta 97 | FIF, FTC, M20/MVB, SPAM, DAT, string tables |
@@ -330,6 +333,160 @@ functions reachable only through vtables**, and no RTTI to lean on. Everything
 else the toolchain has been proven on is smaller, older, or both. It is the
 strongest argument for porting a real vtable scanner from xboxrecomp: a
 function recovery pass that cannot follow a vtable misses most of this binary.
+
+---
+
+## One Must Fall: Battlegrounds (2003)
+
+**Repo**: [sp00nznet/omfbg](https://github.com/sp00nznet/omfbg) (private) *
+**Engine**: Diversions Entertainment, modular -- `OMFBG.exe` + 9 `.ModuleDLL`
+
+**Contributed**: the v6+ file-descriptor layout in `assets/isextract.py`, the
+`MZ` sniffing in `pe/catalog.py`, and the strong/weak split in
+`pe/analyze_sections.py`.
+
+**Notable**: the best-instrumented binary in the collection. **10,374 exports,
+every one an MSVC-mangled C++ name** -- `Core.ModuleDLL` alone publishes 8,320
+named functions with their class, parameter types and calling convention. That
+is better ground truth than Operation Neptune's linker map, and it is why this
+should become the calibration target for C++ recovery the way Neptune is for
+Borland C. Also: the disc carries every SafeDisc marker, and SafeDisc covers
+only the 53 KB launcher -- 4.51 MB of the 4.56 MB total is unprotected. The
+triage lesson is that disc-level DRM markers say nothing about which *binaries*
+are wrapped.
+
+All three tool fixes were prerequisites rather than improvements. `isextract`
+crashed on the disc; `catalog.py` reported the install as two binaries and hid
+the other nine; `analyze_sections.py` called four clean modules SecuROM on the
+strength of `AddD` matches that were all inside
+`?AddData@DE_CChecksumMD5@@`-style export names.
+
+---
+
+## Monster Truck Madness 1 & 2 (1996, 1998)
+
+**Repo**: [sp00nznet/mtm](https://github.com/sp00nznet/mtm) (private) *
+**Engine**: Terminal Reality, third generation
+
+**Notable**: the Fury3/Hellbender pair is the collection's cheapest regression
+test, and this is the same engine a third time -- except MTM2 ships the renderer
+as `VOXRT24.DLL` (248 KB, 8 exports) and `TRID3D.DLL` instead of linking it in.
+The code Fury3 forced the lifter to get right is here as a standalone DLL. With
+Nocturne (1999) that makes four Terminal Reality generations: 1995, 1996, 1998,
+1999. No DRM. Statically linked CRT, so `classify/` runs before anything else.
+
+---
+
+## Star Wars: Force Commander (2000)
+
+**Repo**: [sp00nznet/forcecommander](https://github.com/sp00nznet/forcecommander) (private) *
+**Original**: `Focom.exe`, MSVC 6.0 + MSVCP60, no DRM
+
+**Notable**: the clean version of the X-Wing Alliance problem. Same publisher,
+one year later, 3.94 MB of `.text` -- 1.5x XWA -- and no SafeDisc, no packer,
+nothing to dump. Second-largest target in the collection behind Rise of Legends.
+Everything XWA learned about LucasArts binaries applies without repeating XWA's
+first week.
+
+---
+
+## Terminal Velocity (1995)
+
+**Repo**: [sp00nznet/tv](https://github.com/sp00nznet/tv) (private) *
+**Original**: `GAME.EXE`, Watcom C/C++, DOS/4GW
+
+**Notable**: the argument for an **LE/LX front end**. `catalog.py` names LE/LX
+images correctly and routes them nowhere, because nothing reads them. DOS/4GW is
+what the entire 32-bit DOS era shipped on, and OS/2's 32-bit format is LX -- the
+same work unlocks both, which makes this the highest-leverage missing front end.
+Also Terminal Reality again, contemporary with Fury3, so a Watcom DOS build and
+an MSVC Windows build of related code become comparable: the sharpest available
+test of whether the lifter is compiler-independent.
+
+---
+
+## Black & White 2 (2005)
+
+**Repo**: [sp00nznet/bw2](https://github.com/sp00nznet/bw2) (private) *
+**Engine**: Lionhead, four years on from `bw`
+
+**Notable**: `white.exe` is **21,739,061 bytes** -- larger than Rise of Legends
+(13.25 MB), which is currently the stress test rather than a project. The size
+is read from the InstallShield 9 header; the binary itself is on disc 2, 3 or 4
+and has not been extracted. Black & White's 569 hand-recovered types become 569
+hypotheses to test here. Needs the vtable scanner ported from `xboxrecomp`
+first -- same prerequisite as Rise of Legends, and on a bigger binary.
+
+Incidentally the proof that the `isextract.py` v6+ work generalises: the layout
+that fixed an InstallShield 7 disc reads an InstallShield 9 one unchanged.
+
+---
+
+## The Magic School Bus Explores the Human Body (1994)
+
+**Repo**: [sp00nznet/msbus](https://github.com/sp00nznet/msbus) (private) *
+**Original**: Win16 NE, Microsoft "band" engine
+
+**Notable**: roughly **60 KB of machine code driving 190 MB of content** --
+three `BD*.EXE` of 7-23 KB (`FEEDER`, `MSBSNOOP`, `GOBAND`) plus a 5 KB
+`BANDDLL.DLL`. The inverse of Microsoft Bob, which is the same publisher, same
+year, same format, and where the code *is* the product. Lifting is short; the
+project is `.MSF`, `.PAG` and `.PFL`.
+
+---
+
+## The Even More Incredible Machine (1993)
+
+**Repo**: [sp00nznet/tim](https://github.com/sp00nznet/tim) (private) *
+**Original**: `TEMIM.EXE`, Borland C++, NE, 27 code segments
+
+**Notable**: imports KERNEL, USER and GDI and **nothing else** -- the entire
+shim surface is the one `ne/` already generates. Its NE entry table names its own
+Windows callbacks (`TIMWINDOWPROC`, `CONFIRMDLGPROC`, `STATUSDLGPROC`,
+`DESTROYALLMONSTERS`), so the message loop is identified before disassembly.
+Third Borland project after Operation Neptune and Gizmos & Gadgets.
+
+---
+
+## Missile Attack! (1992)
+
+**Repo**: [sp00nznet/missileattack](https://github.com/sp00nznet/missileattack) (private) *
+**Original**: `MISSILE.EXE`, 87 KB NE shareware, **one code segment**
+
+**Notable**: the fixture for the 16-bit pipeline. 21 KB in a single segment, so
+segmentation -- the first-class problem in every other NE project here -- is
+absent, and a change to `ne_parse.py`/`ne_decode.py`/`lift16.py` can be checked
+end to end in the time it takes to read the diff. Five named entry points across
+21 KB. Imports `win87em`, which puts an x87 surface in a 16-bit NE image: the
+El-Fish problem at 1/100th the size.
+
+---
+
+## The Electronic Whole Earth Catalog (1988)
+
+**Repo**: [sp00nznet/wholeearth](https://github.com/sp00nznet/wholeearth) (private)
+
+**Notable**: not a PC title at all. The disc has an Apple Partition Map and an
+HFS volume and no ISO 9660 descriptor -- Macintosh, Broderbund, the same shelf as
+Shufflepuck Cafe. Probably HyperCard, in which case there is no 68k binary to
+recompile and it is a format project. Staged pending a mount; it likely belongs
+to `macrecomp`.
+
+---
+
+## Not targets, and why that is worth recording
+
+**World Empire (1994)** imports `VBRUN300.DLL` and nothing else, and carries 14
+relocations across 114 KB of "code". It is Visual Basic 3 p-code, not x86. An x86
+lifter produces confident garbage on it and has no way to notice. Routed to
+`vbrecomp`. The general check is cheap: **`VBRUN*.DLL` as the only imported
+module means p-code**, and one `ne_parse.py` run settles it. The same flag fires
+on the Visual Basic catalogue bundled with The Magic School Bus.
+
+**The OS/2 Arsenal and OS/2 Fever discs** are shareware compilations -- 10,000+
+programs, not one target. Kept as a prospecting corpus: OS/2 16-bit is NE, which
+`ne/` already reads (different shim table, not a different front end), and OS/2
+32-bit is LX, which lands on the same missing decoder as Terminal Velocity.
 
 ---
 

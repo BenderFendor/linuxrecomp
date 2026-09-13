@@ -278,8 +278,17 @@ def main():
     targets = []
     for root, _dirs, files in os.walk(base):
         for f in files:
-            if f.lower().rsplit('.', 1)[-1] in ('dll', 'exe', 'ocx', 'sys'):
-                targets.append(os.path.join(root, f))
+            # Sniff the magic, do not trust the extension. Plugin engines
+            # ship their modules as .ModuleDLL, .m8, .flt, .asi and worse, and
+            # an extension whitelist silently hides the half of the install
+            # that matters most.
+            path = os.path.join(root, f)
+            try:
+                with open(path, 'rb') as fh:
+                    if fh.read(2) == b'MZ':
+                        targets.append(path)
+            except OSError:
+                pass
     targets.sort()
 
     catalog = []

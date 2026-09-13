@@ -57,6 +57,8 @@ class Volume:
     """
     def __init__(self, path):
         self.path = path
+        m = re.search(r'([0-9]+)[.]cab$', os.path.basename(path), re.IGNORECASE)
+        self.index = int(m.group(1)) if m else 1
         with open(path, 'rb') as f:
             head = f.read(64)
         self.signature, self.version = struct.unpack_from('<II', head, 0)
@@ -128,33 +130,50 @@ class CabDescriptor:
 
 class FileDescriptor:
     """
-    File descriptor for InstallShield v5.
+    File descriptor. Two completely different layouts.
 
-    Binary layout (0x3a = 58 bytes):
-      +0x00  uint32  name_offset       (offset to filename string in file table)
-      +0x04  uint16  directory_index
-      +0x06  uint16  (padding)
-      +0x08  uint16  flags
-      +0x0a  uint32  expanded_size
-      +0x0e  uint32  compressed_size
-      +0x12  (20 bytes skipped - timestamps, attributes, etc.)
-      +0x26  uint32  data_offset       (offset into .cab file)
-      +0x2a  (16 bytes) md5 checksum
+    v5 and older -- 0x3a bytes, reached through the file_table offset array:
+      +0x00 u32 name_offset   +0x04 u16 directory_index  +0x08 u16 flags
+      +0x0a u32 expanded_size +0x0e u32 compressed_size   +0x26 u32 data_offset
+      +0x2a md5[16]
+
+    v6 and newer -- 0x57 bytes, a flat array at file_table_offset2, no
+    indirection, 64-bit sizes, and the fields in a different order:
+      +0x00 u16 flags         +0x02 u64 expanded_size     +0x0a u64 compressed_size
+      +0x12 u64 data_offset   +0x1a md5[16]               +0x3a u32 name_offset
+      +0x3e u16 directory_index                           +0x55 u16 volume
+    Both name_offsets are relative to cab_descriptor_offset + file_table_offset.
     """
-    SIZE_V5 = 0x3A  # 58 bytes
+    SIZE_V5 = 0x3A
+    SIZE_V6 = 0x57
 
-    def __init__(self, data, offset):
-        self.name_offset = struct.unpack_from('<I', data, offset + 0x00)[0]
-        self.directory_index = struct.unpack_from('<H', data, offset + 0x04)[0]
-        self.flags = struct.unpack_from('<H', data, offset + 0x08)[0]
-        self.expanded_size = struct.unpack_from('<I', data, offset + 0x0A)[0]
-        self.compressed_size = struct.unpack_from('<I', data, offset + 0x0E)[0]
-        self.data_offset = struct.unpack_from('<I', data, offset + 0x26)[0]
-        self.md5 = data[offset + 0x2A:offset + 0x3A]
+    def __init__(self, data, offset, major_version=5):
+        if major_version <= 5:
+            self.name_offset = struct.unpack_from('<I', data, offset + 0x00)[0]
+            self.directory_index = struct.unpack_from('<H', data, offset + 0x04)[0]
+            self.flags = struct.unpack_from('<H', data, offset + 0x08)[0]
+            self.expanded_size = struct.unpack_from('<I', data, offset + 0x0A)[0]
+            self.compressed_size = struct.unpack_from('<I', data, offset + 0x0E)[0]
+            self.data_offset = struct.unpack_from('<I', data, offset + 0x26)[0]
+            self.md5 = data[offset + 0x2A:offset + 0x3A]
+            self.volume = None
+        else:
+            self.flags = struct.unpack_from('<H', data, offset + 0x00)[0]
+            self.expanded_size = struct.unpack_from('<Q', data, offset + 0x02)[0]
+            self.compressed_size = struct.unpack_from('<Q', data, offset + 0x0A)[0]
+            self.data_offset = struct.unpack_from('<Q', data, offset + 0x12)[0]
+            self.md5 = data[offset + 0x1A:offset + 0x2A]
+            self.name_offset = struct.unpack_from('<I', data, offset + 0x3A)[0]
+            self.directory_index = struct.unpack_from('<H', data, offset + 0x3E)[0]
+            self.volume = struct.unpack_from('<H', data, offset + 0x55)[0]
 
     @property
     def is_compressed(self):
         return bool(self.flags & FILE_COMPRESSED)
+
+    @property
+    def is_obfuscated(self):
+        return bool(self.flags & FILE_OBFUSCATED)
 
     @property
     def is_invalid(self):
@@ -163,6 +182,21 @@ class FileDescriptor:
     @property
     def is_split(self):
         return bool(self.flags & FILE_SPLIT)
+
+
+def deobfuscate(buf, seed):
+    """InstallShield 6+ byte scramble. Returns (plaintext, next_seed).
+
+    The seed runs continuously over the whole file's raw stream, chunk size
+    prefixes included -- it is not reset per chunk.
+    """
+    out = bytearray(len(buf))
+    for i, b in enumerate(buf):
+        x = b ^ 0xD5
+        x = ((x >> 2) | (x << 6)) & 0xFF      # ror8 by 2
+        out[i] = (x - (seed % 0x47)) & 0xFF
+        seed += 1
+    return bytes(out), seed
 
 
 class FileGroupDescriptor:
@@ -217,7 +251,8 @@ class ISCabinet:
         self._ft_base = self.common.cab_descriptor_offset + self.cab_desc.file_table_offset
 
         # Read file table (array of uint32 offsets)
-        total_entries = self.cab_desc.directory_count + self.cab_desc.file_count
+        total_entries = self.cab_desc.directory_count + (
+            self.cab_desc.file_count if self.major_version <= 5 else 0)
         self.file_table = []
         for i in range(total_entries):
             val = struct.unpack_from('<I', self.hdr_data, self._ft_base + i * 4)[0]
@@ -229,12 +264,17 @@ class ISCabinet:
             name = self._read_string(self.file_table[i])
             self.directories.append(name)
 
-        # Parse file descriptors
+        # Parse file descriptors. v5 indirects through file_table; v6+ is a
+        # flat array of 0x57-byte records at file_table_offset2.
         self.files = []
         for i in range(self.cab_desc.file_count):
-            table_idx = self.cab_desc.directory_count + i
-            fd_offset = self._ft_base + self.file_table[table_idx]
-            fd = FileDescriptor(self.hdr_data, fd_offset)
+            if self.major_version <= 5:
+                table_idx = self.cab_desc.directory_count + i
+                fd_offset = self._ft_base + self.file_table[table_idx]
+            else:
+                fd_offset = (self._ft_base + self.cab_desc.file_table_offset2
+                             + i * FileDescriptor.SIZE_V6)
+            fd = FileDescriptor(self.hdr_data, fd_offset, self.major_version)
             fd.name = self._read_string(fd.name_offset)
             fd.index = i
 
@@ -250,6 +290,12 @@ class ISCabinet:
         self.file_groups = self._parse_file_groups()
 
     def volume_for(self, index):
+        fd = self.files[index] if index < len(self.files) else None
+        if fd is not None and getattr(fd, 'volume', None):
+            for v in self.volumes:
+                if v.index == fd.volume:
+                    return v.path
+
         """Which volume file holds this file index.
 
         Volumes state a first/last index range and consecutive volumes overlap on
@@ -462,11 +508,21 @@ class ISCabinet:
         total_written = 0
         total_comp_read = 0
         md5_ctx = hashlib.md5()
+        # v6+ may scramble the raw stream. The seed runs over every byte read,
+        # chunk size prefixes included, so it has to live outside the loop.
+        seed = 0 if fd.is_obfuscated else None
+
+        def rd(n):
+            nonlocal seed
+            raw = cab_file.read(n)
+            if seed is not None:
+                raw, seed = deobfuscate(raw, seed)
+            return raw
 
         with open(out_path, 'wb') as out:
             while total_written < fd.expanded_size:
                 # Read 2-byte chunk size
-                size_bytes = cab_file.read(2)
+                size_bytes = rd(2)
                 if len(size_bytes) < 2:
                     raise IOError(
                         f"Unexpected end of cab at offset "
@@ -479,7 +535,7 @@ class ISCabinet:
                     break
 
                 # Read compressed chunk
-                chunk_data = cab_file.read(chunk_size)
+                chunk_data = rd(chunk_size)
                 if len(chunk_data) < chunk_size:
                     raise IOError(
                         f"Unexpected end of cab reading chunk data "
@@ -559,7 +615,60 @@ class ISCabinet:
         sys.stdout.flush()
 
 
+def _selftest():
+    """Pin the v6+ descriptor layout. The md5 offset is the trap: at +0x1c the
+    parse still yields the right name, the right size and the right data offset,
+    so files extract at exactly the expected length and only the checksum shows
+    the two-byte slip. Found on One Must Fall: Battlegrounds (InstallShield 7),
+    where it read 3f421e2edc35... against an expected 1e2edc35...0000."""
+    rec = bytearray(FileDescriptor.SIZE_V6)
+    struct.pack_into('<H', rec, 0x00, FILE_COMPRESSED)
+    struct.pack_into('<Q', rec, 0x02, 0x1234567)        # expanded
+    struct.pack_into('<Q', rec, 0x0A, 0x89abc)          # compressed
+    struct.pack_into('<Q', rec, 0x12, 0x240c3862)       # data offset, >4 GB-capable
+    md5 = bytes(range(0x10))
+    rec[0x1A:0x2A] = md5
+    struct.pack_into('<I', rec, 0x3A, 0x24CC)           # name offset
+    struct.pack_into('<H', rec, 0x3E, 4)                # directory index
+    struct.pack_into('<H', rec, 0x55, 2)                # volume
+
+    fd = FileDescriptor(bytes(rec), 0, major_version=7)
+    assert fd.flags == FILE_COMPRESSED and fd.is_compressed, fd.flags
+    assert not fd.is_obfuscated and not fd.is_invalid
+    assert fd.expanded_size == 0x1234567, fd.expanded_size
+    assert fd.compressed_size == 0x89abc, fd.compressed_size
+    assert fd.data_offset == 0x240c3862, fd.data_offset
+    assert fd.md5 == md5, fd.md5.hex()
+    assert fd.name_offset == 0x24CC, fd.name_offset
+    assert fd.directory_index == 4 and fd.volume == 2
+
+    # v5 is a different layout at a different size; it must not drift.
+    v5 = bytearray(FileDescriptor.SIZE_V5)
+    struct.pack_into('<I', v5, 0x00, 0x1111)
+    struct.pack_into('<H', v5, 0x04, 3)
+    struct.pack_into('<H', v5, 0x08, FILE_COMPRESSED | FILE_OBFUSCATED)
+    struct.pack_into('<I', v5, 0x0A, 999)
+    struct.pack_into('<I', v5, 0x26, 0x4000)
+    fd5 = FileDescriptor(bytes(v5), 0, major_version=5)
+    assert fd5.name_offset == 0x1111 and fd5.directory_index == 3
+    assert fd5.expanded_size == 999 and fd5.data_offset == 0x4000
+    assert fd5.is_obfuscated
+
+    # Deobfuscation must be an involution-free but *resumable* stream: running
+    # it over two halves has to match running it over the whole.
+    blob = bytes(range(256)) * 3
+    whole, _ = deobfuscate(blob, 0)
+    a, seed = deobfuscate(blob[:100], 0)
+    b, _ = deobfuscate(blob[100:], seed)
+    assert a + b == whole, "seed does not carry across reads"
+
+    print("isextract selftest OK")
+
+
 def main():
+    if '--selftest' in sys.argv:
+        _selftest()
+        return
     parser = argparse.ArgumentParser(
         description="Extract files from InstallShield v5/v6 cabinet archives.",
         formatter_class=argparse.RawDescriptionHelpFormatter,

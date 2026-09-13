@@ -144,13 +144,17 @@ def analyze(filepath, only_section=None):
             findings.append(f"entry section '{s['name']}' is high-entropy executable "
                             f"(encrypted/packed loader)")
 
-    # Signature scan across all sections.
-    full = data
+    # Signature scan across the whole file. These markers are four bytes, so on
+    # a multi-megabyte binary they hit by chance -- every 'AddD' in OMF:
+    # Battlegrounds is inside a mangled C++ export (?AddData@DE_CChecksumMD5@@).
+    # A bare signature is a hint to go looking, never a verdict; only section
+    # names, the entry point and entropy are load-bearing.
+    weak = []
     for sig, label in PROTECTION_SIGS:
-        idx = full.find(sig)
+        idx = data.find(sig)
         if idx != -1:
-            findings.append(f"signature '{sig.decode('ascii', errors='replace')}' "
-                            f"@0x{idx:X} -> {label}")
+            weak.append(f"signature '{sig.decode('ascii', errors='replace')}' "
+                        f"@0x{idx:X} -> {label}")
 
     print()
     if findings:
@@ -162,6 +166,11 @@ def analyze(filepath, only_section=None):
                 seen.add(f)
     else:
         print("  No known protection/packer indicators found.")
+    if weak:
+        note = "" if findings else " -- nothing above corroborates them, treat as noise"
+        print(f"  Weak (4-byte signature match, coincidence is common){note}:")
+        for f in weak:
+            print(f"    - {f}")
     return {s['name']: s['data'] for s in sections}
 
 
