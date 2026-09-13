@@ -717,37 +717,67 @@ from, which turns an undifferentiated wall of `sub_004A1C30` into something
 with a shape -- and tells you which functions are worth reverse-engineering in
 one sitting, because they were written in one.
 
-### 9. `conformance` · 2,532 lines · the big one, assess before porting
+### 9. `conformance` · **assessed, then absorbed rather than ported**
 
-**Source**: `xboxrecomp/tools/conformance/` -- of which `cases.py` (442) and
-`harness.py` (329) are the portable core, and `xbe_run.py` (670) is not.
+**Source**: `xboxrecomp/tools/conformance/`, 2,532 lines. **Not ported.** The
+two ideas worth having were lifted into `tools/lift/difftest.py`, which already
+does the harder half -- assembling a snippet, running it through Unicorn,
+compiling the lifted C, and comparing state field by field. Porting a second
+harness beside it would have been duplication, not capability.
 
-Same idea as `lift/difftest.py`, considerably further along. Snippets are written
-as **MSVC inline-assembly text**, so the assembler picks the encoding rather than
-us; the same bytes then run natively and lifted, and the results are compared.
-Three kinds:
+What difftest.py was missing, and now has:
 
-| kind | inputs | compared |
-|------|--------|----------|
-| `gpr` | `(eax, ecx)` uint32 pairs | `eax` |
-| `fpu` | two doubles in a scratch buffer | x87 **stack depth** and every live `st(i)`, plus `eax` |
-| `sse` | two 4-float tuples | all eight XMM registers as raw bytes, plus `eax` |
+**The x87 stack was never compared at all.** `g_st[8]` and `g_fp_top` existed
+only so the generated C would link; nothing read them. Depth is the point --
+a handler that pushes or pops the wrong number of times leaves every later
+`st(i)` reading its neighbour, the values stay plausible for a long while
+afterwards, and a comparison of values alone passes while the model is already
+one slot out. Sixteen x87 cases now cover push, pop, the pop that `faddp` and
+`fstp` do, load/store round trips, and integer conversion.
 
-The depth comparison is what `difftest.py` does not do, and it is the point: a
-handler that pops the wrong number of times is a whole bug class, and the *value*
-alone never shows it. That class desynced Halo's camera maths. POD and Fury3 are
-the local binaries with enough x87 to care.
+Depth on the hardware side comes from the status word's TOP field, which is a
+rotating index starting at 0 on an empty stack and counting *down*, so after n
+pushes it reads `(0 - n) & 7`. Values are not read from registers at all:
+Unicorn's `ST0..ST7` return the 64-bit mantissa with the exponent and sign
+dropped, and its `FP0..FP7` return `(0, 0)` on this build, so neither can be
+turned back into a number. The cases store what they want compared into guest
+memory instead, which difftest already compares byte for byte.
 
-It also pins the x87 control word to **PC=53** so the model -- which holds the
-stack as C `double` -- and the hardware round identically. Without that,
-add/sub/mul/div/sqrt disagree in the last place for reasons that have nothing to
-do with lifting, and every real bug is buried in precision noise.
+**The control word is pinned to PC=53.** The model holds the stack as C
+doubles; the x87 default is 64-bit extended, which carries eleven bits the
+model cannot.
 
-**Assess first**: port the harness, or lift `cases.py` plus the control-word
-discipline into `difftest.py`? The second is probably right -- `difftest.py`
-already runs lifted C against Unicorn, which is the harder half.
+### The pin had to be earned
 
----
+Setting it and asserting it matters would have been the easy version. It does
+not, for most cases: with the hardware left at extended precision, all fifteen
+original x87 cases still passed, because a single operation followed by a store
+to double survives the double rounding.
+
+Searching random divisions, **about 1 in 4,000** does not:
+
+    3855816586396013.0 / 2899998962399734.0
+      PC=53  ->  1.3295924020625665
+      PC=64  ->  1.3295924020625667
+
+That is `fpu.double-rounding`, and it is the case that makes the control word
+load-bearing rather than decorative: with the pin the suite is 16/16, and
+reverting only the control word fails exactly that one. Rare enough to look
+like a flake, common enough that a growing FPU suite would carry a couple of
+permanent unexplained divergences without it -- which is how a suite starts
+being scrolled past.
+
+The depth comparison is mutation-tested too: reporting `g_fp_top + 1` from the
+lifted side turns 15/15 into 15 failures, each naming the discrepancy.
+
+Whole suite: **63/67 match hardware, 4 known divergences, 0 failures.**
+
+### What was left behind
+
+`xbe_run.py` (670 lines) is Xbox-specific. The `sse` case kind is not ported:
+the lifter has MMX but the x87 stack was the gap that mattered, and SSE cases
+need the same memory-capture treatment to be worth anything. The corpus runner
+assumes a title library this repo does not have.
 
 ### 10. `abi_analysis` · 544 lines · and `split` · 482 lines
 
@@ -835,7 +865,10 @@ each should merge rather than one winning.
       46,853 Trespasser functions attributed to a source file at ~97% accuracy
       against the MAP. Direct and interpolated attribution are equally
       accurate, which contradicted the expectation.
-- [ ] 9. `conformance` -- assess against `lift/difftest.py` first
+- [x] 9. `conformance` -- assessed, and absorbed into `lift/difftest.py`
+      rather than ported. x87 stack depth is now compared (it never was), the
+      control word is pinned to PC=53, and 16 x87 cases exist to exercise both.
+      SSE cases and the Xbox corpus runner were left behind.
 - [ ] 10. `abi_analysis`, `split`
 - [ ] 11. Disassembler tests, ported alongside each item
 

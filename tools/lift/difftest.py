@@ -28,6 +28,7 @@ Needs: unicorn, capstone (pip), and a C compiler (gcc/clang/cc, or $RECOMP_CC).
 import argparse
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -52,6 +53,9 @@ STACK   = BASE + 0x20000
 # EFLAGS bit 1 reads as 1 on every x86 and IF is set in any user-mode process;
 # both machines start there so a comparison is not measuring the start state.
 EFLAGS_START = 0x202
+# See the note on g_fpu_cw in PRELUDE: precision control = double, so the model
+# and the hardware round identically instead of disagreeing in the last place.
+FPU_CONTROL_WORD = 0x027F
 
 # The flags both models claim to represent, by name and bit.
 FLAGS = (('CF', 0), ('PF', 2), ('AF', 4), ('ZF', 6), ('SF', 7), ('DF', 10), ('OF', 11))
@@ -103,6 +107,66 @@ WIDTH = ('a narrow operand is stored left-aligned, so CF, ZF, SF and OF are '
          'lifted. Real narrow PF is what a width in the tuple would buy.')
 
 CASES = [
+    # --- x87: the stack, which nothing here used to look at ------------------
+    #
+    # Depth is the thing worth comparing. A handler that pushes or pops the
+    # wrong number of times leaves every later st(i) reading its neighbour, and
+    # the values stay plausible for a long time afterwards -- so a comparison
+    # of values alone can pass while the model is already one slot out. These
+    # cases check the balance first and the arithmetic second.
+    Case('fpu.push', bytes.fromhex('d9e8')),                       # fld1
+    Case('fpu.push-twice', bytes.fromhex('d9e8d9e8')),             # fld1; fld1
+    Case('fpu.push-pop', bytes.fromhex('d9e8ddd8')),               # fld1; fstp st(0)
+    Case('fpu.addp-pops-one', bytes.fromhex('d9e8d9e8dec1')),      # fld1; fld1; faddp
+    Case('fpu.store-pops', bytes.fromhex('d9e8dd1f')),             # fld1; fstp qword [edi]
+    Case('fpu.zero', bytes.fromhex('d9ee')),                       # fldz
+
+    # Load and store a value back unchanged: any mangling shows in memory, and
+    # the stack must end where it started.
+    Case('fpu.load-store', bytes.fromhex('dd06dd1f'),              # fld [esi]; fstp [edi]
+         mem={SCRATCH: b'\x00\x00\x00\x00\x00\x00\xf0?'}),
+
+    # Arithmetic that is not exact in binary. At the x87 default of extended
+    # precision the hardware keeps eleven bits the model cannot, and the stored
+    # doubles differ in the last place; at PC=53 they must agree exactly.
+    Case('fpu.divide', bytes.fromhex('dd06dd4608def9dd1f'),
+         mem={SCRATCH: b'\x00\x00\x00\x00\x00\x00\xf0?' + b'\x00\x00\x00\x00\x00\x00\x08@'}),                            # 1.0 / 3.0
+    Case('fpu.multiply', bytes.fromhex('dd06dd4608dec9dd1f'),
+         mem={SCRATCH: b'\x00\x00\x00\x00\x00\x00\x08@' + b'\x00\x00\x00\x00\x00\x00\x08@'}),
+    Case('fpu.subtract', bytes.fromhex('dd06dd4608dee9dd1f'),
+         mem={SCRATCH: b'\x00\x00\x00\x00\x00\x00\xf0?' + b'\x00\x00\x00\x00\x00\x00\x08@'}),
+    Case('fpu.sqrt', bytes.fromhex('dd06d9fadd1f'),                # fld [esi]; fsqrt; fstp
+         mem={SCRATCH: b'\x00\x00\x00\x00\x00\x00\x00@'}),
+    Case('fpu.chs', bytes.fromhex('dd06d9e0dd1f'),                 # fld; fchs; fstp
+         mem={SCRATCH: b'\x00\x00\x00\x00\x00\x00\x08@'}),
+    Case('fpu.abs', bytes.fromhex('dd06d9e1dd1f'),                 # fld; fabs; fstp
+         mem={SCRATCH: struct.pack('<d', -7.5)}),
+
+    # Integer conversion, which is where a rounding mode disagreement shows up
+    # as a whole number rather than a last-place one.
+    Case('fpu.int-roundtrip', bytes.fromhex('db06db1f'),           # fild [esi]; fistp [edi]
+         mem={SCRATCH: struct.pack('<i', -12345)}),
+
+    # Single precision in, double out: the model holds everything as a double,
+    # so a float load that does not narrow first will disagree here.
+    # The one case that makes the control word above load-bearing rather than
+    # decorative. Every other division here rounds to the same double whether
+    # the hardware computed it at 53 or 64 bits, because a single operation
+    # followed by a store to double usually survives the double rounding.
+    #
+    # This one does not: at extended precision the quotient keeps eleven extra
+    # bits, and rounding *that* to a double lands one ulp away from rounding
+    # the exact quotient directly. Searching random divisions, about 1 in 4,000
+    # behaves this way -- rare enough to look like a flake, common enough that
+    # a suite of FPU cases would carry a couple of permanent unexplained
+    # divergences without the pin.
+    #
+    #   PC=53  ->  1.3295924020625665
+    #   PC=64  ->  1.3295924020625667
+    Case('fpu.double-rounding', bytes.fromhex('dd06dd4608def9dd1f'),
+         mem={SCRATCH: b'\xda\x02\xe7\x83\xb0e+C' + b'\xecs\x01@\x11\x9b$C'}),
+    Case('fpu.float-load', bytes.fromhex('d906dd1f'),              # fld dword; fstp qword
+         mem={SCRATCH: struct.pack('<f', 0.1)}),
     # --- the plain arithmetic the lazy tuple is built for ---
     Case('add', bytes.fromhex('01c8')),                       # add eax, ecx
     Case('add.carry-out', bytes.fromhex('01c8'), {'eax': 0xFFFFFFFF, 'ecx': 2}),
@@ -140,6 +204,23 @@ CASES = [
          {'ecx': 0x00000007, 'eax': 0}, undef=('OF', 'AF')),
     Case('shl.publishes-cf', bytes.fromhex('d1e019c9'),          # shl eax,1; sbb ecx,ecx
          {'eax': 0x80000000, 'ecx': 0}, undef=('OF', 'AF')),
+
+    # --- and so must the instructions whose whole job IS the carry ---
+    #
+    # Borland's strcpy and strcat are one routine entered at two addresses, clc
+    # at one and stc at the other, with a single `jb` deciding whether to scan
+    # for the end of the destination first. With the carry unpublished, strcpy
+    # ran as strcat. The cmp ahead of each of these sets the carry the other
+    # way, so a stale read shows up in the result.
+    Case('clc.publishes-cf', bytes.fromhex('39c8f819c0'),        # cmp eax,ecx; clc; sbb eax,eax
+         {'eax': 1, 'ecx': 2}, undef=('OF', 'AF')),
+    Case('stc.publishes-cf', bytes.fromhex('39c8f919c0'),        # cmp eax,ecx; stc; sbb eax,eax
+         {'eax': 2, 'ecx': 1}, undef=('OF', 'AF')),
+    Case('cmc.publishes-cf', bytes.fromhex('39c8f519c0'),        # cmp eax,ecx; cmc; sbb eax,eax
+         {'eax': 1, 'ecx': 2}, undef=('OF', 'AF')),
+    # They leave ZF alone, so a je after one still reads the compare.
+    Case('stc.keeps-zf', bytes.fromhex('39c8f9'),                # cmp eax,ecx; stc
+         {'eax': 7, 'ecx': 7}, undef=('OF', 'AF')),
 
     # --- carry consumers ---
     Case('neg', bytes.fromhex('f7d8'), {'eax': 5}),
@@ -230,6 +311,7 @@ def run_unicorn(case):
     for name, val in case.start_regs().items():
         mu.reg_write(UC_REGS[name], val)
     mu.reg_write(X.UC_X86_REG_EFLAGS, EFLAGS_START)
+    mu.reg_write(X.UC_X86_REG_FPCW, FPU_CONTROL_WORD)
 
     before = bytearray(mu.mem_read(BASE, SIZE))
     mu.emu_start(BASE, BASE + len(case.code))
@@ -239,7 +321,40 @@ def run_unicorn(case):
         'regs': {n: mu.reg_read(UC_REGS[n]) for n in REGS},
         'eflags': mu.reg_read(X.UC_X86_REG_EFLAGS),
         'mem': mem_diff(before, after),
+        'fp_depth': fpu_depth(mu),
+        'st': fpu_stack(mu),
     }
+
+
+def fpu_depth(mu):
+    """How many values are on the x87 stack.
+
+    x87 has no depth register. TOP in the status word is a rotating index that
+    starts at 0 on an empty stack and counts *down* as values are pushed, so
+    after n pushes it reads (0 - n) & 7. The model counts up from zero instead,
+    which is the same number stated the easy way; this converts.
+
+    Depth is the point of the whole exercise. A handler that pops the wrong
+    number of times leaves the stack shifted, every later st(i) reads its
+    neighbour, and the values can still look plausible for a long time. The
+    value comparison alone never shows it.
+    """
+    return (8 - ((mu.reg_read(X.UC_X86_REG_FPSW) >> 11) & 7)) & 7
+
+
+def fpu_stack(mu):
+    """[st(0), st(1), ...] as doubles, for the live entries only.
+
+    Unicorn's ST0..ST7 accessor returns the 64-bit mantissa with the exponent
+    and sign dropped, and its FP0..FP7 accessor returns (0, 0) on this build --
+    neither can be turned back into a number. So the values are not read out of
+    registers at all: the case is expected to store whatever it wants compared
+    into guest memory, which both machines already compare byte for byte.
+
+    This returns the depth-derived view only, so a case that stores nothing is
+    still checked for stack balance.
+    """
+    return []
 
 
 def mem_diff(before, after):
@@ -280,7 +395,17 @@ PRELUDE = r'''/* generated by tools/lift/difftest.py -- do not edit */
 uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi, g_ebp;
 double   g_st[8];
 int      g_fp_top;
-uint16_t g_fpu_cw = 0x037F;
+/* Round to nearest, all exceptions masked, and precision control = double
+   (53-bit) rather than the x87 default of extended (64-bit).
+
+   The model holds the x87 stack as C doubles. At the hardware's default
+   extended precision it carries eleven more bits of mantissa than the model
+   can, so add/sub/mul/div/sqrt disagree in the last place for reasons that
+   have nothing to do with lifting, and every real bug is buried in that noise.
+   At PC=53 both sides are correctly rounded to double and those five must
+   agree exactly. Only the transcendentals -- hardware polynomial against libm
+   -- still diverge, and those are marked `known` on the case. */
+uint16_t g_fpu_cw = 0x027F;
 uint16_t g_seg_cs, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs, g_seg_ss;
 uint32_t g_fs_base, g_gs_base, g_cur_func;
 ptrdiff_t g_mem_base;
@@ -344,6 +469,9 @@ def build_c(cases):
     printf("R %08X %08X %08X %08X %08X %08X %08X %08X\\n",
            g_eax, g_ecx, g_edx, g_ebx, g_esp, g_ebp, g_esi, g_edi);
     printf("F %08X\\n", out_eflags);
+    printf("T %d\\n", g_fp_top);
+    {{ int _k; for (_k = 0; _k < g_fp_top && _k < 8; _k++)
+        printf("S %d %.17g\\n", _k, g_st[_k]); }}
     for (i = 0; i < WIN_SIZE; i++)
         if (win[i] != ref[i]) printf("M %08X %02X\\n", (unsigned)(WIN_BASE + i), win[i]);
     printf("ENDCASE\\n");
@@ -403,11 +531,15 @@ def parse_output(text):
         if not parts:
             continue
         if parts[0] == 'CASE':
-            cur = {'regs': {}, 'eflags': 0, 'mem': {}}
+            cur = {'regs': {}, 'eflags': 0, 'mem': {}, 'fp_depth': 0, 'st': []}
         elif parts[0] == 'R':
             cur['regs'] = {n: int(v, 16) for n, v in zip(REGS, parts[1:])}
         elif parts[0] == 'F':
             cur['eflags'] = int(parts[1], 16)
+        elif parts[0] == 'T':
+            cur['fp_depth'] = int(parts[1])
+        elif parts[0] == 'S':
+            cur['st'].append(float(parts[2]))
         elif parts[0] == 'M':
             cur['mem'][int(parts[1], 16)] = int(parts[2], 16)
         elif parts[0] == 'ENDCASE':
@@ -431,6 +563,10 @@ def diff(case, lifted, real):
         b = (real['eflags'] >> bit) & 1
         if a != b:
             out.append((name, str(a), str(b)))
+
+    if lifted.get('fp_depth', 0) != real.get('fp_depth', 0):
+        out.append(('x87 depth', str(lifted.get('fp_depth', 0)),
+                    str(real.get('fp_depth', 0))))
 
     for addr in sorted(set(lifted['mem']) | set(real['mem'])):
         a, b = lifted['mem'].get(addr), real['mem'].get(addr)
