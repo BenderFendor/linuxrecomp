@@ -79,6 +79,7 @@ pipeline run.
 | **[elfish](https://github.com/sp00nznet/elfish)** | El-Fish | 1993 | 16-bit NE + TSXLIB extender | Lifted & links - 2,236 functions, 121 segments, startup executes |
 | **[tim](https://github.com/sp00nznet/tim)** | The Even More Incredible Machine | 1993 | Borland C++ / Win16 NE | P0 - 27 code segments, imports only KERNEL/USER/GDI, names its own window procs |
 | **[msbus](https://github.com/sp00nznet/msbus)** | Magic School Bus: Human Body | 1994 | Win16 NE, MS "band" engine | P0 - ~60 KB of code driving 190 MB of content |
+| **[hellbender](https://github.com/sp00nznet/hellbender)** | Hellbender | 1996 | Terminal Reality voxel engine (Win32/MSVC) | Bring-up - lifts clean (5,262 functions, 0 errors), 507 import bridges; same toolchain as Fury³ |
 | **[fury3](https://github.com/sp00nznet/fury3)** | Fury³ | 1995 | Terminal Reality voxel engine (Win32/MSVC) | **Playable!** Flies the canyon - 1,945 functions, SDL2+imgui frontend, real joystick |
 | **[tv](https://github.com/sp00nznet/tv)** | Terminal Velocity | 1995 | Watcom / DOS/4GW **LE** | P0 - blocked on an LE/LX front end that does not exist yet |
 | **[mtm](https://github.com/sp00nznet/mtm)** | Monster Truck Madness 1+2 | 1996 / 1998 | Terminal Reality, 3rd gen | P0 - no DRM; the voxel runtime ships as a standalone 248 KB DLL |
@@ -86,8 +87,11 @@ pipeline run.
 | **[encarta](https://github.com/sp00nznet/encarta)** | Encarta 97 Encyclopedia | 1996 | MFC 4.0 + proprietary | **Runs!** Whole app lifted (7,326 fns); hybrid boundary puts the app body in recompiled code - 10,242 real MFC virtual dispatches land lifted per session |
 | **[gta](https://github.com/sp00nznet/gta)** | Grand Theft Auto | 1997 | DMA "Race'n'Chase" | Builds & runs - 4,094 functions, 444K lines, runtime bringup |
 | **[pod](https://github.com/sp00nznet/pod-recomp)** | POD Gold | 1997 | Ubi Soft MMX software rasteriser | Compiles & links - 3,405 functions, 0 lift errors, 422K lines |
+| **[ejay](https://github.com/sp00nznet/ejay)** | Dance eJay 1 + 2 | 1997 | PXD Musicsoft audio engine behind a VB front end | **Plays and draws!** Decodes its intro, streams to a real sound card at 22,050 Hz and animates its cursor - out of recompiled 16-bit code |
 | **[fallout1-re](https://github.com/sp00nznet/fallout1-re)** | Fallout | 1997 | Custom (Interplay) | Fork - native + HTML5 web port, multiplayer |
 | **[fallout2-re](https://github.com/sp00nznet/fallout2-re)** | Fallout 2 | 1998 | Custom (Interplay) | Fork - decompilation ~complete (alexbatalov upstream) |
+| **[trespasser](https://github.com/sp00nznet/trespasser)** | Jurassic Park: Trespasser | 1998 | DreamWorks Interactive rigid-body engine (MSVC 6.0) | P0 - reconnaissance. Ships a linker map, which makes it the calibration target for function recovery |
+| **[nocturne](https://github.com/sp00nznet/nocturne)** | Nocturne | 1999 | Terminal Reality, Watcom C/C++32 | Phase 7 - 6,027 functions lift with 0 errors; real window, 42 MB image mapped, IAT dispatch, 95 of 171 imports live |
 | **[xwa](https://github.com/sp00nznet/xwa)** | X-Wing Alliance | 1999 | Custom (LucasArts) | Active - D3D11 port, concourse UI runs, 2,702 functions |
 | **[forcecommander](https://github.com/sp00nznet/forcecommander)** | Star Wars: Force Commander | 2000 | LucasArts, MSVC 6 + MSVCP60 | P0 - 3.94 MB of .text and **no DRM**; the clean version of the XWA problem |
 | **[sof](https://github.com/sp00nznet/sof)** | Soldier of Fortune | 2000 | Quake II + GHOUL | Active - SDL2 port, 8 subsystems, full maps render |
@@ -97,6 +101,7 @@ pipeline run.
 | **[bw](https://github.com/sp00nznet/bw)** | Black & White | 2001 | Lionhead custom | Active - all 569 types done, 10 Hz game loop runs |
 | **[omfbg](https://github.com/sp00nznet/omfbg)** | One Must Fall: Battlegrounds | 2003 | Diversions Entertainment, modular | P0 - **10,374 mangled C++ exports**; SafeDisc covers 1% of the code |
 | **[bw2](https://github.com/sp00nznet/bw2)** | Black & White 2 | 2005 | Lionhead, 4 years on from bw | P0 - `white.exe` is **21.7 MB**, the largest binary here; on a later disc |
+| **[rol](https://github.com/sp00nznet/rol)** | Rise of Nations: Rise of Legends | 2006 | Big Huge Games rts2 (MSVC 7.1) | Phase 3 - the largest binary this toolchain has faced: 13.25 MB, 25,513 vtable-only functions, no RTTI |
 
 Every row above links to a repo. The nine most recent are private while they
 are still at P0 -- see [docs/PROJECTS.md](docs/PROJECTS.md) for what each one
@@ -108,14 +113,13 @@ tools here carry their scars: **bolo** (Bolo Adventures III, 1993 -- shipped
 `tools/unpklite.py`, a byte-exact static PKLITE 1.15 decompressor),
 **coaster** (Roller Coaster Construction Set, 1993 -- ~560 functions, boots),
 **bob** (Microsoft Bob, 1995 -- Win16 NE + Jet/WinG, `InitInstance` runs),
-**ejay** (Dance eJay 1+2, 1997 -- plays and draws, 16-bit audio engine behind a
-VB front end), **trespasser** (Jurassic Park: Trespasser, 1998 -- the linker-map
-scorecard that found the E9 seeding bug), **hellbender** (1996 -- 5,262
-functions, 0 lift errors, 507 import bridges), **mw3** (MechWarrior 3, 1999 --
-2,805 functions), **recoil** (1999 -- 3,490 functions), **xvt** (X-Wing vs TIE
-Fighter, 1997), **nocturne** (1999 -- 6,027 functions, Watcom, real window and
-IAT dispatch), **rol** (Rise of Legends, 2006 -- 13.25 MB, the largest binary
-this toolchain has been pointed at).
+**mw3** (MechWarrior 3, 1999 -- 2,805 functions), **recoil** (1999 -- 3,490
+functions) and **xvt** (X-Wing vs TIE Fighter, 1997).
+
+The first three are held back by their own generated code rather than by
+progress: lifted C is a derivative work of the binary it came from, and every
+public repo here tracks none of it. See
+[docs/PUBLISHING.md](docs/PUBLISHING.md) and `tools/audit_repo.py`.
 
 ### Sibling toolboxes
 
