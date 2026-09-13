@@ -724,7 +724,61 @@ class Disassembler:
 
         print(f"[*] Successfully disassembled {len(functions)} functions"
               f" ({round_no} discovery rounds)")
+        moved = clamp_extents(functions, code_end)
+        if moved:
+            print(f"[*] Clamped {moved} function extents to the next function start")
         return functions
+
+
+def clamp_extents(functions, code_end):
+    """No function extends past the next function's entry. Returns how many
+    had to be shortened.
+
+    `func.end` comes out of recursive descent as `max(block.end)`, and descent
+    follows unconditional jumps - so one `jmp` to a shared epilogue, or a jump
+    table whose arms are scattered, puts `end` far past the body and everything
+    in between is counted as part of this function. The lifter then reads
+    `size` bytes LINEARLY from the entry, so it lifts every unrelated function
+    in the gap into this one, over and over.
+
+    Measured on Mario Kart Arcade GP DX: 28,597 recovered functions claiming
+    **89.5 MB of bodies for a 4.3 MB code range** - 271 of them over 64 KB and
+    one at 1.3 MB - which lifted to 18.8 million lines and 1.9 GB of C that no
+    compiler will take. Clamping brings the claim to 6.7 MB. The 1.55x that
+    remains is the 3,619 alias entries, which overlap their host function
+    deliberately and are the reason this clamps only against `entry_kind ==
+    "start"`: clamping against an alias would truncate the function containing
+    it.
+
+    A real function whose body is genuinely split around another one - MSVC
+    does move cold blocks away - loses its far blocks here. That shows up as a
+    named, findable unresolved dispatch at run time, which is much better than
+    a lift nobody can build.
+
+    Accepts the {addr: Function} that find_functions returns, or the plain
+    {addr: size} a project keeps in a catalog; returns the same shape mutated.
+    """
+    import bisect
+
+    starts = sorted(a for a, f in functions.items()
+                    if getattr(f, "entry_kind", "start") == "start")
+    moved = 0
+    for addr, func in functions.items():
+        size = func.size if hasattr(func, "size") else func
+        if size <= 0:
+            continue
+        i = bisect.bisect_right(starts, addr)
+        limit = starts[i] if i < len(starts) else code_end
+        if addr + size <= limit:
+            continue
+        new = max(0, limit - addr)
+        if hasattr(func, "size"):
+            func.size = new
+            func.end = addr + new
+        else:
+            functions[addr] = new
+        moved += 1
+    return moved
 
 
 # ---------------------------------------------------------------------------
@@ -829,6 +883,28 @@ def demo():
     # something is scoring against symbols.
     assert d.probes_as_function_body(a_tail, window=6), \
         "out of window is not out of code"
+
+    # clamp_extents: an over-extended function must be cut at the next START,
+    # an alias inside a function must NOT cut it, and a function that already
+    # ends before the next start must be left exactly alone. Plain {addr: size}
+    # bounds maps have to work too, because that is what a catalog holds.
+    fns = {
+        0x1000: Function(address=0x1000, end=0x9000, size=0x8000),   # over-extended
+        0x1200: Function(address=0x1200, end=0x1300, size=0x100),    # honest
+        0x1250: Function(address=0x1250, end=0x1280, size=0x30,      # alias inside it
+                         entry_kind="alias"),
+        0x2000: Function(address=0x2000, end=0x2010, size=0x10),
+    }
+    moved = clamp_extents(fns, 0x9000)
+    assert moved == 1, moved
+    assert fns[0x1000].size == 0x200, hex(fns[0x1000].size)   # cut at 0x1200
+    assert fns[0x1200].size == 0x100, "an honest extent was changed"
+    assert fns[0x1250].size == 0x30, "an alias was clamped"
+    assert fns[0x2000].size == 0x10
+    # ...and the alias at 0x1250 did not become the limit for 0x1200.
+    bounds = {0x1000: 0x8000, 0x1200: 0x100}
+    assert clamp_extents(bounds, 0x9000) == 1
+    assert bounds == {0x1000: 0x200, 0x1200: 0x100}, bounds
 
     print("disasm32.py self-test OK")
 
