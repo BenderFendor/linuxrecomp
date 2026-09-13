@@ -15,20 +15,31 @@
  * ============================================================ */
 
 /* MSVC inline asm cannot address locals once esp/ebp are switched, so the
- * marshalling slots cannot be locals. They are saved and restored around each
- * call, which is what makes this reentrant (RULE 2) - and they are
- * thread-local, which is what makes it thread-safe, and is not optional once a
- * game has worker threads.
+ * marshalling slots are file-scope. They are saved and restored around each
+ * call, which is what makes this reentrant (RULE 2).
  *
- * Reentrancy and thread-safety are different problems here and both are real.
- * The save/restore handles one call nested inside another on the SAME thread.
- * It does nothing for two threads in hybrid_call_machine at once, which hand
- * each other's registers to each other's target and restore each other's host
- * esp on the way out. Nothing faults where that happens; the process wanders
- * off some time later. Mario Kart spawns six threads during engine startup and
- * every one of them calls back into lifted code. */
-static __declspec(thread)
-       uint32_t T_eax, T_ecx, T_edx, T_ebx, T_esi, T_edi, T_ebp, T_espp4,
+ * RULE 4: REENTRANT IS NOT THREAD-SAFE, AND THIS HALF IS NOT YET.
+ * The save/restore handles a call nested inside another on the SAME thread and
+ * does nothing for two threads in here at once, which hand each other's
+ * registers to each other's target and restore each other's host esp on the
+ * way out. Mario Kart's engine startup makes six threads that all cross.
+ *
+ * `__declspec(thread)` is the obvious fix and does not work: the TLS lookup
+ * MSVC emits for one of these needs eax and ecx, and every reference below
+ * happens after `mov esp, T_espp4` has handed the machine to the guest -
+ * so the fix costs the very registers being marshalled, and the boot dies
+ * three dispatches in. Tried, measured, reverted.
+ *
+ * What does work is not keeping the block in C at all: park the host esp in a
+ * TEB slot (`fs:[0x14]`, ArbitraryUserPointer, free for application use and
+ * per-thread by construction), which needs no registers, and use ebp as
+ * scratch after the `call` returns, by which point the callee has restored it
+ * and nothing here still wants it. That is a rewrite of the asm below rather
+ * than an annotation on it, and it is the next thing this file needs.
+ *
+ * The real->lifted direction below IS thread-safe: it is plain C and its arena
+ * is per thread. */
+static uint32_t T_eax, T_ecx, T_edx, T_ebx, T_esi, T_edi, T_ebp, T_espp4,
                 T_tgt, T_fesp, T_sesp;
 
 #pragma warning(disable:4731)   /* we clobber ebp deliberately; push/pop restores it */
