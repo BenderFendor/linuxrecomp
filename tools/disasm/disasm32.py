@@ -785,6 +785,7 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
     from capstone import Cs, CS_ARCH_X86, CS_MODE_32
     md = Cs(CS_ARCH_X86, CS_MODE_32)
     dropped = 0
+    gone = set()
 
     # Decode to a terminator, NOT to the recorded size, and this is the whole
     # subtlety. clamp_extents has already cut each function at the next start -
@@ -832,10 +833,28 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
             break
         for a in bogus:
             del functions[a]
+        gone.update(bogus)
         dropped += len(bogus)
         if verbose:
             print("[*] Dropped %d entries that are not instruction boundaries"
                   % len(bogus))
+
+    # Re-open the neighbours the dropped entries had truncated.
+    #
+    # clamp_extents cut each real function at the next start, and for these the
+    # next start was the false one - so a function whose extent ends exactly at
+    # a dropped address is a function that was cut short to make room for
+    # something that does not exist. Left alone it ends in a fallthrough to an
+    # address nothing lifts, which is a worse failure than the one this
+    # function just fixed: before, the game ran a wrong instruction; now it
+    # would stop dead at a dispatch.
+    if gone:
+        import bisect
+        starts = sorted(functions)
+        for addr in list(functions):
+            if addr + functions[addr] in gone:
+                i = bisect.bisect_right(starts, addr)
+                functions[addr] = (starts[i] if i < len(starts) else code_end) - addr
     return dropped
 
 
@@ -1013,6 +1032,14 @@ def demo():
     gone = drop_mid_instruction_entries(_read, cat, 0x1000, 0x1000 + len(blob),
                                         verbose=False)
     assert gone == 1 and 0x1002 not in cat and 0x1000 in cat, (gone, cat)
+
+    # ...and a neighbour that had been clamped onto the dropped entry gets its
+    # extent back. Left at 2 bytes it would end in a fallthrough to an address
+    # nothing lifts - a worse failure than the wrong instruction just removed.
+    cat = {0x1000: 2, 0x1002: len(blob) - 2}
+    assert drop_mid_instruction_entries(_read, cat, 0x1000, 0x1000 + len(blob),
+                                        verbose=False) == 1, cat
+    assert cat == {0x1000: len(blob)}, cat
 
     # A real boundary is never dropped, and an entry never drops itself.
     cat = {0x1000: len(blob), 0x1006: len(blob) - 6}
