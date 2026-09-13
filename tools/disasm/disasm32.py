@@ -858,6 +858,74 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
     return dropped
 
 
+def close_dispatch_targets(read_va, functions, code_start, code_end,
+                           aliases=None, max_rounds=3, verbose=True):
+    """Make every direct branch target dispatchable.
+
+    The lifter turns a `jcc`/`jmp`/`call` into a `goto` when the target is
+    inside the function being lifted and into a `dispatch()` when it is not.
+    So every target that leaves its own extent has to BE an entry, or the game
+    stops on "no lifted function at ...".
+
+    Clamping is what creates these. A shared epilogue is a legitimate entry -
+    several functions jump to it - but recording it as a *start* cuts the
+    function that contains it in half, and the second half's branch targets
+    suddenly point outside the extent. Mario Kart stopped on 0x007B96F3, an
+    ordinary `mov eax, [ebp+0x18]` in the middle of a function that had been
+    truncated at the `pop/pop/pop/ret` five bytes earlier.
+
+    New entries are aliases: they overlap whatever contains them on purpose,
+    and must not be used as clamp limits. Their addresses are added to
+    `aliases` if one is given. Returns how many were added.
+    """
+    from capstone import Cs, CS_ARCH_X86, CS_MODE_32
+    import bisect
+    md = Cs(CS_ARCH_X86, CS_MODE_32)
+    md.detail = True
+    BRANCH = ("jmp", "call", "je", "jne", "jz", "jnz", "ja", "jae", "jb", "jbe",
+              "jg", "jge", "jl", "jle", "js", "jns", "jo", "jno", "jp", "jnp",
+              "jcxz", "jecxz", "loop", "loope", "loopz", "loopne", "loopnz")
+    added_total = 0
+
+    for _ in range(max_rounds):
+        wanted = set()
+        for addr, size in list(functions.items()):
+            if size <= 0:
+                continue
+            try:
+                code = read_va(addr, size)
+            except Exception:
+                continue
+            end = addr + size
+            for ins in md.disasm(code, addr):
+                if ins.mnemonic.split()[-1] not in BRANCH:
+                    continue
+                for op in ins.operands:
+                    if op.type != X86_OP_IMM:
+                        continue
+                    t = op.imm & 0xFFFFFFFF
+                    # Inside this extent the lifter emits a goto, and an
+                    # address that is already an entry is already dispatchable.
+                    if addr <= t < end or t in functions:
+                        continue
+                    if code_start <= t < code_end:
+                        wanted.add(t)
+        if not wanted:
+            break
+        starts = sorted(functions)
+        for t in sorted(wanted):
+            i = bisect.bisect_right(starts, t)
+            nxt = starts[i] if i < len(starts) else code_end
+            functions[t] = nxt - t
+            if aliases is not None:
+                aliases.add(t)
+        added_total += len(wanted)
+        if verbose:
+            print("[*] Added %d branch targets that had no dispatchable body"
+                  % len(wanted))
+    return added_total
+
+
 def clamp_extents(functions, code_end, starts=None):
     """No function extends past the next function's entry. Returns how many
     had to be shortened.
@@ -1046,6 +1114,31 @@ def demo():
     assert drop_mid_instruction_entries(_read, cat, 0x1000, 0x1000 + len(blob),
                                         verbose=False) == 0, cat
     assert len(cat) == 2, cat
+
+    # close_dispatch_targets: a branch that leaves its own extent needs an
+    # entry at the target, or the lifter emits a dispatch nothing answers.
+    jmpblob = (bytes([0x74, 0x02]) +                  # 0x1000: je 0x1004
+               bytes([0x33, 0xC0]) +                  # 0x1002: xor eax, eax
+               bytes([0xC3]) +                        # 0x1004: ret
+               bytes([0x8B, 0x45, 0x18]) +            # 0x1005: mov eax,[ebp+0x18]
+               bytes([0xC3]))                         # 0x1008: ret
+
+    def _readj(va, n):
+        off = va - 0x1000
+        return jmpblob[off:off + n] if 0 <= off < len(jmpblob) else b""
+
+    # Truncated at 0x1004, so the `je 0x1004` now leaves the extent.
+    cat, als = {0x1000: 4, 0x1005: 4}, set()
+    n = close_dispatch_targets(_readj, cat, 0x1000, 0x1000 + len(jmpblob),
+                               aliases=als, verbose=False)
+    assert n == 1 and 0x1004 in cat and 0x1004 in als, (n, cat, als)
+    # ...and the new entry runs to the next one, not past it.
+    assert cat[0x1004] == 1, cat
+
+    # A branch that stays inside its own extent adds nothing.
+    cat = {0x1000: len(jmpblob)}
+    assert close_dispatch_targets(_readj, cat, 0x1000, 0x1000 + len(jmpblob),
+                                  verbose=False) == 0, cat
 
     # clamp_extents: an over-extended function must be cut at the next START,
     # an alias inside a function must NOT cut it, and a function that already
