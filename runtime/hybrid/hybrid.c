@@ -277,3 +277,66 @@ int hybrid_route_fnptr_slots(void *image_base, int32_t image_delta,
     FlushInstructionCache(GetCurrentProcess(), NULL, 0);
     return routed;
 }
+
+/* ---------------- the x87 stack across the boundary ---------------- */
+/*
+ * Why this is here and not in the caller: `__asm` is MSVC-x86-only and the
+ * rest of the boundary already is, and because getting the depth right needs
+ * fnstenv, which has a side effect - it masks every exception - that has to be
+ * undone or the caller's FPU control word quietly changes under it.
+ */
+
+/* fnstenv writes a 28-byte environment; the tag word is at offset 8, two bits
+ * per PHYSICAL register with 3 meaning empty. Physical and st(n) numbering
+ * differ, but the count of non-empty registers is the same either way, and a
+ * count is all a depth is. */
+int hybrid_fpu_depth(void)
+{
+    unsigned char env[28];
+    unsigned short tw;
+    int i, live = 0;
+
+    __asm {
+        fnstenv [env]
+        fldenv  [env]      /* fnstenv masks all exceptions; fldenv puts the
+                              control word back exactly as it was */
+    }
+    tw = (unsigned short)(env[8] | (env[9] << 8));
+    for (i = 0; i < 8; i++)
+        if (((tw >> (2 * i)) & 3) != 3) live++;
+    return live;
+}
+
+void hybrid_fpu_push(const double *st, int n)
+{
+    int i;
+    if (n > 8) n = 8;
+    /* Backwards, so st[0] is pushed last and ends up in st(0). That is the
+     * order `_CIpow(x, y)` wants: y in st(0), x in st(1). */
+    for (i = n - 1; i >= 0; i--) {
+        double v = st[i];
+        __asm { fld qword ptr [v] }
+    }
+}
+
+double hybrid_fpu_pop(void)
+{
+    double v;
+    __asm { fstp qword ptr [v] }
+    return v;
+}
+
+/* Discard whatever is on the stack without touching the control word - fninit
+ * would also reset rounding and precision, and a game that set 24-bit
+ * precision (Direct3D used to, on every device create) would silently start
+ * computing in 53. `ffree` marks a register empty; `fincstp` moves the top. */
+void hybrid_fpu_clear(void)
+{
+    int i, n = hybrid_fpu_depth();
+    for (i = 0; i < n; i++) {
+        __asm {
+            ffree st(0)
+            fincstp
+        }
+    }
+}

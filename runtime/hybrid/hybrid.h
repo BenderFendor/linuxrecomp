@@ -110,4 +110,41 @@ int hybrid_route_fnptr_slots(void *image_base, int32_t image_delta,
  * narrows to one slot can say which function it is. -1 if out of range. */
 uint32_t hybrid_slot_target(int slot_index);
 
+/* ---------------- the x87 stack across the boundary ----------------
+ *
+ * hybrid_regs is the integer registers, and for almost every call that is the
+ * whole ABI. Two cases it does not cover, and both are everywhere in an
+ * MSVC-compiled game:
+ *
+ *   * A function returning float or double returns it in **st(0)**, not in eax.
+ *     `ceil`, `floor`, `ldexp`, `strtod`, `atof` - and every D3DX function that
+ *     returns a scalar.
+ *   * MSVC's `_CIpow` / `_CIsqrt` / `_CIsin` / `_CIcos` / `_CIatan2` / `_CIfmod`
+ *     family takes its arguments in **st(0)/st(1)** and nothing on the stack at
+ *     all. The compiler emits these for `pow(x, y)` whenever it cannot inline
+ *     the x87 sequence, so they turn up in almost every import table of the era.
+ *
+ * A lifted CPU model keeps its own x87 stack, so those values have to be moved
+ * across explicitly. Push the arguments before hybrid_call_machine, take the
+ * result after.
+ *
+ * hybrid_fpu_depth() is what makes the result side need no table: call it
+ * before and after, and a callee that returned a float is exactly one that
+ * left the host stack one deeper than it found it. Nothing has to know in
+ * advance which functions return floats.
+ */
+
+/* Push `n` doubles onto the host x87 stack, st[0] ending up in st(0). n <= 8. */
+void hybrid_fpu_push(const double *st, int n);
+
+/* Pop st(0) and return it. Undefined if the stack is empty - check the depth. */
+double hybrid_fpu_pop(void);
+
+/* How many x87 registers are currently live (0..8), from the tag word. */
+int hybrid_fpu_depth(void);
+
+/* Empty the host x87 stack. Worth doing after a call that left values behind
+ * that nobody wanted: eight ignored returns and the ninth faults. */
+void hybrid_fpu_clear(void);
+
 #endif /* PCRECOMP_HYBRID_H */
