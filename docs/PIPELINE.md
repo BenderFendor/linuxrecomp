@@ -265,6 +265,24 @@ Use `templates/CMakeLists.txt.template` as a starting point. Key settings:
 - **Warning suppression** -- generated code is ugly but correct
 - **32-bit target** (`-A Win32`) -- match original architecture
 
+### A build that fails without saying anything
+
+MinGW: if `cmake --build` reports `FAILED` for every object and prints **no
+compiler diagnostics at all**, `<msys root>/mingw64/bin` is missing from `PATH`.
+`gcc.exe` is found by absolute path and starts, but the real compiler,
+`cc1.exe`, lives under `lib/gcc/...` and loads `libmpfr-6.dll` and friends from
+`mingw64/bin` at run time. Without them the loader kills cc1 before it can
+write to stderr, and gcc exits 1 with empty output. `-fsyntax-only` "passes"
+because nothing is checked. Run `cc1.exe` directly and it says so:
+
+```
+cc1.exe: error while loading shared libraries: libmpfr-6.dll: cannot open ...
+```
+
+This is worth knowing because the failure mode is indistinguishable from a
+build system problem, and because a shell that has its own unrelated
+`/mingw64/bin` on `PATH` (Git Bash does) hides it completely.
+
 ### Runtime Infrastructure (`runtime/recomp32/`)
 
 - **main.c**: Entry point, VirtualAlloc memory mapping, VEH crash handler
