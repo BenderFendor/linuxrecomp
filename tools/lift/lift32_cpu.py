@@ -523,6 +523,19 @@ class Lifter:
         if m == "call":
             t = ops[0]
             tgt = self._target(insn, t)
+            if t.type == X86_OP_IMM and t.imm == nxt:
+                # The position-independent "get PC" idiom: a call to the very
+                # next instruction, whose only purpose is to push EIP so the
+                #  that follows can read it and form a GOT pointer. There
+                # is no callee. Dispatching would look up an address in the
+                # middle of this same function and find nothing - so do what
+                # the hardware does, push the address and fall through.
+                #   call 0x8072d9d   <- next instruction
+                #   pop  ebx         <- ebx = 0x8072d9d
+                #   add  ebx, ...    <- ebx = _GLOBAL_OFFSET_TABLE_
+                # Every PIC i386 binary opens with this, which is every .so and
+                # every PIE executable.
+                return [f"push32(c, 0x{nxt:08X}u); /* get-PC, no callee */"]
             if t.type == X86_OP_IMM:
                 return [f"push32(c, 0x{nxt:08X}u); dispatch(c, {tgt});"]
             # Indirect: resolve the target BEFORE pushing the return address.
