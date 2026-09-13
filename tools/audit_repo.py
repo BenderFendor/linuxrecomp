@@ -42,6 +42,15 @@ GAME_ASSET = {".pic", ".act", ".pcx", ".lbm", ".tga", ".wav", ".voc", ".mid",
               ".gob", ".lfd", ".m20", ".mvb", ".fif", ".dat"}
 # Screenshots of our own port belong in docs/. Anything else of these types is
 # the game's art until proven otherwise.
+#
+# "In docs/" is weak evidence, not proof, and this tool cannot tell a
+# screenshot of your renderer from the game's own artwork re-encoded as a PNG.
+# Both are pixels in a file. The Force Commander teardown produced exactly that
+# trap: a 640x480 BITMAP lifted straight out of the executable's .rsrc, written
+# to docs/img/splash.png, which this auditor called clean because of where it
+# sat. It was a byte-exact copy of LucasArts' artwork.
+#
+# So docs/ images are reported for review rather than passed in silence.
 IMAGE = {".png", ".jpg", ".jpeg", ".gif"}
 
 LIFTED_HINTS = ("recompiledfuncs/", "/recomp/gen/", "recomp_0", "/seg0", "/seg1",
@@ -82,15 +91,15 @@ def audit(repo):
     files = [f for f in git(repo, "ls-files").splitlines() if f]
     if not files:
         return None
-    game, lifted = [], []
+    game, lifted, review = [], [], []
     for f in files:
         ext = os.path.splitext(f)[1].lower()
         full = os.path.join(repo, f)
         size = os.path.getsize(full) if os.path.exists(full) else 0
         if ext in GAME_BIN or ext in GAME_ASSET:
             game.append((f, size))
-        elif ext in IMAGE and not f.lower().startswith("docs/"):
-            game.append((f, size))
+        elif ext in IMAGE:
+            (review if f.lower().startswith("docs/") else game).append((f, size))
         elif looks_lifted(repo, f):
             lifted.append((f, size))
 
@@ -106,7 +115,7 @@ def audit(repo):
             hist["game material"] += 1
         elif any(h in p.lower() for h in LIFTED_HINTS):
             hist["lifted output"] += 1
-    return files, game, lifted, hist
+    return files, game, lifted, review, hist
 
 
 def main(argv=None):
@@ -131,7 +140,7 @@ def main(argv=None):
         if r is None:
             print(f"\n{name}: not a git repo, or nothing tracked")
             continue
-        files, game, lifted, hist = r
+        files, game, lifted, review, hist = r
         print(f"\n{'=' * 64}\n{name}  ({len(files)} tracked files)")
         for label, items in (("GAME MATERIAL", game), ("LIFTED OUTPUT", lifted)):
             if items:
@@ -146,8 +155,16 @@ def main(argv=None):
             print("  !! IN HISTORY (deleting from HEAD does not remove these):")
             for k, n in hist.most_common():
                 print(f"       {n:>6} objects  {k}")
+        if review:
+            total = sum(s for _, s in review)
+            print(f"  ?? REVIEW: {len(review)} image(s) in docs/, {human(total)}")
+            print("       Your own screenshots are fine. The game's artwork is not,")
+            print("       and this tool cannot tell them apart -- check these by eye.")
+            for f, s in sorted(review, key=lambda x: -x[1])[:5]:
+                print(f"       {human(s):>8}  {f}")
         if not game and not lifted and not hist:
-            print("  CLEAN -- nothing tracked but our own work")
+            print("  CLEAN -- nothing tracked but our own work"
+                  + (", but see REVIEW above" if review else ""))
         else:
             worst = 1
     if worst:
@@ -165,12 +182,19 @@ def demo():
     assert not looks_lifted(".", "runtime/win16/ne_resources.c")
     assert not looks_lifted(".", "tools/parse_map.py")
 
-    # A screenshot of our own port lives in docs/ and is ours; the same bytes
-    # anywhere else are the game's art until someone says otherwise.
+    # An image outside docs/ is the game's art until someone says otherwise; one
+    # inside docs/ is reported for review rather than trusted, because a
+    # screenshot of your renderer and an asset ripped out of the binary are the
+    # same kind of file.
     assert ".png" in IMAGE
-    for path, flagged in (("docs/img/intro.png", False), ("assets/title.png", True)):
-        is_game = os.path.splitext(path)[1] in IMAGE and not path.startswith("docs/")
-        assert is_game == flagged, path
+    for path, bucket in (("docs/img/intro.png", "review"),
+                         ("assets/title.png", "game"),
+                         ("tools/x.py", None)):
+        ext = os.path.splitext(path)[1]
+        got = None
+        if ext in IMAGE:
+            got = "review" if path.startswith("docs/") else "game"
+        assert got == bucket, (path, got, bucket)
 
     # The categories must not overlap, or a file gets counted twice.
     assert not (GAME_BIN & GAME_ASSET)
