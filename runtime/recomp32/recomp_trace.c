@@ -69,6 +69,19 @@ static unsigned g_at_n;
  * a run tells you what is in it. --watchspan LO HI moves or narrows the window
  * so a member at +0x234 can be read without a recompile.
  */
+/*
+ * --argobj VA N: at every entry to VA, dump the object ARGUMENT N points at.
+ *
+ * --watch dumps the object under ecx, which is the right thing for a method and
+ * the wrong thing about half the time: the object a function is really deciding
+ * about arrives as an argument. Reading it needed a recompile until this
+ * existed. N is zero-based and counts the stack arguments only, so for a
+ * thiscall the `this` is ecx and N=0 is the first declared parameter.
+ */
+#define TRACE_ARGOBJ_MAX 4
+static struct { uint32_t va; unsigned n; } g_argobj[TRACE_ARGOBJ_MAX];
+static unsigned g_argobj_n;
+
 #define TRACE_WATCH_MAX 8
 static uint32_t g_watch[TRACE_WATCH_MAX];
 static unsigned g_watch_n;
@@ -157,6 +170,19 @@ void recomp_trace_enter(uint32_t va) {
                 fprintf(stderr, "\n");
             }
     }
+    for (unsigned w = 0; w < g_argobj_n; w++) {
+        if (g_argobj[w].va != va) continue;
+        uint32_t o = MEM32(g_esp + 4 + 4 * g_argobj[w].n);
+        fprintf(stderr, "[argobj] 0x%08X arg%u=%08X", va, g_argobj[w].n, o);
+        if (o < 0x00200000u) { fprintf(stderr, " (not a pointer)\n"); continue; }
+        fprintf(stderr, " vtable=%08X\n", MEM32(o));
+        for (int row = 0; row < 0x40; row += 0x20) {
+            fprintf(stderr, "[argobj]   [+%02X]:", row);
+            for (int k = 0; k < 0x20; k += 4)
+                fprintf(stderr, " %08X", MEM32(o + row + k));
+            fprintf(stderr, "\n");
+        }
+    }
     if (recomp_trace_extra) recomp_trace_extra(va);
 }
 
@@ -198,6 +224,13 @@ int recomp_trace_arg(int argc, char** argv, int i) {
         g_watch[g_watch_n++] = TRACE_U32(argv[i + 1]);
         return 2;
     }
+    if (!strcmp(a, "--argobj") && i + 2 < argc
+            && g_argobj_n < TRACE_ARGOBJ_MAX) {
+        g_argobj[g_argobj_n].va = TRACE_U32(argv[i + 1]);
+        g_argobj[g_argobj_n].n = (unsigned)TRACE_U32(argv[i + 2]);
+        g_argobj_n++;
+        return 3;
+    }
     if (!strcmp(a, "--watchspan") && i + 2 < argc) {
         g_wlo = (int)(TRACE_U32(argv[i + 1]) & ~0x1Fu);
         g_whi = (int)TRACE_U32(argv[i + 2]);
@@ -228,7 +261,7 @@ void recomp_trace_flush(void) { }
 int recomp_trace_arg(int argc, char** argv, int i) {
     static const struct { const char* name; int takes; } opts[] = {
         {"--calltrace", 2}, {"--firsthit", 3}, {"--argtrace", 2},
-        {"--watch", 2}, {"--watchspan", 3}, {"--poison", 2},
+        {"--watch", 2}, {"--watchspan", 3}, {"--argobj", 3}, {"--poison", 2},
         {"--poisonval", 2}, {"--poke", 4},
     };
     for (unsigned k = 0; k < sizeof opts / sizeof opts[0]; k++)
@@ -249,6 +282,7 @@ void recomp_trace_help(void) {
         "  --argtrace VA         one line per entry to VA, with 3 arguments\n"
         "  --watch VA            registers, arguments and the object at ecx\n"
         "  --watchspan LO HI     move the [ecx+..] window --watch dumps\n"
+        "  --argobj VA N         vtable and first 0x40 bytes of argument N\n"
         "  --poison ADDR         report every change of a target dword\n"
         "  --poisonval V         ...only when it becomes V\n"
         "  --poke ADDR VAL VA    write one byte on first entry to VA\n");
