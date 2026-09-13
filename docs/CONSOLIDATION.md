@@ -580,33 +580,81 @@ Its case is the binary this cannot be tested on yet: Rise of Legends, 25,513
 functions reachable only through vtables and **no RTTI at all**, which is why
 this item was always separate from item 5 rather than superseded by it.
 
-### 7. `symbols/map_names` · 263 lines · worth more on PC than on Xbox
+### 7. `symbols/map_names` · **done** · the port got simpler and the heuristics got worse
 
-**Source**: `xboxrecomp/tools/symbols/map_names.py`.
+**Source**: `xboxrecomp/tools/symbols/map_names.py`. Ported as
+`tools/pe/map_names.py`.
 
-Two modes, and the second is the interesting one.
+`resolve` turns an MSVC linker MAP into `{va: name}`. **Simpler on PC than on
+Xbox**: imagebld discards the preferred load address when it emits an XBE, so
+the Xbox version reconstructs every address from section arithmetic. A plain PE
+keeps it, and MSVC writes the answer into the MAP's own `Rva+Base` column.
 
-`resolve` parses an MSVC linker MAP into `{va: name}`. Two binaries here ship
-their own map -- **Operation Neptune** and **Trespasser** -- and both currently
-use it only as a scorecard, never as a symbol source.
+Validated against Trespasser's `trespass.map`, cross-checked against the
+*independent* parser in that project:
 
-`port` carries *library* names from a binary that has a map onto one that does
-not, by matching library code byte-for-byte. Measured on Xbox: a donor built
-against a different SDK version still named 657 functions in the target; where
-two donors overlapped they agreed 99.1% of the time; and the union of donors
-beat either alone, 735 versus 504.
+| | |
+|---|---:|
+| addresses the other parser found | 34,159 |
+| agreeing | **34,159 (100%)** |
+| names agreeing on those | **34,159 (100%)** |
+| addresses only this parser found | 24 |
 
-On PC this is worth more than on Xbox, because the shared-library surface is
-bigger and better documented. One MSVC 6 binary with a map names the CRT in
-every other MSVC 6 binary in the collection. The MFC 4.0 surface in Encarta, the
-Borland CRT in Operation Neptune, the Watcom runtime in Nocturne -- each is a
-donor for the next project that hits the same toolchain.
+`port` carries *library* names from a donor with a MAP onto a target without
+one, by matching code byte for byte. Round-tripped -- Trespasser as its own
+donor and target -- it applied 431 names and **431 of 431 match the MAP
+exactly**. Pointed at charmap.exe it recovers 9 CRT functions
+(`__SEH_epilog4`, `___report_gsfailure`, `___scrt_fastfail`, ...), all in one
+contiguous CRT block.
 
-The section:offset reasoning in that file is Xbox-specific (imagebld discards
-`Rva+Base` when it emits the XBE). On a plain PE, `Rva+Base` is usable directly
-and the port gets *simpler*.
+### Three bugs, two of them the Xbox assumptions not holding
 
----
+**The flags column is not one flag.** MSVC writes `f` for a function and `f i`
+for an inlined one. A regex expecting a single optional `f` parsed 14,023 of
+36,074 functions and dropped the other **20,983 -- 58% -- with no error at
+all**. The symptom was a smaller number than expected, which is exactly the
+kind of thing that gets rationalised rather than investigated.
+
+**"Came from a library" cannot be inferred from `Lib:Object`.** The Xbox
+version tests against a list of known XDK section names. The obvious PC
+translation is "the column contains a colon", and it is wrong: Trespasser
+builds its own engine as static libraries, so its MAP says
+`Physics:BioModel.obj` and `AI:AIMain.obj` in the same shape as
+`LIBCMT:printf.obj`. That filter accepted 33,054 of 35,006 functions, and
+porting them onto charmap.exe named its functions after Trespasser's physics
+engine -- `?apply_bc_and_locate_field_tracers@CBioModel@@AAEXH@Z`, applied to a
+Windows character map, twice. Now a regex over known runtime names, overridable
+with `--lib`, because this is a judgement the tool cannot make.
+
+**A signature matching several target functions identifies none of them.** A
+12-byte MSVC prologue is common enough to appear dozens of times in one image.
+The donor-side ambiguity check the Xbox version has is necessary and not
+sufficient; the same test is now applied on the target side, which dropped 672
+further matches on the round trip. Conservative, and the reason precision is
+100% rather than nearly so.
+
+The identity check earns its place too. It fired immediately on the first run
+-- and it was catching a bug in this port rather than a mismatched pair, since
+a MAP's section "Start" column is an offset *within* the section while the PE
+puts `.text` at RVA 0x1000. Resolving the entry point the wrong way lands
+exactly one section alignment low, which is indistinguishable from a stale MAP.
+
+### What it is worth
+
+Unlike items 5 and 6, this one pays immediately: 34,183 real function names for
+Trespasser, from a file that was sitting next to the binary. A MAP is the best
+symbol source a binary can have, and games shipped them by accident constantly.
+
+`port`'s yield is low by construction -- 9 functions into charmap -- because it
+only claims what it can prove. That is the right trade for a symbol file, where
+a wrong name is worse than no name: it is a lie you act on for weeks.
+
+**Not covered: Borland and 16-bit maps.** Operation Neptune ships `ONWIN.MAP`,
+but it is a Borland 16-bit map for `ONWIN.EXE` -- 28 segments, four-digit
+offsets, already-demangled names with spaces in them (`operator delete(void
+far*)`) -- and not for the `ONWIN32.EXE` the project actually lifts. A
+different grammar and a different binary, so it is a separate piece of work
+rather than a regex tweak.
 
 ### 8. `debug_symbols` · 256 lines
 
@@ -736,7 +784,9 @@ each should merge rather than one winning.
 - [x] 6. `func_id/vtable_scanner` -- ported to `tools/cpp/vtable_scan.py`.
       100% recall against RTTI's own vtables, 98.0% of slots are real map
       functions. Section filtering, not the run heuristic, was what mattered.
-- [ ] 7. `symbols/map_names`
+- [x] 7. `symbols/map_names` -- ported to `tools/pe/map_names.py`. 100%
+      agreement with an independent parser on 34,159 addresses and names;
+      `port` round-trips at 431/431. Borland/16-bit maps are not covered.
 - [ ] 8. `debug_symbols`
 - [ ] 9. `conformance` -- assess against `lift/difftest.py` first
 - [ ] 10. `abi_analysis`, `split`
