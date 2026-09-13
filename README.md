@@ -74,15 +74,10 @@ pipeline run.
 | **[civ](https://github.com/sp00nznet/civ)** | Civilization | 1991 | 16-bit DOS / MSC 5.x | Runs! 672 functions, interactive boot/menu, 164K lines |
 | **[operationneptune](https://github.com/sp00nznet/operationneptune)** | Operation Neptune | 1991 / Win32 1998 | Borland PE32, ships its own linker map | **Plays!** CRT -> WinMain -> opening -> in the submarine |
 | **[skifree](https://github.com/sp00nznet/skifree)** | SkiFree | 1991 | Win16/Win32 (`ski32.exe`) | Playable rebuild from decompiled C, cross-platform + extras |
-| **[missileattack](https://github.com/sp00nznet/missileattack)** | Missile Attack! | 1992 | Win16 NE, one code segment | P0 - 21 KB in one segment; the fixture for the 16-bit pipeline |
 | **[dinopark](https://github.com/sp00nznet/dinopark)** | DinoPark Tycoon | 1993 | 16-bit DOS / Borland large model | Boots! Whole game lifted (~90K lines), renders .PIC screens + .ACT dinosaurs in colour |
 | **[elfish](https://github.com/sp00nznet/elfish)** | El-Fish | 1993 | 16-bit NE + TSXLIB extender | Lifted & links - 2,236 functions, 121 segments, startup executes |
-| **[tim](https://github.com/sp00nznet/tim)** | The Even More Incredible Machine | 1993 | Borland C++ / Win16 NE | P0 - 27 code segments, imports only KERNEL/USER/GDI, names its own window procs |
-| **[msbus](https://github.com/sp00nznet/msbus)** | Magic School Bus: Human Body | 1994 | Win16 NE, MS "band" engine | P0 - ~60 KB of code driving 190 MB of content |
 | **[hellbender](https://github.com/sp00nznet/hellbender)** | Hellbender | 1996 | Terminal Reality voxel engine (Win32/MSVC) | Bring-up - lifts clean (5,262 functions, 0 errors), 507 import bridges; same toolchain as Fury³ |
 | **[fury3](https://github.com/sp00nznet/fury3)** | Fury³ | 1995 | Terminal Reality voxel engine (Win32/MSVC) | **Playable!** Flies the canyon - 1,945 functions, SDL2+imgui frontend, real joystick |
-| **[tv](https://github.com/sp00nznet/tv)** | Terminal Velocity | 1995 | Watcom / DOS/4GW **LE** | P0 - blocked on an LE/LX front end that does not exist yet |
-| **[mtm](https://github.com/sp00nznet/mtm)** | Monster Truck Madness 1+2 | 1996 / 1998 | Terminal Reality, 3rd gen | P0 - no DRM; the voxel runtime ships as a standalone 248 KB DLL |
 | **[catz](https://github.com/sp00nznet/catz-recomp)** | Catz | 1996 | 16-bit NE engine DLL (PF Magic) | Runs! Win32 window, original frame loop, toys and saving work |
 | **[encarta](https://github.com/sp00nznet/encarta)** | Encarta 97 Encyclopedia | 1996 | MFC 4.0 + proprietary | **Runs!** Whole app lifted (7,326 fns); hybrid boundary puts the app body in recompiled code - 10,242 real MFC virtual dispatches land lifted per session |
 | **[gta](https://github.com/sp00nznet/gta)** | Grand Theft Auto | 1997 | DMA "Race'n'Chase" | Builds & runs - 4,094 functions, 444K lines, runtime bringup |
@@ -93,20 +88,17 @@ pipeline run.
 | **[trespasser](https://github.com/sp00nznet/trespasser)** | Jurassic Park: Trespasser | 1998 | DreamWorks Interactive rigid-body engine (MSVC 6.0) | P0 - reconnaissance. Ships a linker map, which makes it the calibration target for function recovery |
 | **[nocturne](https://github.com/sp00nznet/nocturne)** | Nocturne | 1999 | Terminal Reality, Watcom C/C++32 | Phase 7 - 6,027 functions lift with 0 errors; real window, 42 MB image mapped, IAT dispatch, 95 of 171 imports live |
 | **[xwa](https://github.com/sp00nznet/xwa)** | X-Wing Alliance | 1999 | Custom (LucasArts) | Active - D3D11 port, concourse UI runs, 2,702 functions |
-| **[forcecommander](https://github.com/sp00nznet/forcecommander)** | Star Wars: Force Commander | 2000 | LucasArts, MSVC 6 + MSVCP60 | P0 - 3.94 MB of .text and **no DRM**; the clean version of the XWA problem |
 | **[sof](https://github.com/sp00nznet/sof)** | Soldier of Fortune | 2000 | Quake II + GHOUL | Active - SDL2 port, 8 subsystems, full maps render |
 | **[gunman](https://github.com/sp00nznet/gunman)** | Gunman Chronicles | 2000 | GoldSrc (Half-Life) | Phase 2 - 3,990 functions, weapons/entities rebuilt |
 | **[heavymetal](https://github.com/sp00nznet/heavymetal)** | Heavy Metal: FAKK2 | 2000 | id Tech 3 + UberTools | Foundation - 57 source files, core systems scaffolded |
 | **[crimsonskies](https://github.com/sp00nznet/crimsonskies)** | Crimson Skies | 2000 | Zipper GOS engine | Compiles & links - 6,232 functions, 826K lines, runtime bringup |
 | **[bw](https://github.com/sp00nznet/bw)** | Black & White | 2001 | Lionhead custom | Active - all 569 types done, 10 Hz game loop runs |
-| **[omfbg](https://github.com/sp00nznet/omfbg)** | One Must Fall: Battlegrounds | 2003 | Diversions Entertainment, modular | P0 - **10,374 mangled C++ exports**; SafeDisc covers 1% of the code |
-| **[bw2](https://github.com/sp00nznet/bw2)** | Black & White 2 | 2005 | Lionhead, 4 years on from bw | P0 - `white.exe` is **21.7 MB**, the largest binary here; on a later disc |
 | **[rol](https://github.com/sp00nznet/rol)** | Rise of Nations: Rise of Legends | 2006 | Big Huge Games rts2 (MSVC 7.1) | Phase 3 - the largest binary this toolchain has faced: 13.25 MB, 25,513 vtable-only functions, no RTTI |
 
-Every row above links to a repo. The nine most recent are private while they
-are still at P0 -- see [docs/PROJECTS.md](docs/PROJECTS.md) for what each one
-taught the toolbox, including the three fixes One Must Fall: Battlegrounds
-forced before its disc would even open.
+Every row above links to a repo that is actually there. See
+[docs/PROJECTS.md](docs/PROJECTS.md) for what each one taught the toolbox,
+including the three fixes One Must Fall: Battlegrounds forced before its
+disc would even open.
 
 **Also not public** -- same toolbox, repos still private, listed because the
 tools here carry their scars: **bolo** (Bolo Adventures III, 1993 -- shipped
@@ -120,6 +112,14 @@ The first three are held back by their own generated code rather than by
 progress: lifted C is a derivative work of the binary it came from, and every
 public repo here tracks none of it. See
 [docs/PUBLISHING.md](docs/PUBLISHING.md) and `tools/audit_repo.py`.
+
+Still at P0, so still private: **missileattack** (Missile Attack!, 1992),
+**tim** (The Even More Incredible Machine, 1993), **msbus** (Magic School Bus:
+Human Body, 1994), **tv** (Terminal Velocity, 1995), **mtm** (Monster Truck
+Madness 1+2, 1996 / 1998), **forcecommander** (Star Wars: Force Commander,
+2000), **omfbg** (One Must Fall: Battlegrounds, 2003) and **bw2** (Black &
+White 2, 2005). Each is in [docs/PROJECTS.md](docs/PROJECTS.md) with what it
+cost the toolbox.
 
 ### Sibling toolboxes
 
