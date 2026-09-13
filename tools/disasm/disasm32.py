@@ -786,16 +786,42 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
     md = Cs(CS_ARCH_X86, CS_MODE_32)
     dropped = 0
 
+    # Decode to a terminator, NOT to the recorded size, and this is the whole
+    # subtlety. clamp_extents has already cut each function at the next start -
+    # including at the false one - so the recorded extent stops exactly where
+    # the evidence would have been. Walking to the `ret` the function really
+    # ends at is what puts the bogus entry back inside an instruction.
+    #
+    # Stopping at the terminator also keeps this from marking the NEXT
+    # function's bytes and dropping a real start: over-marking is the only way
+    # this can do harm, and a `ret` is where over-marking would begin.
+    ENDS = ("ret", "retn", "retf", "jmp", "iret", "iretd")
+    WINDOW = 0x2000
+
+    def body_instructions(addr):
+        va, n = addr, 0
+        while n < 4096:
+            try:
+                code = read_va(va, min(WINDOW, code_end - va))
+            except Exception:
+                return
+            advanced = False
+            for ins in md.disasm(code, va):
+                advanced = True
+                n += 1
+                va = ins.address + ins.size
+                yield ins
+                if ins.mnemonic.split()[-1] in ENDS:
+                    return
+            if not advanced:
+                return
+
     for _ in range(max_rounds):
         interior = bytearray(max(0, code_end - code_start))
-        for addr, size in functions.items():
-            if size <= 0:
+        for addr in functions:
+            if functions[addr] <= 0:
                 continue
-            try:
-                code = read_va(addr, size)
-            except Exception:
-                continue
-            for ins in md.disasm(code, addr):
+            for ins in body_instructions(addr):
                 for k in range(ins.address + 1, ins.address + ins.size):
                     if code_start <= k < code_end:
                         interior[k - code_start] = 1
