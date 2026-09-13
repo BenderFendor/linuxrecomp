@@ -1416,14 +1416,25 @@ class Lifter:
         elif m == 'std':
             lines.append(f"_df = -1; {comment}")
 
-        elif m == 'clc':
-            lines.append(f"_cf = 0; {comment}")
-
-        elif m == 'stc':
-            lines.append(f"_cf = 1; {comment}")
-
-        elif m == 'cmc':
-            lines.append(f"_cf = !_cf; {comment}")
+        # clc/stc/cmc write CF and nothing else -- and they have to SAY so, or
+        # the branch that reads the carry reads the last arithmetic instruction's
+        # instead. Borland's strcpy and strcat are one routine with two entry
+        # points, `clc` at one and `stc` at the other, and a single `jb` deciding
+        # whether to scan for the end of the destination first. With the carry
+        # unpublished, strcpy ran as strcat: Treasure MathStorm built every data
+        # file's path on the end of the previous one and could open none of them.
+        elif m in ('clc', 'stc', 'cmc'):
+            # cmc has to read the carry before it can complement it, and `_cf`
+            # is not where it lives: a cmp writes the lazy tuple and never
+            # touches _cf, so `_cf = !_cf` complements a carry from some earlier
+            # instruction. Derive the real one first.
+            if m == 'cmc':
+                set_cf = ("_cf = !(recomp_eflags(_flag_k, _flag_a, _flag_b, _cf, _df) & 1u);")
+            else:
+                set_cf = '_cf = 0;' if m == 'clc' else '_cf = 1;'
+            lines.append(f"{{ {set_cf} _flag_a = recomp_eflags_setcf(_flag_k, _flag_a, _flag_b, _cf, _df); "
+                         f"_flag_b = 0; _flag_k = FK_EFLAGS; }} {comment}")
+            self._flag_state = None
 
         elif m == 'leave':
             lines.append(f"esp = ebp; ebp = POP32_VAL(esp); {comment}")
