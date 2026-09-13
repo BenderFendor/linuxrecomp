@@ -748,10 +748,69 @@ class Disassembler:
 
         print(f"[*] Successfully disassembled {len(functions)} functions"
               f" ({round_no} discovery rounds)")
+        sizes = {a: f.size for a, f in functions.items()}
+        gone = drop_mid_instruction_entries(
+            lambda va, n: self.read_bytes(va, n), sizes, code_start, code_end)
+        for a in list(functions):
+            if a not in sizes:
+                del functions[a]
+
         moved = clamp_extents(functions, code_end)
         if moved:
             print(f"[*] Clamped {moved} function extents to the next function start")
         return functions
+
+
+def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
+                                 max_rounds=4, verbose=True):
+    """Remove catalog entries that are not instruction boundaries.
+
+    An address inside an instruction cannot be the start of anything: decoding
+    from it produces a stream the program never runs. On Mario Kart Arcade GP
+    DX, 0x0081C100 is the third byte of `fld dword ptr [0x8E0848]` and decodes
+    as `dec eax; or byte ptr [esi - 0x3be22700], cl; hlt` - which lifts,
+    compiles, and kills the game a thousand calls into its boot.
+
+    find_functions already refuses these when the containing function was
+    decoded first. Two candidates from the SAME data-scan batch never see each
+    other, and a C++ initialiser table produces exactly that: the initialiser
+    and a false pointer into its middle arrive in the same round.
+
+    So this runs afterwards, over the whole catalog at once, and iterates - a
+    dropped entry's own bogus decode has to stop marking bytes interior, or it
+    can take a real function down with it. Two rounds is normally enough.
+
+    `functions` is {addr: size}, edited in place. Returns how many went.
+    """
+    from capstone import Cs, CS_ARCH_X86, CS_MODE_32
+    md = Cs(CS_ARCH_X86, CS_MODE_32)
+    dropped = 0
+
+    for _ in range(max_rounds):
+        interior = bytearray(max(0, code_end - code_start))
+        for addr, size in functions.items():
+            if size <= 0:
+                continue
+            try:
+                code = read_va(addr, size)
+            except Exception:
+                continue
+            for ins in md.disasm(code, addr):
+                for k in range(ins.address + 1, ins.address + ins.size):
+                    if code_start <= k < code_end:
+                        interior[k - code_start] = 1
+
+        bogus = [a for a in functions
+                 if code_start <= a < code_end and interior[a - code_start]]
+        if not bogus:
+            break
+        for a in bogus:
+            del functions[a]
+        dropped += len(bogus)
+        if verbose:
+            print("[*] Dropped %d entries that are not instruction boundaries"
+                  % len(bogus))
+    return dropped
 
 
 def clamp_extents(functions, code_end, starts=None):
@@ -912,6 +971,28 @@ def demo():
     # something is scoring against symbols.
     assert d.probes_as_function_body(a_tail, window=6), \
         "out of window is not out of code"
+
+    # drop_mid_instruction_entries: the real case in miniature. `fld dword ptr
+    # [0x8E0848]` is six bytes; an entry three bytes into it is not a function
+    # and decodes as something the program never runs.
+    blob = (bytes([0xD9, 0x05, 0x48, 0x08, 0x8E, 0x00]) +   # fld  [0x8E0848]
+            bytes([0xD9, 0x1D, 0xC4, 0x35, 0x95, 0x00]) +   # fstp [0x9535C4]
+            bytes([0xC3]))                                  # ret
+
+    def _read(va, n):
+        off = va - 0x1000
+        return blob[off:off + n] if 0 <= off < len(blob) else b""
+
+    cat = {0x1000: len(blob), 0x1002: len(blob) - 2}
+    gone = drop_mid_instruction_entries(_read, cat, 0x1000, 0x1000 + len(blob),
+                                        verbose=False)
+    assert gone == 1 and 0x1002 not in cat and 0x1000 in cat, (gone, cat)
+
+    # A real boundary is never dropped, and an entry never drops itself.
+    cat = {0x1000: len(blob), 0x1006: len(blob) - 6}
+    assert drop_mid_instruction_entries(_read, cat, 0x1000, 0x1000 + len(blob),
+                                        verbose=False) == 0, cat
+    assert len(cat) == 2, cat
 
     # clamp_extents: an over-extended function must be cut at the next START,
     # an alias inside a function must NOT cut it, and a function that already
