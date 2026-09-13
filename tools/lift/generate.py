@@ -121,8 +121,28 @@ def linear_disassemble_function(md, code_data, code_start, func_start, func_end)
             # Next instruction (if any) is a new leader
             leaders.add(li.end_address)
 
-        # Stop at int3 / padding
-        if li.mnemonic == 'int3':
+        # int3 is inter-function padding -- but MSVC also emits it INSIDE a
+        # function, as the unreachable fallthrough of __assume(0) and of a
+        # range-checked switch:
+        #
+        #     0077C86F  jbe  0x77c872
+        #     0077C871  int3
+        #     0077C872  <the rest of the function>
+        #
+        # Breaking at the first one truncated the body there. The extent walk
+        # had the right answer and 0x0077C872 was already a known leader, but
+        # the instructions were gone, so generate.py had a label it could not
+        # place, emitted a tail transfer instead, and RECOMP_ITAIL could not
+        # resolve a VA that was never lifted -- the transfer silently did
+        # nothing and the function fell through to its caller. In Force
+        # Commander that handed a null `this` to the DX7 pixel-pipe manager,
+        # several calls away, with one "ITAIL: unresolved VA" line as the only
+        # evidence.
+        #
+        # So an int3 ends the body only when nothing this function branches to
+        # lies beyond it. That also covers a RUN of int3 padding before a
+        # jumped-over continuation, which a lookahead of one would not.
+        if li.mnemonic == 'int3' and not any(l > li.address for l in leaders):
             break
 
     return instructions, leaders
@@ -273,6 +293,29 @@ def _selftest():
     # ...and with an indirect jump present, every instruction gets a label.
     labels = re.findall(r'(?m)^\s*(L_[0-9A-Fa-f]{8})\s*:', out)
     assert len(labels) >= len(insns) - 1, (len(labels), len(insns))
+
+    # int3 is padding BETWEEN functions and unreachable filler INSIDE one.
+    #   cmp ebx,0x6c / jbe +1 / int3 / xor eax,eax / ret
+    # MSVC emits exactly this for __assume(0), and breaking at the int3 dropped
+    # everything a jcc jumped over -- silently, because the target was still a
+    # known leader, so the body kept a label it could not place and turned it
+    # into a tail transfer to a VA nobody lifted.
+    over = bytes([0x83, 0xFB, 0x6C,        # cmp ebx, 0x6c
+                  0x76, 0x01,              # jbe +1  (over the int3)
+                  0xCC,                    # int3
+                  0x33, 0xC0, 0xC3])       # xor eax,eax / ret
+    i3, l3 = linear_disassemble_function(md, over, base, base, base + len(over))
+    assert i3[-1].mnemonic == 'ret', [i.mnemonic for i in i3]
+    assert base + 6 in l3, 'the jumped-over continuation is not a leader'
+    out3 = lift_function_linear(Lifter(iat_map={}), 'sub_00401000', i3, l3, base)
+    assert 'RECOMP_ITAIL' not in out3, 'the continuation became a tail transfer'
+
+    # ...and trailing int3 padding still ends the body: the first one is
+    # emitted (it lifts to a trap, which is correct for unreachable filler) and
+    # the sweep stops rather than decoding the rest of the padding run.
+    pad = bytes([0x33, 0xC0, 0xC3, 0xCC, 0xCC, 0xCC])
+    i4, _ = linear_disassemble_function(md, pad, base, base, base + len(pad))
+    assert [i.mnemonic for i in i4] == ['xor', 'ret', 'int3'],         [i.mnemonic for i in i4]
 
     # A straight-line function needs no dispatch machinery at all.
     ret = bytes([0x33, 0xC0, 0xC3])            # xor eax,eax / ret
