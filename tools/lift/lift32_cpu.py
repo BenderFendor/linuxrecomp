@@ -680,7 +680,9 @@ class Lifter:
 
     def _fmem(self, insn, op, kind):
         a = self.addr_expr(insn, op); sz = op.size
-        if kind == "f":  return f"rdf32({a})" if sz == 4 else f"rdf64({a})"
+        if kind == "f":
+            if sz == 10: return f"rdf80({a})"      # x87 extended, explicit integer bit 
+            return f"rdf32({a})" if sz == 4 else f"rdf64({a})"
         return {2: f"rdi16({a})", 4: f"rdi32({a})", 8: f"rdi64({a})"}[sz]
 
     def fpu(self, insn):
@@ -695,7 +697,13 @@ class Lifter:
         # BCD, and `fldenv`/`fnstenv`/`fsave`/`frstor` move the whole 28-byte
         # FPU environment. None of those fit, and reading eight of ten bytes as
         # a double produces a number that looks plausible and is not.
-        if memop is not None and memop.size in (10, 28, 94, 108):
+        # `fld tbyte` and `fstp tbyte` are now honoured - see rdf80/wrf80 - but
+        # the rest of the wide operands still are not. fbld/fbstp read and write
+        # packed BCD, which is ten bytes of something else entirely, and
+        # fldenv/fnstenv/fsave/frstor move the whole FPU environment.
+        if m in ("fbld", "fbstp"):
+            return [_todo(insn.address, f"x87 packed BCD: {m} {insn.op_str}")]
+        if memop is not None and memop.size in (28, 94, 108):
             return [_todo(insn.address, f"x87 m{memop.size * 8}: {m} {insn.op_str}")]
 
         if m in ("fld",):
@@ -709,7 +717,7 @@ class Lifter:
             pop = "; fpop(c);" if m == "fstp" else ";"
             if memop:
                 sz = memop.size; a = self.addr_expr(insn, memop)
-                st = "wrf32" if sz == 4 else "wrf64"
+                st = "wrf32" if sz == 4 else ("wrf80" if sz == 10 else "wrf64")
                 return [f"{st}({a}, *fst(c, 0)){pop}"]
             return [f"*fst(c, {self._st_idx(ops[0])}) = *fst(c, 0){pop}"]
         if m in ("fist", "fistp"):
@@ -717,6 +725,19 @@ class Lifter:
             sz = memop.size; a = self.addr_expr(insn, memop)
             st = {2: "wri16", 4: "wri32", 8: "wri64"}[sz]
             return [f"{st}({a}, *fst(c, 0)){pop}"]
+        if m in ("fprem", "fprem1"):
+            return ["*fst(c, 0) = fprem_op(c, *fst(c, 0), *fst(c, 1));"]
+        if m.startswith("fcmov"):
+            # Conditional move between x87 registers, on the integer flags the
+            # preceding fucomi or test left behind. Same conditions as cmovcc,
+            # spelled the FPU way: fcmovb/fcmove/fcmovbe/fcmovu and their
+            # negations.
+            tail = m[5:]
+            cond = {"b": "c->cf", "e": "c->zf", "be": "(c->cf || c->zf)",
+                    "u": "c->pf", "nb": "!c->cf", "ne": "!c->zf",
+                    "nbe": "(!c->cf && !c->zf)", "nu": "!c->pf"}.get(tail)
+            if cond:
+                return [f"if ({cond}) *fst(c, 0) = *fst(c, {self._st_idx(ops[-1])});"]
         if m in ("fchs",): return ["*fst(c, 0) = -*fst(c, 0);"]
         if m in ("fabs",): return ["*fst(c, 0) = fabs(*fst(c, 0));"]
         if m in ("fsqrt",): return ["*fst(c, 0) = sqrt(*fst(c, 0));"]

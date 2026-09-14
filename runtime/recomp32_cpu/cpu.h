@@ -455,4 +455,72 @@ static inline uint32_t bit_reg_op(CPU *c, uint32_t *r, uint32_t idx, int op)
     return c->cf;
 }
 
+/* ---- 80-bit extended precision ----
+ *
+ * The x87 stack here is modelled as doubles, which is right for almost
+ * everything - but `fld tbyte` and `fstp tbyte` name the hardware's own
+ * 80-bit format directly, and a compiler emits them to spill a register
+ * without losing precision. Reading one as anything else returns nonsense.
+ *
+ * The format is a sign bit, a 15-bit exponent biased by 16383, and a 64-bit
+ * mantissa whose integer bit is EXPLICIT - unlike float and double, where it
+ * is implied. Converting to double loses the extra bits, which is the same
+ * loss the rest of this model already accepts.
+ */
+static inline double rdf80(uint32_t a)
+{
+    unsigned char b[10];
+    memcpy(b, (void *)(uintptr_t)a, 10);
+
+    uint64_t mant;
+    uint16_t se;
+    memcpy(&mant, b, 8);
+    memcpy(&se, b + 8, 2);
+
+    int sign = (se >> 15) & 1;
+    int exp  = se & 0x7FFF;
+
+    if (exp == 0 && mant == 0) return sign ? -0.0 : 0.0;
+    if (exp == 0x7FFF) {
+        if (mant << 1) return (double)NAN;
+        return sign ? -(double)INFINITY : (double)INFINITY;
+    }
+    double m = (double)mant * 5.4210108624275222e-20;   /* 2^-64 */
+    return ldexp(sign ? -m : m, exp - 16383 + 1);
+}
+
+static inline void wrf80(uint32_t a, double v)
+{
+    unsigned char b[10];
+    uint64_t mant = 0;
+    uint16_t se = 0;
+
+    memset(b, 0, sizeof b);
+    if (v != v) {                                   /* NaN */
+        se = 0x7FFF; mant = 0xC000000000000000ull;
+    } else if (v == (double)INFINITY || v == -(double)INFINITY) {
+        se = 0x7FFF; mant = 0x8000000000000000ull;
+        if (v < 0) se |= 0x8000;
+    } else if (v != 0.0) {
+        int e;
+        double m = frexp(v < 0 ? -v : v, &e);        /* m in [0.5, 1) */
+        mant = (uint64_t)ldexp(m, 64);
+        se = (uint16_t)((e - 1 + 16383) & 0x7FFF);
+        if (v < 0) se |= 0x8000;
+    }
+    memcpy(b, &mant, 8);
+    memcpy(b + 8, &se, 2);
+    memcpy((void *)(uintptr_t)a, b, 10);
+}
+
+/* FPREM: the remainder of st0/st1 with the quotient truncated toward zero,
+ * which is what fmod computes. The hardware may reduce only partially and set
+ * C2 to say "call me again"; computing the whole thing at once means C2 is
+ * always clear, and the loop the compiler wrote around it runs once. */
+static inline double fprem_op(CPU *c, double a, double b)
+{
+    c->fpu_sw &= ~0x0400u;              /* C2 = 0: reduction complete */
+    return fmod(a, b);
+}
+
 #endif /* PCRECOMP_CPU_H */
