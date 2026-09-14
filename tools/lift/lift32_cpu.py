@@ -749,7 +749,12 @@ class Lifter:
         if m in ("fscale",): return ["*fst(c, 0) = ldexp(*fst(c, 0), (int)*fst(c, 1));"]
         if m in ("fsincos",): return ["{ double _s=sin(*fst(c,0)), _c=cos(*fst(c,0)); *fst(c,0)=_s; fpush(c,_c); }"]
         if m in ("fxch",):
-            i = self._st_idx(ops[0]) if ops else 1
+            # Capstone spells this one with both registers - st(0) first, the
+            # one to swap with second - so the operand that matters is the
+            # last, not the first. Reading ops[0] makes every fxch a swap of
+            # st(0) with itself, which compiles, runs, and silently leaves the
+            # stack in the order the code was written to avoid.
+            i = self._st_idx(ops[-1]) if ops else 1
             return [f"{{ double _t = *fst(c, 0); *fst(c, 0) = *fst(c, {i}); *fst(c, {i}) = _t; }}"]
         if m in ("fadd","fsub","fsubr","fmul","fdiv","fdivr",
                  "faddp","fsubp","fsubrp","fmulp","fdivp","fdivrp"):
