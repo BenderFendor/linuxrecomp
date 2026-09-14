@@ -271,6 +271,42 @@ Complete DOS environment simulation:
 
 All backed by SDL2 for actual display/input.
 
+### Anything that SENDS a message blocks on a thread that may never pump
+
+A recompiled program's windows do not belong to the threads a native program's
+would. The host makes one before the target runs; the target makes its own
+from whatever host thread its worker landed on; and the host's main thread is
+usually inside lifted code from the entry point until the program exits, so it
+never pumps anything.
+
+Every `SendMessage`-shaped call then becomes a deadlock waiting for a specific
+thread: `UpdateWindow`, `ShowWindow`, `SetWindowPos` without
+`SWP_NOSENDCHANGING`, `SetForegroundWindow`. One project hung on the very first
+`Flip` the program issued because the present path called `UpdateWindow`, and
+hung again later on a `ShowWindow` meant to hide a window.
+
+`GetDC` / `BitBlt` / `ReleaseDC` on another thread's window is fine and does
+not wait for anybody -- which is worth knowing, because "cross-thread GDI is
+too slow" is an easy wrong conclusion to draw from a hang. Measured on the
+same project: 4,400 presents in 130 s into another thread's window. If a
+window needs to be visible, create it visible; if it needs to be hidden, do
+not create it.
+
+### A timer callback is a thread you already know how to run
+
+`timeSetEvent`, `SetTimer` with a TIMERPROC, waitable-timer APC callbacks: the
+callback is lifted code, and "lifted code cannot run on a host thread" is only
+true until `CreateThread` is implemented. After that a timer is the same
+machinery -- a host thread with its own target stack, its own simulated TIB and
+its own saved machine state, claiming the global machine lock around each call
+-- and returning a handle while never calling back is a silent stub in an area
+where the program will not tell you it is broken. iMUSE, for one, runs its
+whole music script on a 20 ms multimedia timer.
+
+Watch the budget when you do it: a program that creates and kills its timer
+four times during audio startup will leak four thread slots if each gets a
+fresh stack. One stack per timer SLOT, not per timer.
+
 ### A no-op shim for a RECORDING API is not neutral
 
 The usual rule for a shim is that doing nothing is the safe default: return
