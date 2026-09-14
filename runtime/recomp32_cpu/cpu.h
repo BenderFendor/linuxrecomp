@@ -86,6 +86,40 @@ static inline void wr16(uint32_t a, uint16_t v) { *(uint16_t *)(uintptr_t)a = v;
 static inline void wr32(uint32_t a, uint32_t v) { *(uint32_t *)(uintptr_t)a = v; }
 
 /* ---- EFLAGS pack/unpack (modelled bits only) ---- */
+/* `lock`-prefixed read-modify-write.
+ *
+ * A recompiled game with a worker pool needs these to be real: the guest uses
+ * `lock xadd` for every reference count and every queue index, and a
+ * non-atomic one is a use-after-free an hour into a session rather than a
+ * crash you can find. Nothing else in this header cares about other threads;
+ * these do.
+ *
+ * The x86 semantics are "return the old value" for xadd, and for cmpxchg
+ * "return what was there, and the caller compares" - the ZF the instruction
+ * sets follows from that. */
+#if defined(_MSC_VER)
+static inline uint32_t atomic_xadd32(uint32_t a, uint32_t v) {
+    return (uint32_t)_InterlockedExchangeAdd((volatile long *)(uintptr_t)a, (long)v);
+}
+static inline uint32_t atomic_cmpxchg32(uint32_t a, uint32_t cmp, uint32_t nv) {
+    return (uint32_t)_InterlockedCompareExchange((volatile long *)(uintptr_t)a,
+                                                 (long)nv, (long)cmp);
+}
+static inline uint32_t atomic_xchg32(uint32_t a, uint32_t v) {
+    return (uint32_t)_InterlockedExchange((volatile long *)(uintptr_t)a, (long)v);
+}
+#else
+static inline uint32_t atomic_xadd32(uint32_t a, uint32_t v) {
+    return __sync_fetch_and_add((volatile uint32_t *)(uintptr_t)a, v);
+}
+static inline uint32_t atomic_cmpxchg32(uint32_t a, uint32_t cmp, uint32_t nv) {
+    return __sync_val_compare_and_swap((volatile uint32_t *)(uintptr_t)a, cmp, nv);
+}
+static inline uint32_t atomic_xchg32(uint32_t a, uint32_t v) {
+    return __sync_lock_test_and_set((volatile uint32_t *)(uintptr_t)a, v);
+}
+#endif
+
 static inline uint32_t eflags_pack(CPU *c) {
     return 0x202u | (c->cf) | (c->pf << 2) | (c->af << 4) |
            (c->zf << 6) | (c->sf << 7) | (c->of << 11);

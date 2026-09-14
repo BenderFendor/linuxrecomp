@@ -105,7 +105,8 @@ SSE_MNEMONICS = (
     | frozenset({"movss", "sqrtss", "sqrtsd", "minss", "maxss", "minsd", "maxsd",
                  "ucomiss", "comiss", "ucomisd", "comisd",
                  "cvtsi2ss", "cvtsi2sd", "cvttss2si", "cvttsd2si",
-                 "cvtss2si", "cvtsd2si", "cvtss2sd", "cvtsd2ss"})
+                 "cvtss2si", "cvtsd2si", "cvtss2sd", "cvtsd2ss",
+                 "cvtdq2ps", "cvtps2dq", "cvttps2dq"})
     | frozenset(o + w for o in SSE_ARITH for w in ("ss", "sd"))
 )
 
@@ -326,6 +327,13 @@ class Lifter:
         ea = insn.address
         nxt = insn.address + insn.size
 
+        # capstone keeps the `lock` prefix in the mnemonic. The instruction
+        # underneath is the one to translate; the atomicity is in the helper
+        # the xadd/cmpxchg cases below reach for, and for everything else a
+        # `lock` on a single store is what the hardware does anyway.
+        if m.startswith("lock "):
+            m = m[5:]
+
         def two(): return ops[0], ops[1]
         def sz0(): return ops[0].size
 
@@ -431,6 +439,26 @@ class Lifter:
             return [f"{{ uint32_t _t = {self._read_dst(insn,d)}; " +
                     self.dst_write(insn, d, self.src(insn, s)).rstrip(';') + "; " +
                     self.dst_write(insn, s, "_t").rstrip(';') + "; }"]
+
+        # xadd / cmpxchg - the interlocked pair.
+        #
+        # A game's reference counts and queue indices are these, and a
+        # recompiled one has as many threads as the original, so they go to
+        # real atomics in cpu.h rather than a read-modify-write that is right
+        # until it is not. Only the 32-bit memory form is written out, because
+        # that is the only one a Win32 compiler emits for Interlocked*.
+        if m in ("xadd", "cmpxchg") and sz0() == 4:
+            d, s = two()
+            if d.type == X86_OP_MEM:
+                a = self.addr_expr(insn, d)
+                if m == "xadd":
+                    return [f"{{ uint32_t _v = {self.src(insn, s)};",
+                            f"  uint32_t _old = atomic_xadd32({a}, _v);",
+                            f"  {self.dst_write(insn, s, '_old')}",
+                            "  flags_add(c, _old, _v, 4); }"]
+                return [f"{{ uint32_t _old = atomic_cmpxchg32({a}, c->eax, {self.src(insn,s)});",
+                        "  flags_sub(c, c->eax, _old, 4);",
+                        "  if (_old != c->eax) c->eax = _old; }"]
         if m.startswith("set") and m not in ("setssbsy",):   # setcc r/m8
             cond = self._cond("j" + m[3:])
             if cond is not None:
@@ -548,10 +576,20 @@ class Lifter:
                 for tv in sorted(set(tgts)):
                     if tv in labels:
                         out.append(f"  if (_jt == GVA(0x{tv:08X})) goto L_{tv:08X};")
-                # Anything else the table holds - an arm that was recovered as
-                # its own function, or an entry this walk did not enumerate -
-                # goes where the instruction says. Aborting here was a guess
-                # that the table could not hold anything else, and it was wrong.
+                    else:
+                        # An arm outside this function - a neighbour recovery
+                        # called a function of its own, or the same code lifted
+                        # twice under two extents. Written as a literal
+                        # dispatch rather than left to the computed one below,
+                        # because a literal is something a build step can SEE:
+                        # the driver closes every address the generated text
+                        # dispatches to, and a target that only appears in a
+                        # register is a runtime abort nobody predicted.
+                        out.append(f"  if (_jt == GVA(0x{tv:08X}))"
+                                   f" {{ dispatch(c, 0x{tv:08X}u); return; }}")
+                # Anything else the table holds - an entry this walk did not
+                # enumerate at all. Aborting here was a guess that the table
+                # could not hold anything else, and it was wrong.
                 out.append("  dispatch_jmp(c, _jt); return; }")
                 return out
             if t.type == X86_OP_IMM:                        # tail call to another function
@@ -858,6 +896,27 @@ class Lifter:
             return [f"c->xmm[{self._xi(d)}].f64[0] = {self._ss(insn, s)};"]
         if m == "cvtsd2ss":
             return [f"c->xmm[{self._xi(d)}].f32[0] = (float)({self._sd(insn, s)});"]
+
+        # ---- packed conversions ----
+        #
+        # All four lanes, which is what a compiler emits for a float4 cast and
+        # what the scalar forms above deliberately do not do. cvtps2dq rounds
+        # to nearest (the default mode; the game never changes MXCSR) and
+        # cvttps2dq truncates - the extra `t` is the whole difference and
+        # getting it backwards is a silently wrong coordinate.
+        if m in ("cvtdq2ps", "cvtps2dq", "cvttps2dq"):
+            n, i = self._xi(d), None
+            src = f"_s"
+            body = []
+            for i in range(4):
+                if m == "cvtdq2ps":
+                    body.append(f"c->xmm[{n}].f32[{i}] = (float)_s.i32[{i}];")
+                elif m == "cvttps2dq":
+                    body.append(f"c->xmm[{n}].i32[{i}] = sse_cvtt_i32(_s.f32[{i}]);")
+                else:
+                    body.append(f"c->xmm[{n}].i32[{i}] = "
+                                f"sse_cvtt_i32(nearbyintf(_s.f32[{i}]));")
+            return [f"{{ XMM _s = {self._xm(insn, s)}; " + " ".join(body) + " }"]
 
         return [_todo(insn.address, f"sse {m} {insn.op_str}")]
 
