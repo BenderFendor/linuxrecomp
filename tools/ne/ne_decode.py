@@ -152,6 +152,43 @@ def collect_internal_code_targets(ne: NEHeader) -> dict:
     return m
 
 
+def collect_entry_table_targets(ne: NEHeader) -> dict:
+    """Map (1-based code seg index) -> set of offsets named by the NE entry
+    table and by the header's own CS:IP.
+
+    These are the addresses *Windows* calls: the startup entry point and every
+    exported callback (window procs, dialog procs, enum callbacks). Nothing
+    inside the image branches to them, and the C startup entry does not even
+    look like a prologue (`xor bp, bp / push bp`, not `push bp / mov bp, sp`),
+    so neither the branch-target sweep nor the prologue scan can find them --
+    they land mid-block and become unreachable. BangBang (1990) is the case
+    that showed it: 32 of its 33 entry points, MAINWNDPROC included, were
+    swallowed by the block containing them.
+
+    Entries naming a DATA segment are dropped: the entry table can carry
+    non-code ordinals, and a data offset seeded as code splits a data segment
+    into bogus functions."""
+    cache = getattr(ne, '_entry_table_targets', None)
+    if cache is not None:
+        return cache
+    m = {}
+
+    def add(seg_idx, off):
+        if seg_idx == 0xFF or not (1 <= seg_idx <= len(ne.segments)):
+            return
+        seg = ne.segments[seg_idx - 1]
+        if not seg.is_code or not (0 <= off < seg.actual_size):
+            return
+        m.setdefault(seg_idx, set()).add(off)
+
+    for e in getattr(ne, 'entries', ()) or ():
+        add(getattr(e, 'segment', 0), getattr(e, 'offset', -1))
+    add(getattr(ne, 'cs', 0), getattr(ne, 'ip', -1))
+
+    ne._entry_table_targets = m
+    return m
+
+
 _BRANCH = frozenset((
     'call', 'jmp',
     'jo', 'jno', 'jb', 'jae', 'je', 'jne', 'jbe', 'ja',
@@ -265,7 +302,61 @@ def disassemble_segment(seg: Segment, ne: NEHeader, show_relocs: bool = True) ->
                 if inst is not None:
                     instructions.append(inst)
     else:
-        instructions = decoder.decode_all()
+        # Authoritative offsets: the entry table and far-call relocation
+        # targets. These are *definitionally* instruction boundaries, which
+        # makes them the one reliable resync point for a linear sweep.
+        #
+        # A single padding byte between functions is enough to lose one: at
+        # BangBang seg1:0x467B a `00` pad ahead of a `push bp / mov bp, sp`
+        # prologue decodes as `add byte ds:[di-0x75], dl`, which swallows
+        # 0x467C and with it an exported entry point. So when an instruction
+        # would straddle an authoritative offset, drop it and resume decoding
+        # there instead of carrying the desync forward.
+        resync = set()
+        resync |= collect_internal_code_targets(ne).get(seg.index, set())
+        resync |= collect_entry_table_targets(ne).get(seg.index, set())
+
+        def sweep(boundaries):
+            """Linear sweep that resyncs onto known instruction boundaries."""
+            pts = sorted(o for o in boundaries if 0 < o < len(seg.data))
+            out = []
+            pos, ri, limit = 0, 0, len(seg.data)
+            while pos < limit:
+                while ri < len(pts) and pts[ri] <= pos:
+                    ri += 1
+                decoder.pos = pos
+                inst = decoder.decode_one()
+                if inst is None:
+                    pos += 1
+                    continue
+                nxt = pts[ri] if ri < len(pts) else None
+                if nxt is not None and pos < nxt < pos + inst.length:
+                    pos = nxt      # straddles a known boundary: resync onto it
+                    continue
+                out.append(inst)
+                pos += inst.length
+            return out
+
+        # A relative branch's destination is as much a boundary as a call
+        # target, so feed the sweep's own branch targets back into it until the
+        # set stops growing. Without this, ONE alignment byte hides a function:
+        # in BangBang a `00` pad ahead of `55 8B EC` (push bp / mov bp, sp)
+        # decodes as `add byte ds:[di-0x75], dl`, swallowing the prologue. 19 of
+        # its real functions were lost that way -- every one of them the target
+        # of a call the lifter then emitted against an undefined symbol.
+        instructions = sweep(resync)
+        for _ in range(8):
+            grown = set(resync)
+            for inst in instructions:
+                if (inst.mnemonic in _BRANCH and inst.op1 is not None
+                        and inst.op1.type in (OpType.REL8, OpType.REL16)):
+                    t = inst.op1.disp
+                    if 0 < t < len(seg.data):
+                        grown.add(t)
+            if grown == resync:
+                break
+            resync = grown
+            instructions = sweep(resync)
 
     # Post-process: enhance FPU instructions with proper mnemonics
     # The base decoder's ESC handler reads ModR/M to advance position but
@@ -281,9 +372,19 @@ def disassemble_segment(seg: Segment, ne: NEHeader, show_relocs: bool = True) ->
             raw = inst.raw
             skip = 0
             seg_override = ''
-            if raw[0] in (0x26, 0x2E, 0x36, 0x3E):
-                seg_override = {0x26: 'es', 0x2E: 'cs', 0x36: 'ss', 0x3E: 'ds'}[raw[0]]
-                skip = 1
+            # Skip the prefixes that can sit ahead of the ESC opcode, in any
+            # order. 0x9B (FWAIT) is the one that matters: 8087-era compilers
+            # emit `9B` before most FP instructions, so the ESC byte is at +1,
+            # not at 0. Looking only at raw[0] left every one of those as a bare
+            # `esc_N`, which the lifter then emitted as a COMMENT -- 331 of
+            # BangBang's 351 FP instructions silently did nothing, which for a
+            # game whose whole model is projectile trajectories means the
+            # physics never ran at all.
+            _SEGS = {0x26: 'es', 0x2E: 'cs', 0x36: 'ss', 0x3E: 'ds'}
+            while skip < len(raw) - 1 and (raw[skip] == 0x9B or raw[skip] in _SEGS):
+                if raw[skip] in _SEGS:
+                    seg_override = _SEGS[raw[skip]]
+                skip += 1
             if skip < len(raw) - 1 and 0xD8 <= raw[skip] <= 0xDF:
                 opcode = raw[skip]
                 modrm = raw[skip + 1]
@@ -328,6 +429,8 @@ def disassemble_segment(seg: Segment, ne: NEHeader, show_relocs: bool = True) ->
                 inst.op2 = None
 
     forced_entries = set(collect_internal_code_targets(ne).get(seg.index, set()))
+    # What Windows calls: header CS:IP + every exported entry-table slot.
+    forced_entries |= collect_entry_table_targets(ne).get(seg.index, set())
     if seg_ida and seg_ida.get('functions'):
         forced_entries.update(seg_ida['functions'])  # authoritative IDA entries
     functions = detect_functions(seg, instructions, forced_entries)

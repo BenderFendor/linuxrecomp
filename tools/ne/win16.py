@@ -409,3 +409,49 @@ PURGE.update({
     # ---- USER ----
     ('USER', 'CALLNEXTHOOKEX'): 10,       # HHOOK, int, WPARAM(2), LPARAM(4)
 })
+
+
+# The dialog/drawing leftovers. Every purge here was read off a real call site
+# (BangBang, 1990) by counting the pushes ahead of the far call, then checked
+# against the documented Win16 signature -- not taken from memory, because a
+# purge that is wrong by one word does not fail at the call, it shifts the
+# caller's frame and crashes somewhere innocent.
+PURGE.update({
+    ('GDI',  'FLOODFILL'):    10,   # HDC, int, int, COLORREF(4)
+    ('USER', 'DLGDIRSELECT'):  8,   # HWND, LPSTR(4), int
+    ('USER', 'DLGDIRLIST'):   12,   # HWND, LPSTR(4), int, int, UINT
+    ('USER', 'ANSIPREV'):      8,   # LPCSTR(4), LPCSTR(4)
+})
+
+
+# The rest of BangBang's (1990) surface: local heap, proc instances, the message
+# loop and the RECT helpers. Same method as above -- pushes counted at the real
+# call sites, cross-checked against the documented signature. Where a call site
+# and the signature disagreed it was the call-site walk that was wrong (it stops
+# at a branch target, and MSC 5.x happily puts one in the middle of an argument
+# setup), so read these as signature-derived and call-site-confirmed.
+PURGE.update({
+    # ---- KERNEL: local heap + proc instances ----
+    ('KERNEL', 'LOCALALLOC'):        4,   # UINT fuFlags, UINT cbAlloc
+    ('KERNEL', 'LOCALREALLOC'):      6,   # HLOCAL, UINT cbNew, UINT fuFlags
+    ('KERNEL', 'LOCALFREE'):         2,   # HLOCAL
+    ('KERNEL', 'LOCALLOCK'):         2,   # HLOCAL
+    ('KERNEL', 'LOCALUNLOCK'):       2,   # HLOCAL
+    ('KERNEL', 'MAKEPROCINSTANCE'):  6,   # FARPROC(4), HINSTANCE
+    ('KERNEL', 'FREEPROCINSTANCE'):  4,   # FARPROC(4)
+
+    # ---- GDI ----
+    ('GDI', 'GETTEXTMETRICS'):       6,   # HDC, LPTEXTMETRIC(4)
+
+    # ---- USER ----
+    ('USER', 'GETCURRENTTIME'):      0,   # void
+    ('USER', 'SETFOCUS'):            2,   # HWND
+    ('USER', 'UPDATEWINDOW'):        2,   # HWND
+    ('USER', 'GETCLASSWORD'):        4,   # HWND, int nIndex
+    ('USER', 'CHECKRADIOBUTTON'):    8,   # HWND, int, int, int
+    ('USER', 'ADJUSTWINDOWRECT'):   10,   # LPRECT(4), DWORD dwStyle(4), BOOL
+    ('USER', 'GETMESSAGE'):         10,   # LPMSG(4), HWND, UINT, UINT
+    ('USER', 'SETRECT'):            12,   # LPRECT(4), int, int, int, int
+    ('USER', 'UNIONRECT'):          12,   # LPRECT(4), LPCRECT(4), LPCRECT(4)
+    ('USER', 'ANSINEXT'):            4,   # LPCSTR(4)
+})

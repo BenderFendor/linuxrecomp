@@ -249,8 +249,13 @@ def parse_ne(filepath: str) -> NEHeader:
                     if target_type == 0:  # Internal reference
                         rel.target_seg = r_data[4]  # 1-byte segment number... but could be 0xFF
                         if rel.target_seg == 0xFF:
-                            # Moveable entry point - use entry table ordinal
-                            rel.ordinal = struct.unpack_from('<H', r_data, 5)[0]
+                            # Moveable entry point: the target is named by its
+                            # ENTRY TABLE ordinal. The target field is
+                            # [byte segment][byte reserved][word ordinal], so
+                            # the ordinal is at +6 like every other target word
+                            # below -- read at +5 it picks up the reserved zero
+                            # as its low byte and comes back as ordinal << 8.
+                            rel.ordinal = struct.unpack_from('<H', r_data, 6)[0]
                         else:
                             rel.target_off = struct.unpack_from('<H', r_data, 6)[0]
                     elif target_type == 1:  # Import by ordinal
