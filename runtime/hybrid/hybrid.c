@@ -257,9 +257,25 @@ static uint64_t __cdecl r2l_helper(uint32_t ova, uint32_t this_, uint32_t *real_
     r.esp = argsp;
 
     InterlockedIncrement((volatile LONG *)&g_r2l_calls);
-    ret = g_invoke(ova, &r, real_args);
 
-    t_arena_top = save;
+    /* __finally, because a callback can leave without returning.
+     *
+     * Guest code throws, and the handler that catches it is somewhere further
+     * out - so the unwind runs straight past this function and the line below
+     * never executes. The frame is then never given back, the next crossing
+     * carves a new one under it, and the arena walks downwards one throw at a
+     * time until a forwarded call pushes into memory that was never committed.
+     * That is unreportable: the kernel cannot push an exception frame onto a
+     * stack that has just run out, so there is no handler, no filter and no
+     * log - only a process that is suddenly gone.
+     *
+     * Mario Kart threw about three thousand times during its data load and ate
+     * sixteen megabytes doing it. */
+    __try {
+        ret = g_invoke(ova, &r, real_args);
+    } __finally {
+        t_arena_top = save;
+    }
     return ret;
 }
 
