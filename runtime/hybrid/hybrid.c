@@ -14,50 +14,41 @@
  * lifted -> real
  * ============================================================ */
 
-/* MSVC inline asm cannot address locals once esp/ebp are switched, so the
- * marshalling slots are file-scope. They are saved and restored around each
- * call, which is what makes this reentrant (RULE 2).
+/* Everything this needs lives on the caller's own stack, and the pointer to it
+ * lives in a TEB slot. No file-scope state at all, which is what makes it both
+ * reentrant AND thread-safe.
  *
- * RULE 4: REENTRANT IS NOT THREAD-SAFE, AND THIS HALF IS NOT YET.
- * The save/restore handles a call nested inside another on the SAME thread and
- * does nothing for two threads in here at once, which hand each other's
- * registers to each other's target and restore each other's host esp on the
- * way out. Mario Kart's engine startup makes six threads that all cross.
+ * The problem it solves: MSVC inline asm cannot address a local once esp and
+ * ebp have been handed to the guest, so the marshalling block used to be
+ * file-scope, saved and restored around each call. That is reentrant - a
+ * nested crossing on the same thread works - and it is not thread-safe, and
+ * with fourteen engine threads calling forwarded imports the difference stops
+ * being academic: two of them hand each other's registers to each other's
+ * target.
  *
- * `__declspec(thread)` is the obvious fix and does not work: the TLS lookup
- * MSVC emits for one of these needs eax and ecx, and every reference below
- * happens after `mov esp, T_espp4` has handed the machine to the guest -
- * so the fix costs the very registers being marshalled, and the boot dies
- * three dispatches in. Tried, measured, reverted.
+ * `__declspec(thread)` is not the fix. The TLS lookup MSVC emits needs eax and
+ * ecx, and every reference happens after the machine has been handed over -
+ * so it costs the very registers being marshalled. Measured: a game that ran
+ * 2,015 guest calls ran 3.
  *
- * What does work is not keeping the block in C at all: park the host esp in a
- * TEB slot (`fs:[0x14]`, ArbitraryUserPointer, free for application use and
- * per-thread by construction), which needs no registers, and use ebp as
- * scratch after the `call` returns, by which point the callee has restored it
- * and nothing here still wants it. That is a rewrite of the asm below rather
- * than an annotation on it, and it is the next thing this file needs.
- *
- * The real->lifted direction below IS thread-safe: it is plain C and its arena
- * is per thread. */
-static uint32_t T_eax, T_ecx, T_edx, T_ebx, T_esi, T_edi, T_ebp, T_espp4,
-                T_tgt, T_fesp, T_sesp;
+ * What works is not needing a register to find the block. `fs:[0x14]` is
+ * NT_TIB.ArbitraryUserPointer, free for application use and per-thread by
+ * construction, and `mov`/`xchg` can reach it with no register at all. The
+ * previous occupant is saved on the host stack, so a nested crossing nests.
+ */
+typedef struct {
+    uint32_t eax, ecx, edx, ebx, esi, edi, ebp, esp_, tgt;
+} L2R;
+
+#define TIB_SCRATCH 14h    /* NT_TIB.ArbitraryUserPointer */
 
 #pragma warning(disable:4731)   /* we clobber ebp deliberately; push/pop restores it */
 void hybrid_call_machine(hybrid_regs *r, uint32_t target)
 {
-    /* RULE 2: BE REENTRANT.
-     * The real code we are about to call can call back into lifted code (that
-     * is the whole point of routing vtables), which dispatches an import, which
-     * lands here again. If the saved host esp lived in a plain global, the
-     * inner call would overwrite the outer's copy and the outer would restore a
-     * bogus esp and return into hyperspace - long after the real mistake, in a
-     * frame that looks unrelated. Save and restore the whole block. */
-    uint32_t sv_eax = T_eax, sv_ecx = T_ecx, sv_edx = T_edx, sv_ebx = T_ebx,
-             sv_esi = T_esi, sv_edi = T_edi, sv_ebp = T_ebp, sv_espp4 = T_espp4,
-             sv_tgt = T_tgt, sv_fesp = T_fesp, sv_sesp = T_sesp;
+    L2R b;
 
-    T_eax = r->eax; T_ecx = r->ecx; T_edx = r->edx; T_ebx = r->ebx;
-    T_esi = r->esi; T_edi = r->edi;
+    b.eax = r->eax; b.ecx = r->ecx; b.edx = r->edx; b.ebx = r->ebx;
+    b.esi = r->esi; b.edi = r->edi;
 
     /* RULE 1: SEED ebp.
      * MSVC emits frameless funclets for SEH unwind and local-object destruction
@@ -67,45 +58,61 @@ void hybrid_call_machine(hybrid_regs *r, uint32_t target)
      * If such a funclet is not in your lifted set, dispatch falls back to the
      * real original - which then runs against the HOST's ebp and destructs a
      * garbage pointer. That reads as heap corruption a long way from the cause. */
-    T_ebp = r->ebp;
+    b.ebp = r->ebp;
 
-    T_espp4 = r->esp + 4;   /* skip the fake return slot; `call` writes a real one there */
-    T_tgt = target;
+    b.esp_ = r->esp + 4;   /* skip the fake return slot; `call` writes a real one there */
+    b.tgt = target;
 
     __asm {
         push ebx
         push esi
         push edi
         push ebp
-        mov T_sesp, esp
-        mov eax, T_eax
-        mov ecx, T_ecx
-        mov edx, T_edx
-        mov ebx, T_ebx
-        mov esi, T_esi
-        mov edi, T_edi
-        mov ebp, T_ebp
-        mov esp, T_espp4
-        call dword ptr [T_tgt]
-        mov T_fesp, esp
-        mov T_eax, eax
+        push dword ptr fs:[TIB_SCRATCH]   /* RULE 2: whoever had it, gets it back */
+        lea  eax, b
+        push eax                          /* the block, for the recovery half */
+        mov  fs:[TIB_SCRATCH], esp        /* host esp, reachable with no register */
+
+        mov  esp, [eax]L2R.esp_           /* the guest's arguments */
+        mov  ecx, [eax]L2R.tgt
+        mov  [esp-4], ecx                 /* target into the dead fake-return slot */
+        mov  ecx, [eax]L2R.ecx
+        mov  edx, [eax]L2R.edx
+        mov  ebx, [eax]L2R.ebx
+        mov  esi, [eax]L2R.esi
+        mov  edi, [eax]L2R.edi
+        mov  ebp, [eax]L2R.ebp
+        mov  eax, [eax]L2R.eax            /* the block pointer is released here */
+
+        /* `call [esp-4]` and not `call [esp]`: the operand is read before the
+         * return address is pushed, and pushing lands on that same slot - so
+         * the callee ends up with its arguments at [esp+4], exactly where a
+         * normal `call` would have left them. Through [esp] they would be one
+         * slot short. */
+        call dword ptr [esp-4]
+
+        /* One instruction to get the host stack back and the guest's final esp
+         * out, with every register still holding a result. */
+        xchg esp, fs:[TIB_SCRATCH]
+
+        pop  ecx                          /* the block */
+        mov  [ecx]L2R.eax, eax
         /* RULE 3: CAPTURE edx.
          * A 64-bit return comes back in edx:eax. Dropping edx silently
          * truncates every one of them, and compilers of this era pass such
          * pairs around constantly (`mov [ebp-8],eax; mov [ebp-4],edx`). */
-        mov T_edx, edx
-        mov esp, T_sesp
-        pop ebp
-        pop edi
-        pop esi
-        pop ebx
+        mov  [ecx]L2R.edx, edx
+        mov  eax, fs:[TIB_SCRATCH]        /* the guest's esp after its own `ret N` */
+        mov  [ecx]L2R.esp_, eax
+        pop  eax
+        mov  fs:[TIB_SCRATCH], eax        /* give the slot back */
+        pop  ebp
+        pop  edi
+        pop  esi
+        pop  ebx
     }
 
-    r->eax = T_eax; r->edx = T_edx; r->esp = T_fesp;
-
-    T_eax = sv_eax; T_ecx = sv_ecx; T_edx = sv_edx; T_ebx = sv_ebx;
-    T_esi = sv_esi; T_edi = sv_edi; T_ebp = sv_ebp; T_espp4 = sv_espp4;
-    T_tgt = sv_tgt; T_fesp = sv_fesp; T_sesp = sv_sesp;
+    r->eax = b.eax; r->edx = b.edx; r->esp = b.esp_;
 }
 
 /* ============================================================

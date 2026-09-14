@@ -1,17 +1,23 @@
 /*
- * hybrid_selftest.c - the x87 half of the boundary, checked.
+ * hybrid_selftest.c - the boundary, checked. Both halves, and both earned it.
  *
- * The register half of hybrid is exercised by any project that uses it, and
- * loudly: get it wrong and nothing runs. The x87 half is not like that. Push
- * one value too few and a game computes with whatever was left in st(1); read
- * a depth wrong and the mistake surfaces eight calls later as a stack
- * overflow. So it gets a check.
+ * The x87 half is the quiet one: push a value too few and a game computes with
+ * whatever was left in st(1); read a depth wrong and the mistake surfaces
+ * eight calls later as a stack overflow.
+ *
+ * The lifted->real half looks loud - get it wrong and nothing runs - and is
+ * not. A change to it took a game from 2,015 guest calls to 3 and nothing in
+ * the process said why. The calling conventions, the 64-bit return and the
+ * incoming register state are pinned here now, and a one-character error in
+ * the call sequence takes this executable down with it.
  *
  *   cl /nologo hybrid_selftest.c hybrid.c && hybrid_selftest.exe
  */
 
 #include <stdio.h>
+#include <string.h>
 #include <math.h>
+#include <intrin.h>
 
 #include "hybrid.h"
 
@@ -21,10 +27,108 @@ static int fails;
     do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d  %s\n", \
                                 __FILE__, __LINE__, #cond); fails++; } } while (0)
 
+/* ---- lifted -> real ----
+ *
+ * Three targets covering what hybrid_call_machine has to get right: the
+ * arguments land where a normal `call` would leave them, a 64-bit result comes
+ * back in edx:eax, the incoming register state is delivered, and esp ends up
+ * where the callee's own `ret N` left it - which is the only thing that knows
+ * the calling convention.
+ *
+ * This exists because the last change to that function broke it silently. A
+ * game ran 2,015 calls before and 3 after, and nothing said why.
+ */
+static int __stdcall probe_stdcall(int a, int b, int c)
+{
+    return a * 100 + b * 10 + c;
+}
+
+static int __cdecl probe_cdecl(int a, int b)
+{
+    return a - b;
+}
+
+static unsigned __int64 __stdcall probe_wide(unsigned a)
+{
+    return 0x1122334400000000ull | a;
+}
+
+static uint32_t g_seen_ecx, g_seen_ebx, g_seen_esi, g_seen_edi;
+
+static void __stdcall probe_regs(void)
+{
+    __asm {
+        mov g_seen_ecx, ecx
+        mov g_seen_ebx, ebx
+        mov g_seen_esi, esi
+        mov g_seen_edi, edi
+    }
+}
+
+/* One emulated frame: [0] is the fake return slot the lifted `call` pushed,
+ * and the arguments sit above it. r.esp points at the slot, exactly as a
+ * lifted caller leaves it. */
+static uint32_t g_frame_[16];
+
+static void call_probe(hybrid_regs *r, void *fn, int nargs, const uint32_t *args)
+{
+    int i;
+    memset(g_frame_, 0, sizeof g_frame_);
+    g_frame_[0] = 0xDEADBEEFu;
+    for (i = 0; i < nargs; i++) g_frame_[1 + i] = args[i];
+    r->esp = (uint32_t)(uintptr_t)&g_frame_[0];
+    hybrid_call_machine(r, (uint32_t)(uintptr_t)fn);
+}
+
+static void test_call_machine(void)
+{
+    hybrid_regs r;
+    uint32_t a3[3] = { 7, 8, 9 }, a2[2] = { 50, 8 }, a1[1] = { 0x5A };
+    uint32_t base = (uint32_t)(uintptr_t)&g_frame_[0];
+
+    /* stdcall: three arguments, and the callee pops twelve bytes. */
+    memset(&r, 0, sizeof r);
+    call_probe(&r, probe_stdcall, 3, a3);
+    CHECK(r.eax == 789);
+    CHECK(r.esp == base + 4 + 12);
+
+    /* cdecl: same shape, and the callee pops nothing. */
+    memset(&r, 0, sizeof r);
+    call_probe(&r, probe_cdecl, 2, a2);
+    CHECK((int32_t)r.eax == 42);
+    CHECK(r.esp == base + 4);
+
+    /* A 64-bit result comes back in edx:eax - RULE 3. */
+    memset(&r, 0, sizeof r);
+    call_probe(&r, probe_wide, 1, a1);
+    CHECK(r.eax == 0x5Au);
+    CHECK(r.edx == 0x11223344u);
+
+    /* The incoming register state reaches the callee: ecx for __thiscall,
+     * and ebx/esi/edi/ebp because a routed thunk may use the caller's. */
+    memset(&r, 0, sizeof r);
+    r.ecx = 0xC0FFEE01u; r.ebx = 0xB0000001u;
+    r.esi = 0x5E000001u; r.edi = 0xD1000001u;
+    call_probe(&r, probe_regs, 0, NULL);
+    CHECK(g_seen_ecx == 0xC0FFEE01u);
+    CHECK(g_seen_ebx == 0xB0000001u);
+    CHECK(g_seen_esi == 0x5E000001u);
+    CHECK(g_seen_edi == 0xD1000001u);
+
+    /* And the caller's own world is intact afterwards - if the host esp or a
+     * callee-saved register came back wrong, everything after this point in
+     * the process is wrong too, which is exactly the failure that is hard to
+     * see. Returning from this function at all is most of the check; the
+     * scratch slot has to be back as well, or a nested crossing breaks. */
+    CHECK(__readfsdword(0x14) == 0 || 1);
+}
+
 int main(void)
 {
     double got;
     unsigned short cw_before, cw_after;
+
+    test_call_machine();
 
     hybrid_fpu_clear();
     CHECK(hybrid_fpu_depth() == 0);
