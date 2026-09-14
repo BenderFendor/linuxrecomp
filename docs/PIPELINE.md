@@ -188,6 +188,32 @@ The ratio depends heavily on whether the game uses a public engine/SDK.
 - String: rep movsb/d, rep stosb/d, rep cmpsb/d, rep scasb/d
 - System: cpuid, rdtsc, int3, in, out (stubbed)
 
+### Every vtable slot is a function entry
+
+Union the vtable slot addresses into the function list before lifting. The
+disassembler's recovery will not find all of them, and the ones it misses are
+the ones that break a C++ target.
+
+MSVC's virtual-inheritance adjustor thunks are the case that matters:
+
+```
+00762820  sub ecx, dword ptr [ecx - 4]     ; apply the vtordisp
+00762823  jmp 0x761880                     ; the real method
+```
+
+Eight bytes, nothing calls them, nothing falls through into them -- so no
+recovery pass names one, "lift everything" does not lift one, and the runtime
+answers the slot with `ICALL: unresolved VA` and sets `eax = 0`. That zero is
+then an ordinary null return value, and the fault lands hundreds of
+instructions later in whatever took it as an object. On Force Commander 130 of
+5,682 vtable slots were uncatalogued, and the two the run actually reached were
+both adjustor thunks.
+
+Give injected entries a TIGHT bound -- the next known entry above, capped at a
+few hundred bytes. Handing them the end of `.text` like a normal seed gives the
+extent walk the whole section to descend through, and the lift hangs on its
+first chunk.
+
 **Pipeline Orchestrator** (`tools/lift/translator.py`):
 1. Load PE analysis
 2. Discover functions via disassembler
