@@ -422,24 +422,6 @@ static inline int32_t sse_cvtt_i32(double v) {
     return (v >= -2147483648.0 && v < 2147483648.0) ? (int32_t)v : (int32_t)0x80000000;
 }
 
-/* ---- locked read-modify-write ----
- *
- * The LOCK prefix is not decoration. libstdc++ uses these for the reference
- * counts inside std::string and shared_ptr, and a game with several threads
- * sharing strings will race on them - producing a use-after-free at some
- * unrelated later moment, which is the worst kind of bug to go looking for.
- * One atomic instruction is cheaper than ever debugging that. */
-static inline uint32_t atomic_xadd32(uint32_t addr, uint32_t v)
-{
-#if defined(_MSC_VER)
-    return (uint32_t)_InterlockedExchangeAdd((volatile long *)(uintptr_t)addr, (long)v);
-#elif defined(__GNUC__)
-    return __atomic_fetch_add((volatile uint32_t *)(uintptr_t)addr, v, __ATOMIC_SEQ_CST);
-#else
-    uint32_t old = rd32(addr); wr32(addr, old + v); return old;   /* single-threaded fallback */
-#endif
-}
-
 /* ---- BT / BTS / BTR / BTC ----
  *
  * With a memory destination and a register bit index, the index is NOT masked
