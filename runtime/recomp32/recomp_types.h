@@ -724,9 +724,21 @@ static inline void CPUID(uint32_t eax_val, uint32_t ebx_val, uint32_t ecx_val, u
  * unresolved dispatch is far more useful with its caller named. */
 extern uint32_t g_cur_func;
 
-/* ICALL trace ring buffer for crash diagnostics */
-#define ICALL_TRACE_SIZE 32
+/* ICALL trace ring buffer for crash diagnostics.
+ *
+ * Both halves matter. A target on its own says which vtable slot ran; the
+ * CALLER is what you actually need, because an indirect call is how a null
+ * `this` or a null argument gets handed across a module boundary, and the
+ * function that built the argument is the one to read. Recovering it by hand
+ * means a --calltrace and guessing which nearby entry was still on the stack,
+ * and the entry ring is no help when the answer is 33 entries back. */
+/* 32 was too small the first time it mattered: a method that makes a few
+ * indirect calls of its own scrolls its own entry out of the ring, so the
+ * report showed it as a caller and never as a target, and the function that
+ * handed it a null argument was already gone. 128 costs a kilobyte. */
+#define ICALL_TRACE_SIZE 128
 extern uint32_t g_icall_trace[ICALL_TRACE_SIZE];
+extern uint32_t g_icall_from[ICALL_TRACE_SIZE];
 extern uint32_t g_icall_trace_idx;
 extern uint32_t g_icall_count;
 
@@ -756,6 +768,7 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
 #define RECOMP_ICALL(target_va) do { \
     uint32_t _va = (uint32_t)(target_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    g_icall_from[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = g_cur_func; \
     g_icall_trace_idx++; \
     g_icall_count++; \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
@@ -777,6 +790,7 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
 #define RECOMP_ITAIL(target_va) do { \
     uint32_t _va = (uint32_t)(target_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    g_icall_from[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = g_cur_func; \
     g_icall_trace_idx++; \
     g_icall_count++; \
     recomp_func_t _fn = recomp_lookup_manual(_va); \

@@ -26,6 +26,7 @@ ptrdiff_t g_mem_base = 0;
 
 /* ICALL trace */
 uint32_t g_icall_trace[ICALL_TRACE_SIZE] = {0};
+uint32_t g_icall_from[ICALL_TRACE_SIZE] = {0};
 uint32_t g_icall_trace_idx = 0;
 uint32_t g_icall_count = 0;
 
@@ -62,7 +63,8 @@ static void dump_icall_trace(void) {
     for (int i = 0; i < ICALL_TRACE_SIZE; i++) {
         uint32_t idx = (g_icall_trace_idx - ICALL_TRACE_SIZE + i) & (ICALL_TRACE_SIZE - 1);
         if (g_icall_trace[idx]) {
-            fprintf(stderr, "  [%2d] 0x%08X\n", i, g_icall_trace[idx]);
+            fprintf(stderr, "  [%2d] 0x%08X  <- 0x%08X\n", i,
+                    g_icall_trace[idx], g_icall_from[idx]);
         }
     }
     fprintf(stderr, "Total indirect calls: %u\n", g_icall_count);

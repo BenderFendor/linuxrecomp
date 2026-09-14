@@ -35,7 +35,8 @@ static void dump_icall_trace(void) {
                        & (ICALL_TRACE_SIZE - 1);
         uint32_t va = g_icall_trace[idx];
         if (!va) continue;
-        fprintf(stderr, "    %08X %s\n", va, region_of(va));
+        fprintf(stderr, "    %08X %-18s <- %08X\n", va, region_of(va),
+                g_icall_from[idx]);
         shown++;
     }
     if (!shown) fprintf(stderr, "    (none)\n");
