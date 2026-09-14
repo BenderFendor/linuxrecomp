@@ -422,4 +422,55 @@ static inline int32_t sse_cvtt_i32(double v) {
     return (v >= -2147483648.0 && v < 2147483648.0) ? (int32_t)v : (int32_t)0x80000000;
 }
 
+/* ---- locked read-modify-write ----
+ *
+ * The LOCK prefix is not decoration. libstdc++ uses these for the reference
+ * counts inside std::string and shared_ptr, and a game with several threads
+ * sharing strings will race on them - producing a use-after-free at some
+ * unrelated later moment, which is the worst kind of bug to go looking for.
+ * One atomic instruction is cheaper than ever debugging that. */
+static inline uint32_t atomic_xadd32(uint32_t addr, uint32_t v)
+{
+#if defined(_MSC_VER)
+    return (uint32_t)_InterlockedExchangeAdd((volatile long *)(uintptr_t)addr, (long)v);
+#elif defined(__GNUC__)
+    return __atomic_fetch_add((volatile uint32_t *)(uintptr_t)addr, v, __ATOMIC_SEQ_CST);
+#else
+    uint32_t old = rd32(addr); wr32(addr, old + v); return old;   /* single-threaded fallback */
+#endif
+}
+
+/* ---- BT / BTS / BTR / BTC ----
+ *
+ * With a memory destination and a register bit index, the index is NOT masked
+ * to the operand size: it selects a dword away from the base address, which is
+ * how a bitmap of arbitrary size gets addressed. Masking it the way the
+ * register form does would quietly read and write the wrong word - the kind of
+ * wrong that shows up as unrelated corruption much later.
+ *
+ * op: 0 test, 1 set, 2 reset, 3 complement. CF receives the bit as it was. */
+static inline uint32_t bit_string_op(CPU *c, uint32_t addr, int32_t idx, int op)
+{
+    uint32_t a = addr + 4u * (uint32_t)(idx >> 5);
+    unsigned b = (unsigned)(idx & 31);
+    uint32_t w = rd32(a);
+    c->cf = (w >> b) & 1u;
+    if      (op == 1) w |=  (1u << b);
+    else if (op == 2) w &= ~(1u << b);
+    else if (op == 3) w ^=  (1u << b);
+    if (op) wr32(a, w);
+    return c->cf;
+}
+
+/* The register form, where the index really is taken modulo the width. */
+static inline uint32_t bit_reg_op(CPU *c, uint32_t *r, uint32_t idx, int op)
+{
+    unsigned b = idx & 31u;
+    c->cf = (*r >> b) & 1u;
+    if      (op == 1) *r |=  (1u << b);
+    else if (op == 2) *r &= ~(1u << b);
+    else if (op == 3) *r ^=  (1u << b);
+    return c->cf;
+}
+
 #endif /* PCRECOMP_CPU_H */
