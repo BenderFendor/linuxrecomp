@@ -9,6 +9,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <string.h>
+#include <stdio.h>
 
 /* ============================================================
  * lifted -> real
@@ -143,9 +144,38 @@ static unsigned long g_r2l_calls;
  * never calls back never pays for one. */
 static __declspec(thread) uint8_t  *t_arena;
 static __declspec(thread) uint32_t  t_arena_top;
+static __declspec(thread) uint32_t  t_arena_low;   /* lowest committed byte */
 
 #define R2L_STUB_BYTES 16
 #define R2L_ARGS_COPIED 16      /* enough for any sane calling convention */
+
+/*
+ * A thread that cannot get an arena returns 0 from every callback, and 0 is a
+ * legal answer to most messages - so the failure arrives somewhere else
+ * entirely, as a library function that says no for a reason of its own.
+ *
+ * The one that cost a day: a window procedure returning 0 to WM_NCCREATE makes
+ * CreateWindowExW return NULL and set ERROR_NOT_ENOUGH_MEMORY, which reads as a
+ * problem with the window and is a problem with the arena. Say it out loud.
+ */
+static void arena_failed(const char *verb)
+{
+    static volatile LONG said;
+    if (InterlockedExchange(&said, 1)) return;
+    fprintf(stderr,
+        "[hybrid] a thread could not %s its callback arena (%u MB reserved, "
+        "%u KB per frame).\n"
+        "  Callbacks from real code into lifted code need one, so this thread\n"
+        "  now returns 0 from every callback it is given. Where that surfaces\n"
+        "  depends on who was calling: a window procedure answering 0 to\n"
+        "  WM_NCCREATE turns into CreateWindowEx failing with\n"
+        "  ERROR_NOT_ENOUGH_MEMORY and nothing at all in between.\n"
+        "  A 32-bit process has 2 GB of address space and a game with a worker\n"
+        "  pool has a lot of threads. Lower the arena size given to\n"
+        "  hybrid_init() before lowering the frame size - only nesting depth\n"
+        "  needs the arena, and every crossing needs the frame.\n",
+        verb, (unsigned)(g_arena_bytes >> 20), (unsigned)(g_frame >> 10));
+}
 
 static uint64_t __cdecl r2l_helper(uint32_t ova, uint32_t this_, uint32_t *real_args,
                                    uint32_t ebx, uint32_t esi, uint32_t edi, uint32_t ebp)
@@ -160,14 +190,32 @@ static uint64_t __cdecl r2l_helper(uint32_t ova, uint32_t this_, uint32_t *real_
      * real stack while the lifted code runs, and the two would interleave.
      * Per thread, so two threads crossing at once do not carve overlapping
      * frames out of the same one. */
+    /* Reserved whole, committed a frame at a time. Committing it all up front
+     * charged every thread that ever crossed the boundary for the deepest
+     * nesting it might ever reach, and sixteen of those is most of a 32-bit
+     * address space. */
     if (!t_arena) {
         t_arena = (uint8_t *)VirtualAlloc(NULL, g_arena_bytes,
-                                          MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        if (!t_arena) return 0;
-        t_arena_top = (uint32_t)(uintptr_t)(t_arena + g_arena_bytes);
+                                          MEM_RESERVE, PAGE_READWRITE);
+        if (!t_arena) { arena_failed("reserve"); return 0; }
+        t_arena_top = t_arena_low = (uint32_t)(uintptr_t)(t_arena + g_arena_bytes);
     }
     save = t_arena_top;
     t_arena_top -= g_frame;
+    if (t_arena_top < (uint32_t)(uintptr_t)t_arena) {
+        t_arena_top = save;
+        arena_failed("grow");      /* nested this deep - raise the arena size */
+        return 0;
+    }
+    if (t_arena_top < t_arena_low) {
+        if (!VirtualAlloc((LPVOID)(uintptr_t)t_arena_top,
+                          t_arena_low - t_arena_top, MEM_COMMIT, PAGE_READWRITE)) {
+            t_arena_top = save;
+            arena_failed("commit");
+            return 0;
+        }
+        t_arena_low = t_arena_top;
+    }
     argsp = t_arena_top + g_frame - 0x100;
 
     for (i = 0; i < R2L_ARGS_COPIED; i++)

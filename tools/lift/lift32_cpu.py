@@ -158,8 +158,25 @@ class Lifter:
         self.md.detail = True
 
     def resolve_jumptable(self, table_va):
-        """Read consecutive dword targets from a jump table that point within
-        the current function; stop at the first that doesn't (heuristic)."""
+        """Read consecutive dword targets from a jump table.
+
+        The old rule - stop at the first entry outside the *current function* -
+        silently truncated any table whose last arms were recovered as
+        functions of their own, which on a stripped binary happens constantly:
+        an arm that is also a branch target gets its own catalog entry, the
+        clamp ends the containing function there, and every arm past it
+        disappears.
+
+        It cost a day in Mario Kart. The window procedure's table has ten arms;
+        arm nine, WM_NCCREATE, lives past a neighbour that recovery had called
+        a function. The lifter emitted nine `goto`s and an `abort()`, so no
+        window could ever be created - CreateWindowExW returned NULL with
+        ERROR_NOT_ENOUGH_MEMORY and nothing said why.
+
+        The image's own range is the bound that a real table has anyway: the
+        dword after the last arm is whatever follows it in `.rdata` - here the
+        byte index table the same switch uses - and is not an address at all.
+        """
         targets = []
         if not self.read_va:
             return targets
@@ -169,7 +186,7 @@ class Lifter:
             except Exception:
                 break
             t = int.from_bytes(raw, "little")
-            if self.func_start <= t < self.func_end:
+            if self.in_image(t):
                 targets.append(t)
             else:
                 break
@@ -529,8 +546,13 @@ class Lifter:
                 addr = self.addr_expr(insn, t)
                 out = [f"{{ uint32_t _jt = rd32({addr});"]
                 for tv in sorted(set(tgts)):
-                    out.append(f"  if (_jt == GVA(0x{tv:08X})) goto L_{tv:08X};")
-                out.append("  abort(); }")
+                    if tv in labels:
+                        out.append(f"  if (_jt == GVA(0x{tv:08X})) goto L_{tv:08X};")
+                # Anything else the table holds - an arm that was recovered as
+                # its own function, or an entry this walk did not enumerate -
+                # goes where the instruction says. Aborting here was a guess
+                # that the table could not hold anything else, and it was wrong.
+                out.append("  dispatch_jmp(c, _jt); return; }")
                 return out
             if t.type == X86_OP_IMM:                        # tail call to another function
                 return [f"dispatch(c, 0x{t.imm:08X}u); return;"]
@@ -879,6 +901,33 @@ class Lifter:
         insns = list(self.md.disasm(code, start))
         # collect intra-function branch targets
         end = start + len(code)
+
+        # An extent that ends in the middle of an instruction.
+        #
+        # Clamping a recovered function against the next catalog entry does
+        # this whenever that entry is false, and on a stripped binary some
+        # always are. Capstone then stops one instruction early, and the
+        # function's fall-through address is *inside* a real instruction:
+        # dispatching there decodes its tail as something else. `74 5B` - a
+        # two-byte `je` - read from its second byte is `pop ebx`, and a guest
+        # stack one slot out is the worst failure this project can produce.
+        #
+        # The bytes are in the image either way, so read the few more that
+        # finish the instruction and keep it. The fall-through then lands where
+        # the program's own code does, which is somewhere with a body.
+        if insns and self.read_va:
+            tail = insns[-1].address + insns[-1].size
+            if tail < end:
+                try:
+                    extra = self.read_va(tail, (end - tail) + 15)
+                except Exception:
+                    extra = b""
+                for ins in self.md.disasm(extra, tail):
+                    if ins.address >= end:
+                        break
+                    insns.append(ins)
+                end = max(end, insns[-1].address + insns[-1].size)
+
         self.func_start, self.func_end = start, end
         insn_addrs = set(ins.address for ins in insns)   # only these can be goto labels
         labels = set()
@@ -891,11 +940,20 @@ class Lifter:
                         labels.add(op.imm)
                     elif op.type == X86_OP_MEM and ins.mnemonic == "jmp":
                         d = op.mem.disp & 0xffffffff      # jump table base
-                        if self.in_image(d):
-                            tgts = [t for t in self.resolve_jumptable(d) if t in insn_addrs]
+                        # A switch indexes: `jmp [reg*4 + table]`. Without the
+                        # scaled index this is `jmp [__imp_memcpy]` - an IAT
+                        # thunk, of which a PE has hundreds - and walking the
+                        # import table as if it were a jump table invents
+                        # thousands of branch targets out of hint RVAs.
+                        if (op.mem.index and op.mem.scale == 4 and
+                                self.in_image(d)):
+                            tgts = self.resolve_jumptable(d)
                             if tgts:
                                 self.jumptables[ins.address] = tgts
-                                labels.update(tgts)
+                                # Only the arms that are instruction boundaries
+                                # in THIS function can be goto labels; the rest
+                                # are dispatched, see the emitter.
+                                labels.update(t for t in tgts if t in insn_addrs)
         out = []
         out.append(f"void L_{start:08X}(CPU *c)")
         out.append("{")
@@ -921,8 +979,17 @@ class Lifter:
         # of the mnemonic, not the whole thing.
         last = insns[-1].mnemonic.split()[-1] if insns else None
         if last not in ("ret", "retn", "retf", "jmp", "iret", "iretd", "hlt"):
+            # After the last instruction decoded, NOT at the end of the extent.
+            # They differ exactly when the extent cuts an instruction in half -
+            # a clamp to a false function start does that - and then the extent
+            # end is an address in the middle of a real instruction. Dispatching
+            # there decodes the tail of it as something else: `74 5B`, a two-byte
+            # `je`, becomes a one-byte `pop ebx` at the second byte, and the
+            # guest stack is one slot out from then on with nothing to show for
+            # it. Mario Kart lost a pointer to a memcpy that way.
+            nxt = insns[-1].address + insns[-1].size if insns else end
             out.append(f"    /* extent ends mid-function: fall through */")
-            out.append(f"    dispatch(c, 0x{end:08X}u); return;")
+            out.append(f"    dispatch(c, 0x{nxt:08X}u); return;")
 
         out.append("}")
         return "\n".join(out)
