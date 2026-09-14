@@ -271,6 +271,52 @@ Complete DOS environment simulation:
 
 All backed by SDL2 for actual display/input.
 
+### A no-op shim for a RECORDING API is not neutral
+
+The usual rule for a shim is that doing nothing is the safe default: return
+success, leave the out-parameters alone, add behaviour when something is
+measured to want it. That rule breaks for any API whose contract is "from now
+until I say stop, do not act on what I tell you".
+
+Direct3D 7's state blocks are the case that taught this. Between
+`BeginStateBlock` and `EndStateBlock` the runtime RECORDS state-setting calls
+instead of applying them, and `ApplyStateBlock` applies the recorded set. With
+all three stubbed, every state in every block was applied the instant it was
+RECORDED -- and never applied again -- so the live device state at every draw
+was whatever the last block to be BUILT had happened to want. The symptom was
+a 3D scene drawn with a 2D overlay's blend mode and depth settings, which
+looks like a renderer bug and is a shim bug.
+
+The same shape turns up in transactions, batched updates, deferred contexts,
+display lists and any "begin/end capture" pair. If a stub cannot both suppress
+and replay, it is not a stub, it is a behaviour change. The fix is small --
+record `(kind, args)` into an array and replay it -- and it is much smaller
+than finding it later.
+
+### Report every failed file operation, unconditionally
+
+Failed opens are usually logged; failed directory ENUMERATIONS usually are
+not, because they are noisy in the normal case of a loose-file lookup falling
+back to an archive. Log them anyway, outside the verbose flag.
+
+An empty directory and a missing one are indistinguishable to the caller, and
+a program that enumerates a directory it needs, gets nothing and waits for
+something that will never arrive says nothing at all about why. One
+unconditional line -- `FindFirstFileA("...\Players") -> not found` -- is worth
+more than the whole verbose trace it would otherwise be buried in.
+
+### A retail install is not the disc
+
+The installer copies and RENAMES. Assembling an install by hand from a mounted
+image gets the 8.3 names out of the ISO-9660 tree (`1201-O~1.IMU`) while the
+program asks for what the installer wrote (`1201 - OpeningScreen.imu`), so
+read the **Joliet** tree instead: the supplementary volume descriptor at
+sector 17, escape `%/@`, `%/C` or `%/E`, names in UCS-2.
+
+And check what is missing before blaming the recompilation. One project ran
+for a long time with `Resource\Music` and `Resource\Movies` simply absent --
+260 MB the install step had never copied -- with the program silent about it.
+
 ### DRM Removal (`tools/drm/`)
 
 - **SafeDisc v1**: `safedisc_dump.py` -- launch via Steam, dump decrypted .text section
