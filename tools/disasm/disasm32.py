@@ -796,11 +796,22 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
     # Stopping at the terminator also keeps this from marking the NEXT
     # function's bytes and dropping a real start: over-marking is the only way
     # this can do harm, and a `ret` is where over-marking would begin.
-    ENDS = ("ret", "retn", "retf", "jmp", "iret", "iretd")
+    ENDS = ("ret", "retn", "retf", "iret", "iretd")
     WINDOW = 0x2000
 
     def body_instructions(addr):
+        """Walk a function's real extent, following unconditional jumps.
+
+        Stopping at a `jmp` was the obvious rule and is wrong: MSVC emits them
+        inside a function constantly - around a loop, out of a switch arm, to a
+        shared tail - and stopping there ends the walk in the middle of the
+        body. `0x00768220` ends at `jmp 0x76825F` twenty-three instructions in,
+        so a false entry at `0x00768279` was never reached and survived two
+        passes. Follow the jump instead, exactly as probes_as_function_body
+        does; only `ret` and an indirect jump really end a body.
+        """
         va, n = addr, 0
+        seen = set()
         while n < 4096:
             try:
                 code = read_va(va, min(WINDOW, code_end - va))
@@ -814,6 +825,16 @@ def drop_mid_instruction_entries(read_va, functions, code_start, code_end,
                 yield ins
                 if ins.mnemonic.split()[-1] in ENDS:
                     return
+                if ins.mnemonic.split()[-1] == "jmp":
+                    op = ins.op_str.strip()
+                    if not op.startswith("0x"):
+                        return                      # indirect: a table or a thunk
+                    t = int(op, 16)
+                    if t in seen or not (code_start <= t < code_end):
+                        return
+                    seen.add(t)
+                    va = t
+                    break
             if not advanced:
                 return
 
