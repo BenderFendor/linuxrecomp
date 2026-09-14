@@ -434,6 +434,13 @@ class Lifter:
             fn = "op_rol" if m == "rol" else "op_ror"
             return [self.dst_write(insn, d,
                                    f"{fn}(c, {self._read_dst(insn,d)}, {cnt}, {d.size})")]
+        if m == "bswap":
+            # Register only, and 32-bit only: the 16-bit encoding is undefined
+            # on real parts, so anything else here is data read as code.
+            d = ops[0]
+            if d.size == 4:
+                return [self.dst_write(insn, d,
+                                       f"op_bswap32({self._read_dst(insn, d)})")]
         if m in ("shld", "shrd"):
             d, s2 = ops[0], ops[1]
             cnt = self.src(insn, ops[2]) if len(ops) > 2 else "R8L(c->ecx)"

@@ -278,6 +278,20 @@ static inline uint32_t op_ror(CPU *c, uint32_t v, uint32_t cnt, int sz) {
     return r;
 }
 
+/* ---- byte order ----
+ *
+ * bswap reverses the four bytes of a 32-bit register and touches no flags.
+ * It is how a compiler writes htonl/ntohl inline, so it turns up in any code
+ * that opens a socket, next to a `ror bx, 8` doing the 16-bit half.
+ *
+ * The 16-bit form is architecturally undefined - Intel documents it as such
+ * and real parts leave the register zeroed - so a compiler never emits it and
+ * this deliberately does not pretend to implement it. */
+static inline uint32_t op_bswap32(uint32_t v) {
+    return (v >> 24) | ((v >> 8) & 0x0000FF00u)
+         | ((v << 8) & 0x00FF0000u) | (v << 24);
+}
+
 /* ---- double-precision shifts: shift `d`, feeding in bits from `s` ---- */
 static inline uint32_t op_shld(CPU *c, uint32_t d, uint32_t s, uint32_t cnt, int sz) {
     uint32_t m = mask_sz(sz); int w = sz * 8;
