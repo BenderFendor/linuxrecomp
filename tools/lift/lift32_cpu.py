@@ -692,7 +692,19 @@ class Lifter:
         if m in ("fscale",): return ["*fst(c, 0) = ldexp(*fst(c, 0), (int)*fst(c, 1));"]
         if m in ("fsincos",): return ["{ double _s=sin(*fst(c,0)), _c=cos(*fst(c,0)); *fst(c,0)=_s; fpush(c,_c); }"]
         if m in ("fxch",):
-            i = self._st_idx(ops[0]) if ops else 1
+            # ops[-1], not ops[0]. Capstone prints `fxch st(1)` but reports it
+            # with BOTH registers, st(0) first, so ops[0] is always st(0) and
+            # the swap this emitted was st(0) with st(0) - a no-op, for every
+            # fxch in the program.
+            #
+            # It is the kind of wrong that does not look wrong: an fxch is
+            # usually followed by an fstp, so the value that gets stored is
+            # simply the other one, and the arithmetic downstream stays
+            # plausible. In Mario Kart it turned a fixed-timestep accumulator
+            # into an infinite loop - the game subtracted its step from the
+            # wrong register, the step was negative, and the guest thread never
+            # came out of the frame it was in.
+            i = self._st_idx(ops[-1]) if ops else 1
             return [f"{{ double _t = *fst(c, 0); *fst(c, 0) = *fst(c, {i}); *fst(c, {i}) = _t; }}"]
         if m in ("fadd","fsub","fsubr","fmul","fdiv","fdivr",
                  "faddp","fsubp","fsubrp","fmulp","fdivp","fdivrp"):
@@ -703,9 +715,21 @@ class Lifter:
                 src = self._fmem(insn, memop, "f"); dst = "(*fst(c, 0))"
                 expr = f"{src} {opc} {dst}" if rev else f"{dst} {opc} {src}"
                 return [f"*fst(c, 0) = {expr};"]
-            # register form: default dst st(0) when single operand
+            # register form. Which register is the DESTINATION depends on
+            # whether this pops, and capstone prints one operand for both:
+            #
+            #   fadd  st(1)   (D8 C1)  st(0) = st(0) + st(1)   dst is st(0)
+            #   faddp st(1)   (DE C1)  st(1) = st(1) + st(0)   dst is st(1)
+            #
+            # The popping forms name their destination, which is the opposite
+            # of the non-popping ones, and treating them alike wrote the result
+            # into the register the very next fpop threw away - so `faddp`
+            # returned the operand it was supposed to have added to. Forty
+            # thousand of them in one game.
             if len(ops) == 2:
                 a = self._st_idx(ops[0]); b = self._st_idx(ops[1])
+            elif pops:
+                a = self._st_idx(ops[0]) if ops else 1; b = 0
             else:
                 a = 0; b = self._st_idx(ops[0]) if ops else 1
             dst = f"(*fst(c, {a}))"; src = f"(*fst(c, {b}))"
@@ -1125,5 +1149,50 @@ def main():
     print(f"[*] wrote {out_c} and {list_h} ({len(done)} funcs)", file=sys.stderr)
 
 
+def selftest():
+    """The x87 forms where capstone's operand list is a trap.
+
+    difftest.py runs lifted C against Unicorn, and it covers lift32.py - the
+    global-register lifter - not this one. Both of the bugs below had already
+    been found and fixed there and came back here, so this is the smallest
+    check that says so: lift the bytes and read the C.
+
+    Text assertions, because the thing being tested is a code generator and the
+    text is its output. Run it directly:  python tools/lift/lift32_cpu.py --selftest
+    """
+    lf = Lifter(None, 0x100000)
+    def emit(code):
+        insn = next(lf.md.disasm(code, 0x401000))
+        return " ".join(lf.fpu(insn))
+
+    # fxch st(N) is reported as [st(0), st(N)]: the first operand is always
+    # st(0), so an emitter reading ops[0] swaps st(0) with itself and every
+    # fxch in the program does nothing.
+    for code, want in ((b"\xd9\xc9", 1), (b"\xd9\xca", 2), (b"\xd9\xcd", 5)):
+        out = emit(code)
+        assert f"*fst(c, {want})" in out and "fst(c, 0) = *fst(c, 0)" not in out, \
+            "fxch st(%d) lifted as a no-op: %s" % (want, out)
+
+    # The popping arithmetic names its DESTINATION - `faddp st(1)` is
+    # st(1) += st(0) - which is the opposite of `fadd st(1)`, st(0) += st(1).
+    # Writing to st(0) puts the result in the slot fpop() then discards.
+    assert emit(b"\xde\xc1").startswith("*fst(c, 1) ="), \
+        "faddp st(1) writes the wrong register: " + emit(b"\xde\xc1")
+    assert emit(b"\xde\xca").startswith("*fst(c, 2) ="), \
+        "fmulp st(2) writes the wrong register: " + emit(b"\xde\xca")
+    # ...while the non-popping form still lands in st(0).
+    assert emit(b"\xd8\xc1").startswith("*fst(c, 0) ="), \
+        "fadd st(1) writes the wrong register: " + emit(b"\xd8\xc1")
+    # fsubrp st(1): st(1) = st(0) - st(1), reversed as well as redirected.
+    out = emit(b"\xde\xe1")
+    assert out.startswith("*fst(c, 1) =") and "(*fst(c, 0)) - (*fst(c, 1))" in out, \
+        "fsubrp st(1) is wrong: " + out
+
+    print("lift32_cpu x87 selftest: ok")
+
+
 if __name__ == "__main__":
-    main()
+    if "--selftest" in sys.argv:
+        selftest()
+    else:
+        main()
