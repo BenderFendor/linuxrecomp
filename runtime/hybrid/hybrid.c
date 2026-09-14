@@ -146,6 +146,14 @@ static __declspec(thread) uint8_t  *t_arena;
 static __declspec(thread) uint32_t  t_arena_top;
 static __declspec(thread) uint32_t  t_arena_low;   /* lowest committed byte */
 
+/* The same pointer again, in the one Win32 slot that has a destructor. */
+static DWORD g_fls = FLS_OUT_OF_INDEXES;
+
+static void WINAPI arena_released(void *p)
+{
+    if (p) VirtualFree(p, 0, MEM_RELEASE);
+}
+
 #define R2L_STUB_BYTES 16
 #define R2L_ARGS_COPIED 16      /* enough for any sane calling convention */
 
@@ -199,6 +207,25 @@ static uint64_t __cdecl r2l_helper(uint32_t ova, uint32_t this_, uint32_t *real_
                                           MEM_RESERVE, PAGE_READWRITE);
         if (!t_arena) { arena_failed("reserve"); return 0; }
         t_arena_top = t_arena_low = (uint32_t)(uintptr_t)(t_arena + g_arena_bytes);
+        /* And a way to give it back. `__declspec(thread)` has no destructor,
+         * so a thread that exits leaves its reservation behind forever - and a
+         * game whose thread pool churns leaves dozens. Mario Kart reached 67
+         * arenas at 15 MB, a gigabyte of a two-gigabyte address space, and the
+         * symptom was `operator new` throwing std::bad_alloc with a 125 MB
+         * working set: nothing was allocated, everything was reserved.
+         *
+         * FLS is the Win32 slot that does run a callback on thread exit. The
+         * hot path still reads the TLS variable; this is only the funeral. */
+        if (g_fls != FLS_OUT_OF_INDEXES) FlsSetValue(g_fls, t_arena);
+        {   /* Named once per arena, so a memory map can be read against it:
+             * "44 regions of 15 MB" is only an accusation until the addresses
+             * match. */
+            static volatile LONG n;
+            LONG k = InterlockedIncrement(&n);
+            fprintf(stderr, "[hybrid] arena %ld at %p, %u MB reserved "
+                            "(thread %lu)\n", k, (void *)t_arena,
+                    (unsigned)(g_arena_bytes >> 20), GetCurrentThreadId());
+        }
     }
     save = t_arena_top;
     t_arena_top -= g_frame;
@@ -271,9 +298,16 @@ int hybrid_init(hybrid_invoke_fn invoke, uint32_t frame_bytes, uint32_t arena_by
     /* Not allocated here: each thread takes its own on first crossing, and the
      * thread that calls hybrid_init is often not one of them. */
     g_arena_bytes = arena_bytes;
+    g_fls = FlsAlloc(arena_released);   /* so a thread's arena dies with it */
     g_pool_size = 0x200000u;
     g_pool = (uint8_t *)VirtualAlloc(NULL, g_pool_size, MEM_RESERVE | MEM_COMMIT,
                                      PAGE_EXECUTE_READWRITE);
+    /* Named because a fault "in private memory at 036E0000" is a mystery
+     * until something says that region is the thunk pool. */
+    if (g_pool)
+        fprintf(stderr, "[hybrid] thunk pool at %p, %u KB; r2l_common at %p\n",
+                (void *)g_pool, (unsigned)(g_pool_size >> 10),
+                (void *)(uintptr_t)r2l_common);
     return g_pool != NULL;
 }
 
