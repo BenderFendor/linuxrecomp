@@ -106,7 +106,8 @@ SSE_MNEMONICS = (
                  "ucomiss", "comiss", "ucomisd", "comisd",
                  "cvtsi2ss", "cvtsi2sd", "cvttss2si", "cvttsd2si",
                  "cvtss2si", "cvtsd2si", "cvtss2sd", "cvtsd2ss",
-                 "cvtdq2ps", "cvtps2dq", "cvttps2dq"})
+                 "cvtdq2ps", "cvtps2dq", "cvttps2dq",
+                 "cvtps2pd", "cvtpd2ps"})
     | frozenset(o + w for o in SSE_ARITH for w in ("ss", "sd"))
 )
 
@@ -669,6 +670,22 @@ class Lifter:
             return [f"fpush(c, {self._fmem(insn, memop, 'i')});"]
         if m in ("fldz",): return ["fpush(c, 0.0);"]
         if m in ("fld1",): return ["fpush(c, 1.0);"]
+        # The other five constants the 8087 carries in microcode. A compiler
+        # emits fldln2 and fldl2e for log() and exp() whenever it cannot call
+        # the CRT helper, and fldpi turns up in any code that builds a rotation
+        # - so "rare" they are not. Written to more digits than a double can
+        # hold on purpose: the value that matters is the nearest double to the
+        # real constant, not to a shortened decimal.
+        if m in ("fldpi",):
+            return ["fpush(c, 3.14159265358979323846264338327950288);"]
+        if m in ("fldl2e",):
+            return ["fpush(c, 1.44269504088896340735992468100189214);"]
+        if m in ("fldl2t",):
+            return ["fpush(c, 3.32192809488736234787031942948939018);"]
+        if m in ("fldlg2",):
+            return ["fpush(c, 0.301029995663981195213738894724493027);"]
+        if m in ("fldln2",):
+            return ["fpush(c, 0.693147180559945309417232121458176568);"]
         if m in ("fst", "fstp"):
             pop = "; fpop(c);" if m == "fstp" else ";"
             if memop:
@@ -691,6 +708,31 @@ class Lifter:
         if m in ("frndint",): return ["*fst(c, 0) = nearbyint(*fst(c, 0));"]
         if m in ("fscale",): return ["*fst(c, 0) = ldexp(*fst(c, 0), (int)*fst(c, 1));"]
         if m in ("fsincos",): return ["{ double _s=sin(*fst(c,0)), _c=cos(*fst(c,0)); *fst(c,0)=_s; fpush(c,_c); }"]
+        # The rest of the 8087's transcendental set. These are not exotic: a
+        # compiler builds log() out of `fldln2; fxch; fyl2x` and exp() out of
+        # `fldl2e; fmul; ...; f2xm1; fscale`, so a game that takes a logarithm
+        # anywhere reaches them. Each one consumes st(0) the way the manual
+        # says, which is the only part that is easy to get wrong: fyl2x pops,
+        # f2xm1 does not.
+        if m in ("fyl2x",):        # st(1) = st(1) * log2(st(0)), pop
+            return ["{ double _x = *fst(c, 0), _y = *fst(c, 1);"
+                    " fpop(c); *fst(c, 0) = _y * log2(_x); }"]
+        if m in ("fyl2xp1",):      # st(1) = st(1) * log2(st(0) + 1), pop
+            return ["{ double _x = *fst(c, 0), _y = *fst(c, 1);"
+                    " fpop(c); *fst(c, 0) = _y * log2(_x + 1.0); }"]
+        if m in ("f2xm1",):        # st(0) = 2**st(0) - 1, no pop
+            return ["*fst(c, 0) = pow(2.0, *fst(c, 0)) - 1.0;"]
+        if m in ("fprem", "fprem1"):
+            # Both leave the remainder in st(0) and do not pop. The difference
+            # is the rounding of the implied quotient - truncating for fprem,
+            # to-nearest for fprem1 - which is fmod and remainder exactly.
+            f = "fmod" if m == "fprem" else "remainder"
+            return [f"*fst(c, 0) = {f}(*fst(c, 0), *fst(c, 1));"]
+        if m in ("fxtract",):      # st(0) -> exponent, then push the mantissa
+            return ["{ int _e = 0; double _m = frexp(*fst(c, 0), &_e);"
+                    " *fst(c, 0) = (double)(_e - 1); fpush(c, _m * 2.0); }"]
+        if m in ("ftst",):         # compare st(0) with zero, flags only
+            return ["fcompare(c, *fst(c, 0), 0.0);"]
         if m in ("fxch",):
             # ops[-1], not ops[0]. Capstone prints `fxch st(1)` but reports it
             # with BOTH registers, st(0) first, so ops[0] is always st(0) and
@@ -941,6 +983,38 @@ class Lifter:
                     body.append(f"c->xmm[{n}].i32[{i}] = "
                                 f"sse_cvtt_i32(nearbyintf(_s.f32[{i}]));")
             return [f"{{ XMM _s = {self._xm(insn, s)}; " + " ".join(body) + " }"]
+
+        # ---- the two that change lane width ----
+        #
+        # cvtps2pd reads TWO floats - the low 64 bits - and writes two doubles.
+        # That asymmetry is the whole reason it needs its own case: reading the
+        # source with _xm() would fetch sixteen bytes for an eight-byte
+        # operand, which is a fault the moment the operand sits in the last
+        # eight bytes of a page. So the memory form reads exactly the two
+        # floats it is entitled to.
+        #
+        # Both read the source into locals before writing the destination,
+        # because `cvtps2pd xmm0, xmm0` is real code and the lanes overlap.
+        if m == "cvtps2pd":
+            n = self._xi(d)
+            if self._is_xmm(s):
+                j = self._xi(s)
+                src = f"c->xmm[{j}].f32[0], _b = c->xmm[{j}].f32[1]"
+                return [f"{{ float _a = {src};"
+                        f" c->xmm[{n}].f64[0] = _a; c->xmm[{n}].f64[1] = _b; }}"]
+            return [f"{{ uint32_t _p = {self.addr_expr(insn, s)};"
+                    f" float _a = rdf32(_p), _b = rdf32(_p + 4u);"
+                    f" c->xmm[{n}].f64[0] = _a; c->xmm[{n}].f64[1] = _b; }}"]
+
+        # cvtpd2ps is the other way: two doubles in, two floats into the low 64
+        # bits, and the top 64 bits ZEROED - which is architectural, not tidy,
+        # and code that then reads lane 2 or 3 depends on it.
+        if m == "cvtpd2ps":
+            n = self._xi(d)
+            return [f"{{ XMM _s = {self._xm(insn, s)};"
+                    f" c->xmm[{n}].f32[0] = (float)_s.f64[0];"
+                    f" c->xmm[{n}].f32[1] = (float)_s.f64[1];"
+                    f" c->xmm[{n}].i32[2] = 0; c->xmm[{n}].i32[3] = 0; }}"]
 
         return [_todo(insn.address, f"sse {m} {insn.op_str}")]
 
