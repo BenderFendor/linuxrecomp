@@ -58,6 +58,18 @@ from lift32_cpu import (
 
 IMAGE_BASE = 0x140000000     # overridden from the PE's ImageBase in main()
 
+# The string operations, plus the quadword forms that only exist in long mode.
+#
+# STRING_OPS comes from lift32_cpu and stops at the doubleword, because a
+# 32-bit target has no MOVSQ. Inheriting that set unchanged left movsq, stosq,
+# lodsq, scasq and cmpsq falling through to a RECOMP_TODO - and `rep movsq` is
+# how a 64-bit compiler inlines a structure copy, so the gap sits directly in
+# the path of anything that copies memory. It aborted Battle Pods inside the
+# package loader the moment the packages actually started loading.
+STRING_OPS64 = STRING_OPS | frozenset((
+    'movsq', 'stosq', 'lodsq', 'scasq', 'cmpsq',
+))
+
 
 # ---- register tables -------------------------------------------------------
 #
@@ -713,7 +725,7 @@ class Lifter:
         # left unstripped every one becomes an abort at the point a function
         # tries to return.
         _p = m.split()
-        if len(_p) > 1 and _p[0] in REP_PREFIXES and _p[-1] not in STRING_OPS:
+        if len(_p) > 1 and _p[0] in REP_PREFIXES and _p[-1] not in STRING_OPS64:
             m = _p[-1]
 
         def two():
@@ -1035,7 +1047,7 @@ class Lifter:
 
         # ---- string ops ----
         parts = m.split()
-        if parts[-1] in STRING_OPS:
+        if parts[-1] in STRING_OPS64:
             return self.string_op(insn, parts)
 
         # ---- control flow ----
