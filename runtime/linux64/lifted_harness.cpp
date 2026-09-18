@@ -295,6 +295,7 @@ int main(int argc, char **argv) {
 
     const char *path = argv[1];
     uint64_t function_va = 0;
+    size_t import_count = 0;
     if (parse_u64(argv[2], &function_va) != 0) {
         std::fprintf(stderr, "lifted: bad function address %s\n", argv[2]);
         return 1;
@@ -362,6 +363,23 @@ int main(int argc, char **argv) {
 
     trace("image mapped at %#" PRIx64 " size %#" PRIx64 ", entry %#" PRIx64,
           image.image_base, image.size_of_image, image.image_base + image.entry_rva);
+
+    /* Bind the image's imports to the host's implementations. The host may be able
+     * to resolve none of them, which is not an error: it is why a run that reaches
+     * an import stops. */
+    static import_table imports;
+    {
+        char import_error[256];
+        if (imports_bind(&image, &imports, import_error, sizeof(import_error)) != 0) {
+            std::fprintf(stderr, "lifted: %s\n", import_error);
+            pe_unmap(&image);
+            return 1;
+        }
+        lifted_set_imports(&imports);
+        trace("imports: %zu bound, %zu unresolved, host=%s", imports.count, imports.unresolved,
+              imports_host_available() ? "wine" : "none");
+    }
+    import_count = imports.count;
     trace("reserving the guest stack");
     /* Address 0: the host picks. Only the guest image is address-bound, because
      * only the image's address is something the guest itself depends on. */

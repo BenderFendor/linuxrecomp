@@ -50,7 +50,6 @@ StopContext *g_current = nullptr;
 
 const char *reason_name(StopReason reason);
 void trace_dispatch(const char *format, ...);
-
 StopReason g_reason = StopReason::kReturned;
 uint64_t g_stop_pc = 0;
 char g_detail[256];
@@ -68,6 +67,33 @@ size_t g_missing_count = 0;
  * instruction results). This runtime answers zero and reports them when asked,
  * rather than pretending the value was defined. */
 bool g_report_undefined = false;
+
+/* Imports the host bound for this image, if any. */
+const import_table *g_imports = nullptr;
+
+/* Call a host import the way its own ABI expects.
+ *
+ * The guest convention is the Microsoft x64 one: four arguments in RCX, RDX, R8
+ * and R9, further arguments on the guest stack above the return address, and the
+ * result in RAX. A Win32 import is called with that same convention, so the
+ * function pointer types carry ms_abi; calling through a SysV pointer into a Win32
+ * function works by luck rather than by contract, and stops working as soon as
+ * the callee spills its register arguments into the home area its ABI gives it.
+ *
+ * Eight arguments are always passed. A callee reads only the arguments it declares,
+ * so extra ones are harmless, and they are read from the guest's own stack, which is
+ * exactly where a real call would have left them.
+ */
+#define IMPORT_ARGS 8
+
+uint64_t call_host_import(uint64_t address, const uint64_t *arguments) {
+    typedef uint64_t(__attribute__((ms_abi)) * function_pointer)(uint64_t, uint64_t, uint64_t,
+                                                                 uint64_t, uint64_t, uint64_t,
+                                                                 uint64_t, uint64_t);
+    function_pointer function = (function_pointer)(uintptr_t)address;
+    return function(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4],
+                    arguments[5], arguments[6], arguments[7]);
+}
 
 Memory *halt(StopReason reason, uint64_t pc, const char *detail) {
     trace_dispatch("halt %s at %#" PRIx64 " (%s)", reason_name(reason), pc,
@@ -253,6 +279,8 @@ Memory *compare_exchange(Memory *memory, uint64_t address, T *expected, T desire
     return memory;
 }
 
+
+
 }  // namespace
 
 uint8_t *guest_ptr(Memory *memory, uint64_t address, uint64_t length) {
@@ -286,6 +314,14 @@ StopReason lifted_run_dispatched(uint64_t va, State *state, Memory *memory) {
 
 void lifted_report_undefined(bool enabled) { g_report_undefined = enabled; }
 
+void lifted_set_imports(const import_table *table) {
+    g_imports = table;
+}
+
+size_t lifted_import_count(void) {
+    return g_imports ? g_imports->count : 0;
+}
+
 void lifted_set_memory_trace(bool enabled) { g_trace_memory = enabled; }
 
 void lifted_set_dispatch_trace(bool enabled) { g_trace_dispatch = enabled; }
@@ -307,6 +343,10 @@ uint64_t lifted_missing_target(size_t index) {
 }
 
 extern "C" {
+
+/* Declared here, where the dispatcher that uses it lives, so it has the same
+ * linkage as its definition. */
+Memory *call_import(State *state, const import_entry *import, Memory *memory);
 
 StopReason lifted_stop_reason(void) { return g_reason; }
 uint64_t lifted_stop_pc(void) { return g_stop_pc; }
@@ -395,6 +435,45 @@ bool __remill_compare_uge(bool result) { return result; }
  * itself, so this records where control went and returns normally: a direct call
  * chain resolves through the linker, and the caller's lifted code continues on
  * its own. Halting here would abandon callers that are still running. */
+/* Call one bound import and leave the guest in the state a real call would.
+ *
+ * The lifted `call` has already pushed the return address on the guest stack, so
+ * the import's own `ret` is emulated by popping it. The result goes to RAX, which is
+ * where the Microsoft x64 convention returns an integer or a pointer. */
+Memory *call_import(State *state, const import_entry *import, Memory *memory) {
+    uint64_t arguments[IMPORT_ARGS];
+    arguments[0] = state->gpr.rcx.qword;
+    arguments[1] = state->gpr.rdx.qword;
+    arguments[2] = state->gpr.r8.qword;
+    arguments[3] = state->gpr.r9.qword;
+
+    const uint64_t stack_pointer = state->gpr.rsp.qword;
+    for (int i = 4; i < IMPORT_ARGS; i++) {
+        /* Above the return address: [rsp+8] is the fifth argument. */
+        uint8_t *slot = guest_ptr(memory, stack_pointer + 8 * (i - 3), 8);
+        if (!slot) {
+            arguments[i] = 0;
+            continue;
+        }
+        uint64_t value = 0;
+        std::memcpy(&value, slot, sizeof(value));
+        arguments[i] = value;
+    }
+
+    trace_dispatch("import %s!%s%u at %p arg0=%#llx arg1=%#llx", import->dll,
+                   import->by_ordinal ? "#" : "", import->by_ordinal ? import->ordinal : 0,
+                   (void *)(uintptr_t)import->host_address,
+                   (unsigned long long)arguments[0], (unsigned long long)arguments[1]);
+
+    const uint64_t result = call_host_import(import->host_address, arguments);
+
+    state->gpr.rax.qword = result;
+    state->gpr.rsp.qword = stack_pointer + 8; /* the callee's ret */
+    trace_dispatch("import %s returned %#llx", import->name[0] ? import->name : import->dll,
+                   (unsigned long long)result);
+    return memory;
+}
+
 Memory *__remill_function_return(State &, uint64_t address, Memory *memory) {
     g_reason = StopReason::kReturned;
     g_stop_pc = address;
@@ -403,6 +482,9 @@ Memory *__remill_function_return(State &, uint64_t address, Memory *memory) {
 }
 
 Memory *__remill_function_call(State &state, uint64_t target, Memory *memory) {
+    if (const import_entry *import = imports_find_host(g_imports, target)) {
+        return call_import(&state, import, memory);
+    }
     if (!lifted_lookup(target)) {
         record_missing(target);
         char detail[96];

@@ -18,6 +18,7 @@
 #include <cstdint>
 
 #include "image_pe64.h"
+#include "imports.h"
 
 #include <remill/Arch/X86/Runtime/State.h>
 
@@ -57,6 +58,12 @@ void lifted_report_undefined(bool enabled);
 /* Print every guest memory access. For diagnosing an unexplained fault, where
  * the last access before it is the useful clue. */
 void lifted_set_memory_trace(bool enabled);
+
+/* Imports the host bound for this image. The dispatcher uses the table to tell a
+ * call to a host import (whose target is a host address, not a guest one) from a
+ * call to lifted guest code. */
+void lifted_set_imports(const import_table *table);
+size_t lifted_import_count(void);
 
 /* Print each trace boundary: entry, finish and halt. For locating a fault that
  * the host cannot report. */
