@@ -78,6 +78,29 @@ static unsigned g_at_n;
  * existed. N is zero-based and counts the stack arguments only, so for a
  * thiscall the `this` is ecx and N=0 is the first declared parameter.
  */
+/*
+ * --chase VA OFFSETS: follow a pointer chain from ecx, every entry to VA.
+ *
+ * The field that matters is rarely in the object a method is called on. It is
+ * two or three hops away -- `this->device->batch->buffer` -- and each hop's
+ * address is different every run, so --watch and --poison cannot get there:
+ * --watch dumps one object, and --poison needs an address you do not have
+ * until the run is already past the point you wanted to look at.
+ *
+ * OFFSETS is a comma-separated list, and each hop prints its value and the
+ * word at that value, which is the vtable for anything with one -- so
+ * rtti.json names every object on the way down.
+ *
+ *   --chase 0x0071E850 0xC,0x98
+ *   [chase] 0x0071E850 ecx=11EABFD0 [007D39A4]  +0C=11EAC020 [007CF138]
+ *                                               +98=00000000
+ */
+#define TRACE_CHASE_MAX 4
+#define TRACE_CHASE_HOPS 6
+static struct { uint32_t va; unsigned n; uint32_t off[TRACE_CHASE_HOPS]; }
+    g_chase[TRACE_CHASE_MAX];
+static unsigned g_chase_n;
+
 #define TRACE_ARGOBJ_MAX 4
 static struct { uint32_t va; unsigned n; } g_argobj[TRACE_ARGOBJ_MAX];
 static unsigned g_argobj_n;
@@ -183,6 +206,19 @@ void recomp_trace_enter(uint32_t va) {
             fprintf(stderr, "\n");
         }
     }
+    for (unsigned w = 0; w < g_chase_n; w++) {
+        if (g_chase[w].va != va) continue;
+        uint32_t p = g_ecx;
+        fprintf(stderr, "[chase] 0x%08X ecx=%08X", va, p);
+        if (p >= 0x00200000u) fprintf(stderr, " [%08X]", MEM32(p));
+        for (unsigned k = 0; k < g_chase[w].n; k++) {
+            if (p < 0x00200000u) { fprintf(stderr, "  +%02X=?", g_chase[w].off[k]); break; }
+            p = MEM32(p + g_chase[w].off[k]);
+            fprintf(stderr, "  +%02X=%08X", g_chase[w].off[k], p);
+            if (p >= 0x00200000u) fprintf(stderr, " [%08X]", MEM32(p));
+        }
+        fprintf(stderr, "\n");
+    }
     if (recomp_trace_extra) recomp_trace_extra(va);
 }
 
@@ -224,6 +260,20 @@ int recomp_trace_arg(int argc, char** argv, int i) {
         g_watch[g_watch_n++] = TRACE_U32(argv[i + 1]);
         return 2;
     }
+    if (!strcmp(a, "--chase") && i + 2 < argc && g_chase_n < TRACE_CHASE_MAX) {
+        g_chase[g_chase_n].va = TRACE_U32(argv[i + 1]);
+        const char* q = argv[i + 2];
+        unsigned n = 0;
+        while (*q && n < TRACE_CHASE_HOPS) {
+            g_chase[g_chase_n].off[n++] = (uint32_t)strtoul(q, NULL, 0);
+            const char* comma = strchr(q, ',');
+            if (!comma) break;
+            q = comma + 1;
+        }
+        g_chase[g_chase_n].n = n;
+        g_chase_n++;
+        return 3;
+    }
     if (!strcmp(a, "--argobj") && i + 2 < argc
             && g_argobj_n < TRACE_ARGOBJ_MAX) {
         g_argobj[g_argobj_n].va = TRACE_U32(argv[i + 1]);
@@ -261,7 +311,8 @@ void recomp_trace_flush(void) { }
 int recomp_trace_arg(int argc, char** argv, int i) {
     static const struct { const char* name; int takes; } opts[] = {
         {"--calltrace", 2}, {"--firsthit", 3}, {"--argtrace", 2},
-        {"--watch", 2}, {"--watchspan", 3}, {"--argobj", 3}, {"--poison", 2},
+        {"--watch", 2}, {"--watchspan", 3}, {"--argobj", 3}, {"--chase", 3},
+        {"--poison", 2},
         {"--poisonval", 2}, {"--poke", 4},
     };
     for (unsigned k = 0; k < sizeof opts / sizeof opts[0]; k++)
@@ -283,6 +334,7 @@ void recomp_trace_help(void) {
         "  --watch VA            registers, arguments and the object at ecx\n"
         "  --watchspan LO HI     move the [ecx+..] window --watch dumps\n"
         "  --argobj VA N         vtable and first 0x40 bytes of argument N\n"
+        "  --chase VA OFFSETS    follow a pointer chain from ecx (0xC,0x98)\n"
         "  --poison ADDR         report every change of a target dword\n"
         "  --poisonval V         ...only when it becomes V\n"
         "  --poke ADDR VAL VA    write one byte on first entry to VA\n");

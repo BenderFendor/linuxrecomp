@@ -271,6 +271,88 @@ Complete DOS environment simulation:
 
 All backed by SDL2 for actual display/input.
 
+### Anything that SENDS a message blocks on a thread that may never pump
+
+A recompiled program's windows do not belong to the threads a native program's
+would. The host makes one before the target runs; the target makes its own
+from whatever host thread its worker landed on; and the host's main thread is
+usually inside lifted code from the entry point until the program exits, so it
+never pumps anything.
+
+Every `SendMessage`-shaped call then becomes a deadlock waiting for a specific
+thread: `UpdateWindow`, `ShowWindow`, `SetWindowPos` without
+`SWP_NOSENDCHANGING`, `SetForegroundWindow`. One project hung on the very first
+`Flip` the program issued because the present path called `UpdateWindow`, and
+hung again later on a `ShowWindow` meant to hide a window.
+
+`GetDC` / `BitBlt` / `ReleaseDC` on another thread's window is fine and does
+not wait for anybody -- which is worth knowing, because "cross-thread GDI is
+too slow" is an easy wrong conclusion to draw from a hang. Measured on the
+same project: 4,400 presents in 130 s into another thread's window. If a
+window needs to be visible, create it visible; if it needs to be hidden, do
+not create it.
+
+### A timer callback is a thread you already know how to run
+
+`timeSetEvent`, `SetTimer` with a TIMERPROC, waitable-timer APC callbacks: the
+callback is lifted code, and "lifted code cannot run on a host thread" is only
+true until `CreateThread` is implemented. After that a timer is the same
+machinery -- a host thread with its own target stack, its own simulated TIB and
+its own saved machine state, claiming the global machine lock around each call
+-- and returning a handle while never calling back is a silent stub in an area
+where the program will not tell you it is broken. iMUSE, for one, runs its
+whole music script on a 20 ms multimedia timer.
+
+Watch the budget when you do it: a program that creates and kills its timer
+four times during audio startup will leak four thread slots if each gets a
+fresh stack. One stack per timer SLOT, not per timer.
+
+### A no-op shim for a RECORDING API is not neutral
+
+The usual rule for a shim is that doing nothing is the safe default: return
+success, leave the out-parameters alone, add behaviour when something is
+measured to want it. That rule breaks for any API whose contract is "from now
+until I say stop, do not act on what I tell you".
+
+Direct3D 7's state blocks are the case that taught this. Between
+`BeginStateBlock` and `EndStateBlock` the runtime RECORDS state-setting calls
+instead of applying them, and `ApplyStateBlock` applies the recorded set. With
+all three stubbed, every state in every block was applied the instant it was
+RECORDED -- and never applied again -- so the live device state at every draw
+was whatever the last block to be BUILT had happened to want. The symptom was
+a 3D scene drawn with a 2D overlay's blend mode and depth settings, which
+looks like a renderer bug and is a shim bug.
+
+The same shape turns up in transactions, batched updates, deferred contexts,
+display lists and any "begin/end capture" pair. If a stub cannot both suppress
+and replay, it is not a stub, it is a behaviour change. The fix is small --
+record `(kind, args)` into an array and replay it -- and it is much smaller
+than finding it later.
+
+### Report every failed file operation, unconditionally
+
+Failed opens are usually logged; failed directory ENUMERATIONS usually are
+not, because they are noisy in the normal case of a loose-file lookup falling
+back to an archive. Log them anyway, outside the verbose flag.
+
+An empty directory and a missing one are indistinguishable to the caller, and
+a program that enumerates a directory it needs, gets nothing and waits for
+something that will never arrive says nothing at all about why. One
+unconditional line -- `FindFirstFileA("...\Players") -> not found` -- is worth
+more than the whole verbose trace it would otherwise be buried in.
+
+### A retail install is not the disc
+
+The installer copies and RENAMES. Assembling an install by hand from a mounted
+image gets the 8.3 names out of the ISO-9660 tree (`1201-O~1.IMU`) while the
+program asks for what the installer wrote (`1201 - OpeningScreen.imu`), so
+read the **Joliet** tree instead: the supplementary volume descriptor at
+sector 17, escape `%/@`, `%/C` or `%/E`, names in UCS-2.
+
+And check what is missing before blaming the recompilation. One project ran
+for a long time with `Resource\Music` and `Resource\Movies` simply absent --
+260 MB the install step had never copied -- with the program silent about it.
+
 ### DRM Removal (`tools/drm/`)
 
 - **SafeDisc v1**: `safedisc_dump.py` -- launch via Steam, dump decrypted .text section

@@ -91,8 +91,11 @@ SSE_CMP_PRED = {
 SSE_CMP_RE = re.compile(r"^cmp(%s)(ss|sd)$" % "|".join(SSE_CMP_PRED))
 
 # Moves of the whole register. Aligned and unaligned differ only in whether the
-# hardware faults on a misaligned address; both memcpy here.
-SSE_MOV128 = frozenset({"movaps", "movups", "movapd", "movupd", "movdqa", "movdqu"})
+# hardware faults on a misaligned address; the movnt* forms differ only in a
+# cache hint, which a host that is not managing the guest cache can ignore.
+# They are all a 128-bit copy here.
+SSE_MOV128 = frozenset({"movaps", "movups", "movapd", "movupd", "movdqa", "movdqu",
+                        "movntps", "movntpd", "movntdq"})
 
 # Mnemonics that are SSE only when an XMM register is involved. `movsd` is also
 # "move string dword"; `movq`/`movd` and every `p*` op below are also MMX, where
@@ -102,13 +105,15 @@ SSE_AMBIGUOUS = frozenset({"movsd", "movq", "movd", "pxor", "pand", "por", "pand
 
 SSE_MNEMONICS = (
     SSE_MOV128 | SSE_AMBIGUOUS | frozenset(SSE_BITWISE)
-    | frozenset({"movss", "sqrtss", "sqrtsd", "minss", "maxss", "minsd", "maxsd",
+    | frozenset({"movss", "sqrtss", "sqrtsd", "sqrtps",
+                 "shufps", "unpcklps", "unpckhps",
+                 "minps", "maxps", "minpd", "maxpd", "minss", "maxss", "minsd", "maxsd",
                  "ucomiss", "comiss", "ucomisd", "comisd",
                  "cvtsi2ss", "cvtsi2sd", "cvttss2si", "cvttsd2si",
                  "cvtss2si", "cvtsd2si", "cvtss2sd", "cvtsd2ss",
                  "cvtdq2ps", "cvtps2dq", "cvttps2dq",
                  "cvtps2pd", "cvtpd2ps"})
-    | frozenset(o + w for o in SSE_ARITH for w in ("ss", "sd"))
+    | frozenset(o + w for o in SSE_ARITH for w in ("ss", "sd", "ps", "pd"))
 )
 
 def reg_read(name):
@@ -338,6 +343,37 @@ class Lifter:
         def two(): return ops[0], ops[1]
         def sz0(): return ops[0].size
 
+        # ---- bit test and friends ----
+        if m in ("bt", "bts", "btr", "btc"):
+            opnum = {"bt": 0, "bts": 1, "btr": 2, "btc": 3}[m]
+            d, s2 = ops[0], ops[1]
+            idx = self.src(insn, s2)
+            if d.type == X86_OP_MEM:
+                return ["bit_string_op(c, %s, (int32_t)(%s), %d);"
+                        % (self.addr_expr(insn, d), idx, opnum)]
+            return ["bit_reg_op(c, &c->%s, %s, %d);"
+                    % (self.md.reg_name(d.reg), idx, opnum)]
+
+        # ---- LOCK-prefixed read-modify-write ----
+        # Capstone folds the prefix into the mnemonic. Only the forms that turn
+        # up are here: these are what libstdc++ compiles a reference count to,
+        # and a game with several threads sharing strings really does race on
+        # them. Anything else keeps its TODO rather than quietly losing the
+        # atomicity, which would fail as a use-after-free somewhere unrelated.
+        if m.startswith("lock "):
+            base = m[5:]
+            d, s2 = (ops[0], ops[1]) if len(ops) > 1 else (ops[0], None)
+            if base in ("add", "xadd") and d.type == X86_OP_MEM and s2 is not None:
+                addr = self.addr_expr(insn, d)
+                val = self.src(insn, s2)
+                out = ["{ uint32_t _old = atomic_xadd32(%s, %s);" % (addr, val)]
+                if base == "xadd":
+                    # xadd hands the register the value memory held before.
+                    out[0] += " " + reg_write(self.md.reg_name(s2.reg), "_old")
+                out[0] += " flags_add(c, _old, %s, 4); }" % val
+                return out
+            return [f"RECOMP_TODO(0x{ea:08X}, \"{m} {insn.op_str}\");"]
+
         if m[0] == "f":
             return self.fpu(insn)
         if self.is_sse(insn):
@@ -399,6 +435,13 @@ class Lifter:
             fn = "op_rol" if m == "rol" else "op_ror"
             return [self.dst_write(insn, d,
                                    f"{fn}(c, {self._read_dst(insn,d)}, {cnt}, {d.size})")]
+        if m == "bswap":
+            # Register only, and 32-bit only: the 16-bit encoding is undefined
+            # on real parts, so anything else here is data read as code.
+            d = ops[0]
+            if d.size == 4:
+                return [self.dst_write(insn, d,
+                                       f"op_bswap32({self._read_dst(insn, d)})")]
         if m in ("shld", "shrd"):
             d, s2 = ops[0], ops[1]
             cnt = self.src(insn, ops[2]) if len(ops) > 2 else "R8L(c->ecx)"
@@ -645,7 +688,9 @@ class Lifter:
 
     def _fmem(self, insn, op, kind):
         a = self.addr_expr(insn, op); sz = op.size
-        if kind == "f":  return f"rdf32({a})" if sz == 4 else f"rdf64({a})"
+        if kind == "f":
+            if sz == 10: return f"rdf80({a})"      # x87 extended, explicit integer bit 
+            return f"rdf32({a})" if sz == 4 else f"rdf64({a})"
         return {2: f"rdi16({a})", 4: f"rdi32({a})", 8: f"rdi64({a})"}[sz]
 
     def fpu(self, insn):
@@ -660,7 +705,13 @@ class Lifter:
         # BCD, and `fldenv`/`fnstenv`/`fsave`/`frstor` move the whole 28-byte
         # FPU environment. None of those fit, and reading eight of ten bytes as
         # a double produces a number that looks plausible and is not.
-        if memop is not None and memop.size in (10, 28, 94, 108):
+        # `fld tbyte` and `fstp tbyte` are now honoured - see rdf80/wrf80 - but
+        # the rest of the wide operands still are not. fbld/fbstp read and write
+        # packed BCD, which is ten bytes of something else entirely, and
+        # fldenv/fnstenv/fsave/frstor move the whole FPU environment.
+        if m in ("fbld", "fbstp"):
+            return [_todo(insn.address, f"x87 packed BCD: {m} {insn.op_str}")]
+        if memop is not None and memop.size in (28, 94, 108):
             return [_todo(insn.address, f"x87 m{memop.size * 8}: {m} {insn.op_str}")]
 
         if m in ("fld",):
@@ -690,7 +741,7 @@ class Lifter:
             pop = "; fpop(c);" if m == "fstp" else ";"
             if memop:
                 sz = memop.size; a = self.addr_expr(insn, memop)
-                st = "wrf32" if sz == 4 else "wrf64"
+                st = "wrf32" if sz == 4 else ("wrf80" if sz == 10 else "wrf64")
                 return [f"{st}({a}, *fst(c, 0)){pop}"]
             return [f"*fst(c, {self._st_idx(ops[0])}) = *fst(c, 0){pop}"]
         if m in ("fist", "fistp"):
@@ -698,6 +749,19 @@ class Lifter:
             sz = memop.size; a = self.addr_expr(insn, memop)
             st = {2: "wri16", 4: "wri32", 8: "wri64"}[sz]
             return [f"{st}({a}, *fst(c, 0)){pop}"]
+        if m in ("fprem", "fprem1"):
+            return ["*fst(c, 0) = fprem_op(c, *fst(c, 0), *fst(c, 1));"]
+        if m.startswith("fcmov"):
+            # Conditional move between x87 registers, on the integer flags the
+            # preceding fucomi or test left behind. Same conditions as cmovcc,
+            # spelled the FPU way: fcmovb/fcmove/fcmovbe/fcmovu and their
+            # negations.
+            tail = m[5:]
+            cond = {"b": "c->cf", "e": "c->zf", "be": "(c->cf || c->zf)",
+                    "u": "c->pf", "nb": "!c->cf", "ne": "!c->zf",
+                    "nbe": "(!c->cf && !c->zf)", "nu": "!c->pf"}.get(tail)
+            if cond:
+                return [f"if ({cond}) *fst(c, 0) = *fst(c, {self._st_idx(ops[-1])});"]
         if m in ("fchs",): return ["*fst(c, 0) = -*fst(c, 0);"]
         if m in ("fabs",): return ["*fst(c, 0) = fabs(*fst(c, 0));"]
         if m in ("fsqrt",): return ["*fst(c, 0) = sqrt(*fst(c, 0));"]
@@ -746,6 +810,10 @@ class Lifter:
             # into an infinite loop - the game subtracted its step from the
             # wrong register, the step was negative, and the guest thread never
             # came out of the frame it was in.
+            #
+            # Found twice, independently, on two branches that reached the same
+            # line of code. Which is the argument for one toolbox and not
+            # three.
             i = self._st_idx(ops[-1]) if ops else 1
             return [f"{{ double _t = *fst(c, 0); *fst(c, 0) = *fst(c, {i}); *fst(c, {i}) = _t; }}"]
         if m in ("fadd","fsub","fsubr","fmul","fdiv","fdivr",
@@ -929,6 +997,48 @@ class Lifter:
             rd_ = self._sd if wide else self._ss
             fn = f"sse_{m[:3]}{'d' if wide else 'f'}"
             return [f"{rd_(insn, d)} = {fn}({rd_(insn, d)}, {rd_(insn, s)});"]
+
+        # ---- packed arithmetic, lane by lane ----
+        if m[:-2] in SSE_ARITH and m[-2:] in ("ps", "pd"):
+            wide = m[-2:] == "pd"
+            n, lanes, fld = self._xi(d), (2 if wide else 4), ("f64" if wide else "f32")
+            op = SSE_ARITH[m[:-2]]
+            return ["{ XMM _s = %s; for (int _i = 0; _i < %d; _i++)"
+                    " c->xmm[%d].%s[_i] = c->xmm[%d].%s[_i] %s _s.%s[_i]; }"
+                    % (self._xm(insn, s), lanes, n, fld, n, fld, op, fld)]
+        if m in ("minps", "maxps", "minpd", "maxpd"):
+            wide = m.endswith("pd")
+            n, lanes, fld = self._xi(d), (2 if wide else 4), ("f64" if wide else "f32")
+            fn = "sse_%s%s" % (m[:3], "d" if wide else "f")
+            return ["{ XMM _s = %s; for (int _i = 0; _i < %d; _i++)"
+                    " c->xmm[%d].%s[_i] = %s(c->xmm[%d].%s[_i], _s.%s[_i]); }"
+                    % (self._xm(insn, s), lanes, n, fld, fn, n, fld, fld)]
+        if m in ("sqrtps",):
+            n = self._xi(d)
+            return ["{ XMM _s = %s; for (int _i = 0; _i < 4; _i++)"
+                    " c->xmm[%d].f32[_i] = sqrtf(_s.f32[_i]); }"
+                    % (self._xm(insn, s), n)]
+
+        # ---- lane shuffles ----
+        # Every one of these reads the destination while writing it, so the
+        # destination has to be copied first. Writing lane 0 before reading
+        # lane 2 for lane 1 is the classic way to get this subtly wrong.
+        if m == "shufps":
+            n = self._xi(d)
+            imm = insn.operands[2].imm & 0xFF
+            sel = [(imm >> 0) & 3, (imm >> 2) & 3, (imm >> 4) & 3, (imm >> 6) & 3]
+            return ["{ XMM _d = c->xmm[%d], _s = %s;"
+                    " c->xmm[%d].f32[0] = _d.f32[%d]; c->xmm[%d].f32[1] = _d.f32[%d];"
+                    " c->xmm[%d].f32[2] = _s.f32[%d]; c->xmm[%d].f32[3] = _s.f32[%d]; }"
+                    % (n, self._xm(insn, s), n, sel[0], n, sel[1], n, sel[2], n, sel[3])]
+        if m in ("unpcklps", "unpckhps"):
+            n = self._xi(d)
+            lo = m == "unpcklps"
+            a, b = (0, 1) if lo else (2, 3)
+            return ["{ XMM _d = c->xmm[%d], _s = %s;"
+                    " c->xmm[%d].f32[0] = _d.f32[%d]; c->xmm[%d].f32[1] = _s.f32[%d];"
+                    " c->xmm[%d].f32[2] = _d.f32[%d]; c->xmm[%d].f32[3] = _s.f32[%d]; }"
+                    % (n, self._xm(insn, s), n, a, n, a, n, b, n, b)]
 
         # ---- compares that set flags ----
         if m in ("ucomiss", "comiss", "ucomisd", "comisd"):

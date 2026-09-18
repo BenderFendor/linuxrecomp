@@ -278,6 +278,20 @@ static inline uint32_t op_ror(CPU *c, uint32_t v, uint32_t cnt, int sz) {
     return r;
 }
 
+/* ---- byte order ----
+ *
+ * bswap reverses the four bytes of a 32-bit register and touches no flags.
+ * It is how a compiler writes htonl/ntohl inline, so it turns up in any code
+ * that opens a socket, next to a `ror bx, 8` doing the 16-bit half.
+ *
+ * The 16-bit form is architecturally undefined - Intel documents it as such
+ * and real parts leave the register zeroed - so a compiler never emits it and
+ * this deliberately does not pretend to implement it. */
+static inline uint32_t op_bswap32(uint32_t v) {
+    return (v >> 24) | ((v >> 8) & 0x0000FF00u)
+         | ((v << 8) & 0x00FF0000u) | (v << 24);
+}
+
 /* ---- double-precision shifts: shift `d`, feeding in bits from `s` ---- */
 static inline uint32_t op_shld(CPU *c, uint32_t d, uint32_t s, uint32_t cnt, int sz) {
     uint32_t m = mask_sz(sz); int w = sz * 8;
@@ -420,6 +434,107 @@ static inline double sse_maxd(double d, double s) { return (d > s) ? d : s; }
  * and may trap. One comparison buys a defined answer that matches hardware. */
 static inline int32_t sse_cvtt_i32(double v) {
     return (v >= -2147483648.0 && v < 2147483648.0) ? (int32_t)v : (int32_t)0x80000000;
+}
+
+/* ---- BT / BTS / BTR / BTC ----
+ *
+ * With a memory destination and a register bit index, the index is NOT masked
+ * to the operand size: it selects a dword away from the base address, which is
+ * how a bitmap of arbitrary size gets addressed. Masking it the way the
+ * register form does would quietly read and write the wrong word - the kind of
+ * wrong that shows up as unrelated corruption much later.
+ *
+ * op: 0 test, 1 set, 2 reset, 3 complement. CF receives the bit as it was. */
+static inline uint32_t bit_string_op(CPU *c, uint32_t addr, int32_t idx, int op)
+{
+    uint32_t a = addr + 4u * (uint32_t)(idx >> 5);
+    unsigned b = (unsigned)(idx & 31);
+    uint32_t w = rd32(a);
+    c->cf = (w >> b) & 1u;
+    if      (op == 1) w |=  (1u << b);
+    else if (op == 2) w &= ~(1u << b);
+    else if (op == 3) w ^=  (1u << b);
+    if (op) wr32(a, w);
+    return c->cf;
+}
+
+/* The register form, where the index really is taken modulo the width. */
+static inline uint32_t bit_reg_op(CPU *c, uint32_t *r, uint32_t idx, int op)
+{
+    unsigned b = idx & 31u;
+    c->cf = (*r >> b) & 1u;
+    if      (op == 1) *r |=  (1u << b);
+    else if (op == 2) *r &= ~(1u << b);
+    else if (op == 3) *r ^=  (1u << b);
+    return c->cf;
+}
+
+/* ---- 80-bit extended precision ----
+ *
+ * The x87 stack here is modelled as doubles, which is right for almost
+ * everything - but `fld tbyte` and `fstp tbyte` name the hardware's own
+ * 80-bit format directly, and a compiler emits them to spill a register
+ * without losing precision. Reading one as anything else returns nonsense.
+ *
+ * The format is a sign bit, a 15-bit exponent biased by 16383, and a 64-bit
+ * mantissa whose integer bit is EXPLICIT - unlike float and double, where it
+ * is implied. Converting to double loses the extra bits, which is the same
+ * loss the rest of this model already accepts.
+ */
+static inline double rdf80(uint32_t a)
+{
+    unsigned char b[10];
+    memcpy(b, (void *)(uintptr_t)a, 10);
+
+    uint64_t mant;
+    uint16_t se;
+    memcpy(&mant, b, 8);
+    memcpy(&se, b + 8, 2);
+
+    int sign = (se >> 15) & 1;
+    int exp  = se & 0x7FFF;
+
+    if (exp == 0 && mant == 0) return sign ? -0.0 : 0.0;
+    if (exp == 0x7FFF) {
+        if (mant << 1) return (double)NAN;
+        return sign ? -(double)INFINITY : (double)INFINITY;
+    }
+    double m = (double)mant * 5.4210108624275222e-20;   /* 2^-64 */
+    return ldexp(sign ? -m : m, exp - 16383 + 1);
+}
+
+static inline void wrf80(uint32_t a, double v)
+{
+    unsigned char b[10];
+    uint64_t mant = 0;
+    uint16_t se = 0;
+
+    memset(b, 0, sizeof b);
+    if (v != v) {                                   /* NaN */
+        se = 0x7FFF; mant = 0xC000000000000000ull;
+    } else if (v == (double)INFINITY || v == -(double)INFINITY) {
+        se = 0x7FFF; mant = 0x8000000000000000ull;
+        if (v < 0) se |= 0x8000;
+    } else if (v != 0.0) {
+        int e;
+        double m = frexp(v < 0 ? -v : v, &e);        /* m in [0.5, 1) */
+        mant = (uint64_t)ldexp(m, 64);
+        se = (uint16_t)((e - 1 + 16383) & 0x7FFF);
+        if (v < 0) se |= 0x8000;
+    }
+    memcpy(b, &mant, 8);
+    memcpy(b + 8, &se, 2);
+    memcpy((void *)(uintptr_t)a, b, 10);
+}
+
+/* FPREM: the remainder of st0/st1 with the quotient truncated toward zero,
+ * which is what fmod computes. The hardware may reduce only partially and set
+ * C2 to say "call me again"; computing the whole thing at once means C2 is
+ * always clear, and the loop the compiler wrote around it runs once. */
+static inline double fprem_op(CPU *c, double a, double b)
+{
+    c->fpu_sw &= ~0x0400u;              /* C2 = 0: reduction complete */
+    return fmod(a, b);
 }
 
 #endif /* PCRECOMP_CPU_H */

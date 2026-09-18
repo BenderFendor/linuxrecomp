@@ -268,10 +268,14 @@ PSHUF = {
     'pshufhw': ('u16', 4, 4, 8),
 }
 
-# The non-temporal stores. Identical to their ordinary forms here: the hint is
-# about the host's cache, which a recompiler is not managing. UE3's texture and
-# vertex uploads use them, so a 64-bit target meets them early.
-SSE64_MOV128 = frozenset({'movntps', 'movntpd', 'movntdq', 'movntdqa', 'lddqu'})
+# The 128-bit moves lift32_cpu's SSE_MOV128 does not carry. Identical to their
+# ordinary forms here: the non-temporal hint is about a cache this runtime is
+# not managing, and lddqu differs from movdqu only across a cache line.
+#
+# movntps/movntpd/movntdq were here too until the 32-bit line added them; they
+# are imported from SSE_MOV128 now rather than declared twice, which is the
+# whole reason the tables are shared instead of copied.
+SSE64_MOV128 = frozenset({'movntdqa', 'lddqu'})
 
 PINTEGER_MISC = frozenset({
     'pmullw', 'pmulhw', 'pmulhuw', 'pmaddwd', 'pavgb', 'pavgw',
