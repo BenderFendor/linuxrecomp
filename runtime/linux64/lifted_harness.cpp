@@ -312,6 +312,7 @@ int main(int argc, char **argv) {
     uint64_t dump_len[16];
     int dump_count = 0;
     bool report_undefined = false;
+    bool skip_missing = false;
 
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--poke") == 0 && i + 1 < argc) {
@@ -340,6 +341,10 @@ int main(int argc, char **argv) {
                 return 1;
             }
             dump_count++;
+            continue;
+        }
+        if (strcmp(argv[i], "--skip-missing") == 0) {
+            skip_missing = true;
             continue;
         }
         if (strcmp(argv[i], "--report-undefined") == 0) {
@@ -446,6 +451,7 @@ int main(int argc, char **argv) {
     trace("guest heap %#" PRIx64 " size %#" PRIx64, memory.heap_base, memory.heap_size);
 
     lifted_report_undefined(report_undefined);
+    lifted_set_skip_missing(skip_missing);
     lifted_set_memory_trace(report_undefined);
     lifted_set_dispatch_trace(trace_enabled);
 

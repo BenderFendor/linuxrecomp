@@ -69,6 +69,9 @@ const char *lifted_stop_reason_name(StopReason reason);
  * treating them as zero. */
 void lifted_report_undefined(bool enabled);
 
+/* Collect every missing function instead of stopping at the first one. */
+void lifted_set_skip_missing(bool enabled);
+
 /* Print every guest memory access. For diagnosing an unexplained fault, where
  * the last access before it is the useful clue. */
 void lifted_set_memory_trace(bool enabled);

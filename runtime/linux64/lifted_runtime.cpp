@@ -88,6 +88,12 @@ size_t g_missing_count = 0;
  * rather than pretending the value was defined. */
 bool g_report_undefined = false;
 
+/* Collect every function the run needed and did not have, instead of stopping at the
+ * first. The lifter's round loop is otherwise one round per missing function, and each
+ * round costs a rebuild: gathering them all lets one lift and one rebuild answer the lot.
+ * A skipped call is treated as returned, so the run carries on and keeps finding more. */
+bool g_skip_missing = false;
+
 /* Running a program rather than a function: the entry is the program's root, so a
  * top-level return ends the run instead of chaining into whatever the return address
  * happens to be. Without this, the harness's function mode (which follows a return
@@ -799,6 +805,8 @@ StopReason lifted_run_dispatched(uint64_t va, State *state, Memory *memory) {
 
 void lifted_report_undefined(bool enabled) { g_report_undefined = enabled; }
 
+void lifted_set_skip_missing(bool enabled) { g_skip_missing = enabled; }
+
 void lifted_set_guest_image(uint64_t base, const char *path) {
     g_guest_image_base = base;
     g_guest_image_path = path;
@@ -1076,6 +1084,24 @@ Memory *__remill_function_call(State &state, uint64_t target, Memory *memory) {
     }
     if (!lifted_lookup(target)) {
         record_missing(target);
+        if (g_skip_missing) {
+            /* Pretend the call returned so the run reaches the next missing function.
+             * The stack is what the caller expects after a call: address popped, and the
+             * callee's own frame never existed. */
+            const uint64_t *slot =
+                (const uint64_t *)guest_ptr(memory, state.gpr.rsp.qword, sizeof(uint64_t));
+            const uint64_t return_address = slot ? *slot : 0;
+            state.gpr.rsp.qword += 8;
+            if (return_address && lifted_lookup(return_address)) {
+                StopReason reason = dispatch_from(return_address, &state, memory);
+                if (reason != StopReason::kReturned) {
+                    return propagate(reason, g_stop_pc);
+                }
+            }
+            g_reason = StopReason::kError;
+            g_stop_pc = 0;
+            return memory;
+        }
         char detail[96];
         std::snprintf(detail, sizeof(detail), "call to unlifted address %#" PRIx64,
                       target);
@@ -1087,8 +1113,13 @@ Memory *__remill_function_call(State &state, uint64_t target, Memory *memory) {
         /* The callee returned and the caller continues in its own lifted code, so the
          * return address has been consumed. Leaving it in g_stop_pc lets a later frame
          * that returns propagate a stale address as its own, which is how a run ended
-         * reporting a return from earlier in the program. */
+         * reporting a return from earlier in the program. The reason has to go with it:
+         * a caller that does not return itself - one that tail-jumps or jumps away -
+         * would otherwise leave kReturned set from the callee and have it read as its
+         * own return, which ends the run one frame early. */
+        g_reason = StopReason::kError;
         g_stop_pc = 0;
+        g_detail[0] = '\0';
         return memory;
     }
     return propagate(reason, g_stop_pc);
@@ -1119,6 +1150,23 @@ Memory *__remill_jump(State &state, uint64_t target, Memory *memory) {
     }
     if (!lifted_lookup(target)) {
         record_missing(target);
+        if (g_skip_missing) {
+            /* A jumped-to function is not returning here, so the guest's own return
+             * address at the stack pointer is where control would go. */
+            const uint64_t *slot =
+                (const uint64_t *)guest_ptr(memory, state.gpr.rsp.qword, sizeof(uint64_t));
+            const uint64_t return_address = slot ? *slot : 0;
+            state.gpr.rsp.qword += 8;
+            if (return_address && lifted_lookup(return_address)) {
+                StopReason reason = dispatch_from(return_address, &state, memory);
+                if (reason != StopReason::kReturned) {
+                    return propagate(reason, g_stop_pc);
+                }
+            }
+            g_reason = StopReason::kError;
+            g_stop_pc = 0;
+            return memory;
+        }
         char detail[96];
         std::snprintf(detail, sizeof(detail), "jump to unlifted address %#" PRIx64,
                       target);
