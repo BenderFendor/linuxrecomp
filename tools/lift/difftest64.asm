@@ -58,16 +58,32 @@ host_xmm    OWORD 10 DUP(0)         ; xmm6..xmm15 are non-volatile on Win64
 .CODE
 
 PUBLIC run_native
-run_native PROC
+; FRAME, and a .PUSHREG for every push, because this procedure needs UNWIND
+; INFORMATION - not for tidiness, but because the instruction under test can
+; fault, and Windows dispatches an exception by walking unwind data. A PROC
+; without it is a hole in the chain: the __except around run_native never runs,
+; and the process dies with an access violation and no output at all. That cost
+; a debugging session on its own, and only appeared once the corpus included
+; memory operands, which are the ones that can fault.
+run_native PROC FRAME
         ; ---- preserve the host's non-volatile state ----
         push    rbx
+        .pushreg rbx
         push    rbp
+        .pushreg rbp
         push    rsi
+        .pushreg rsi
         push    rdi
+        .pushreg rdi
         push    r12
+        .pushreg r12
         push    r13
+        .pushreg r13
         push    r14
+        .pushreg r14
         push    r15
+        .pushreg r15
+        .endprolog
 
         movaps  OWORD PTR [host_xmm + 16*0], xmm6
         movaps  OWORD PTR [host_xmm + 16*1], xmm7
