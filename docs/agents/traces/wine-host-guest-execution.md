@@ -326,3 +326,33 @@ initialisers run.
 
 Next: resolve the four IAT slots above to import names and compare each returned value
 against what the startup's check expects. That is the concrete, bounded question now.
+
+
+## The startup's own frame leaks, and the last event is a tail jump into an import
+
+The harness already reports a leak per dispatched function. The trace names two, both with
+the same numbers:
+
+```
+stack leak: sub_140005070 at 0x140005070 entry rsp 0x7ffffe8deff8 final rsp 0x7ffffe8def40 delta -184
+stack leak: sub_140005310 at 0x140005310 entry rsp 0x7ffffe8deff8 final rsp 0x7ffffe8def40 delta -184
+```
+
+`sub_140005070` is the startup and `sub_140005310` is the 18-byte entry stub that tail-jumps
+into it, so this is one leak seen from both ends of the same tail chain. 184 is 0xb8, a frame
+size, so a frame was pushed and never popped.
+
+The last dispatch event before the stop is a tail jump to a host address:
+
+```
+dispatch: jump  0x6fffffbc73f0 rsp=0x7ffffe8def38
+```
+
+and `0x6fffffbc73f0` is `EnterCriticalSection`, whose traced return is the very next event.
+So the program tail-jumps into that import: it never returns to the startup, it returns to
+the startup's caller. That is correct guest behaviour and it is also exactly the case the
+runtime's own comment describes - the callee's return ends up reported against the caller's
+trace. The remaining question is whether the 184-byte leak is real guest behaviour or our
+handling of a jumped import, and the two ways to tell are: check the startup's prologue for
+a 0xb8 (or 0xb0 plus a push) frame, and confirm the epilogue at 0x1400052d6 runs on the
+path taken.
