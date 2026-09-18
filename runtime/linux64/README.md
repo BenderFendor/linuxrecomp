@@ -2,7 +2,8 @@
 
 Shared runtime for recompiled AMD64 Windows targets.
 
-Two pieces exist today, both built by `scripts/build-runtime-linux64.sh` into
+Built by `scripts/build-runtime-linux64.sh` (reference side) and
+`scripts/build-lifted-harness.sh IMAGE` (lifted side), both into
 `work/linux64/bin`:
 
 * `image_pe64.{c,h}` maps a PE32+ image at its preferred base with the sections
@@ -16,17 +17,30 @@ Two pieces exist today, both built by `scripts/build-runtime-linux64.sh` into
   running the original bytes is the oracle. Arguments go in through the Microsoft
   x64 convention using `ms_abi`, and `--poke ADDR=HEXBYTES` and `--dump ADDR:LEN`
   set up and inspect guest memory.
+* `lifted_runtime.{h,cpp}` implements Remill's `__remill_*` contract: guest
+  memory access, the control-flow boundaries that stop a trace, flags, undefined
+  values. It is the only place that decides what an unmodelled situation does,
+  and the answer is to stop and report rather than invent a value.
+* `lifted_harness.cpp` runs one lifted function with the guest state its ABI
+  expects and prints the same report format as `refexec`, so one parser reads
+  both.
 
 ```
 ./scripts/build-runtime-linux64.sh
+./scripts/build-lifted-harness.sh IMAGE
 work/linux64/bin/refexec IMAGE FUNCTION_VA [a b c d] [--poke ADDR=HEX] [--dump ADDR:LEN]
+work/linux64/bin/lifted_harness IMAGE FUNCTION_VA [a b c d] [--poke ADDR=HEX] [--dump ADDR:LEN]
 ```
+
+The contract, the memory model and the known limits are in
+`docs/linux64/LIFTING.md`.
 
 Planned modules (P3 onward in `docs/linux64/ROADMAP.md`):
 
 ```
-cpu/         CPU state bootstrap (Remill State/Memory), stack setup
-dispatch/    guest VA -> lifted function, generated from the backend symbol map
+cpu/         CPU state bootstrap for whole-program runs, stack setup
+dispatch/    guest VA -> lifted function at call sites, growing from the table
+             the harness already generates
 imports/     IAT slot resolution; thunks at the Win32 boundary
 tls/         guest TLS block, index, and TLS callbacks
 platform/    POSIX/SDL3 services the Win32 layer does not provide

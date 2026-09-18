@@ -50,8 +50,13 @@ LLVM bitcode  -->  LLVM codegen  -->  native ELF
 python -m tools.linux64 doctor                 # toolchain, Wine layer, upstreams
 ./scripts/build-win64-fixtures.sh              # PE64 test images
 python -m tools.linux64 recon work/linux64/fixtures/return42.exe
-python -m tools.linux64 selftest               # parser, spec and fixture checks
+python -m tools.linux64 selftest               # parser, spec, fixture, Wrapper and difftest checks
 ./scripts/check-winelib.sh                     # proves the Win32 layer strategy
+
+# Lift and run code (P2)
+python -m tools.linux64 lift TARGET.exe --function 0x140006D80
+./scripts/build-lifted-harness.sh TARGET.exe
+python -m tools.linux64 difftest TARGET.exe    # lifted vs the real CPU
 ```
 
 Optional heavy analysis backends:
@@ -60,5 +65,6 @@ Optional heavy analysis backends:
 ./scripts/bootstrap-linux64.sh --analysis
 ```
 
-Details: `docs/linux64/RECON.md` (the spec), `docs/linux64/WINE.md` (the Win32
-layer), `docs/linux64/ROADMAP.md` (bring-up order).
+Details: `docs/linux64/RECON.md` (the spec), `docs/linux64/LIFTING.md` (lifting
+and the differential tests), `docs/linux64/WINE.md` (the Win32 layer),
+`docs/linux64/ROADMAP.md` (bring-up order and status).

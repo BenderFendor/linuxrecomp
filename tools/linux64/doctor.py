@@ -118,6 +118,24 @@ def run() -> int:
                     "present" if present else "run scripts/bootstrap-linux64.sh",
                     required=False)
 
+    report.group("lifted pipeline")
+    remill_lifters = sorted((ROOT / ".deps" / "src" / "remill" / "install" / "bin").glob(
+        "remill-lift-*")) if (ROOT / ".deps" / "src" / "remill" / "install" / "bin").is_dir() else []
+    if remill_lifters:
+        report.line("ok", "remill built", remill_lifters[-1].name, required=False)
+    else:
+        report.line("opt", "remill built",
+                    "checked out but not built (see docs/linux64/ROADMAP.md P2)",
+                    required=False)
+    harness = ROOT / "work" / "linux64" / "bin" / "lifted_harness"
+    report.line("ok" if harness.is_file() else "opt", "lifted harness",
+                str(harness) if harness.is_file() else
+                "run scripts/build-lifted-harness.sh IMAGE", required=False)
+    manifests = list((ROOT / "work" / "linux64" / "lift").glob("*/*.manifest.json")) \
+        if (ROOT / "work" / "linux64" / "lift").is_dir() else []
+    report.line("ok" if manifests else "opt", "lift manifests", f"{len(manifests)} lifted function(s)",
+                required=False)
+
     report.group("optional analysis backends")
     report.found("ghidra analyzeHeadless", _headless(), optional=True)
     for tool in ("ninja", "meson", "llvm-config", "opt", "llc",

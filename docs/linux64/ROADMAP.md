@@ -42,16 +42,31 @@ Acceptance, and the evidence:
 * `python -m tools.linux64 selftest` passes, including a synthetic PE32+ image
   that needs no compiler.
 
-## P2 — one AMD64 function → LLVM → host execution
+## P2 — one AMD64 function → LLVM → host execution — **done**
 
-Target: `return42.exe`.
+Acceptance, and the evidence:
 
-* build Remill (`bootstrap-linux64.sh` checks it out; building it is a separate,
-  explicit step because of LLVM version constraints);
-* lift one known function from `program.json`;
-* compile the bitcode with the host LLVM;
-* execute it in a Linux harness and compare registers/flags/memory against a
-  reference execution of the same bytes.
+* Remill built against LLVM 22 (the system LLVM; Remill's CI matrix covers 17 to
+  22). Its dependencies superbuild needed `ENABLE_SLEIGH=ON`, because Remill's
+  own configure requires the sleigh package even for x86 lifting.
+* Lift: `python -m tools.linux64 lift HLExtract.exe --function 0x140006D80`
+  emits `sub_140006d80.ll` plus a manifest that records the image hash, the byte
+  range and the lifter identity.
+* Compile and link: `scripts/build-lifted-harness.sh` compiles the IR with clang
+  and links it with the project's `__remill_*` runtime and a dispatch table built
+  from the manifests.
+* Execute: `lifted_harness` builds the guest state the target's ABI expects and
+  runs the lifted trace.
+* Compare: `python -m tools.linux64 difftest HLExtract.exe` reports 4 of 4 cases
+  matched. The cases cover a constant return, arguments that must not change it,
+  a memory-reading function whose result depends on a `cmp`/`sete` flag chain in
+  both directions, and a guest memory dump that both executors must agree on.
+
+Two functions were lifted and executed: `0x140006D80` (26 bytes, returns 1) and
+`0x14000C5F0` (33 bytes, reads a pointer and compares the dword it finds against
+`0xC0000005`). Both agree with the reference execution of the same bytes.
+
+Details in `docs/linux64/LIFTING.md`.
 
 ## P3 — whole-program direct control flow
 

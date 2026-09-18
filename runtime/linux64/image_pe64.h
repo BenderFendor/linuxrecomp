@@ -19,6 +19,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define PE_MAX_SECTIONS 32
 
 typedef struct {
@@ -57,5 +61,9 @@ int pe_is_code(const pe_image *image, uint64_t va);
 
 /* Name of the section containing `va`, or NULL. */
 const char *pe_section_name(const pe_image *image, uint64_t va);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* LINUXRECOMP_IMAGE_PE64_H */

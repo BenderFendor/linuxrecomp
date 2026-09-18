@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/BenderFendor/linuxrecomp/tools/linux64/lift_manifest_schema.json",
+  "title": "linuxrecomp lift manifest v1",
+  "description": "Records exactly which image, which bytes and which lifter produced one lifted function, so a differential test or a crash report can be traced back to its inputs.",
+  "type": "object",
+  "required": ["format", "arch", "generator", "source", "artifact"],
+  "additionalProperties": false,
+  "properties": {
+    "format": {"const": "linuxrecomp-lift-manifest-v1"},
+    "arch": {"type": "string", "enum": ["amd64", "amd64_avx", "amd64_avx512"]},
+    "os": {"type": "string", "enum": ["windows", "linux", "macos", "solaris"],
+           "description": "source operating system given to the lifter; these targets are Windows images"},
+    "generator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool", "lifter"],
+      "properties": {
+        "tool": {"type": "string"},
+        "version": {"type": "string"},
+        "lifter": {"type": "string"},
+        "lifter_version": {"type": "string"}
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "image_sha256", "function_va", "function_start_rva",
+                   "byte_length", "bytes_sha256", "bytes"],
+      "properties": {
+        "image": {"type": "string"},
+        "image_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "function_va": {"type": "integer", "minimum": 0},
+        "function_start_rva": {"type": "integer", "minimum": 0},
+        "range_end_rva": {"type": "integer", "minimum": 0},
+        "byte_length": {"type": "integer", "minimum": 1},
+        "bytes_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "bytes": {"type": "string", "pattern": "^[0-9a-f]+$"}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ir"],
+      "properties": {
+        "ir": {"type": "string"},
+        "ir_bytes": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

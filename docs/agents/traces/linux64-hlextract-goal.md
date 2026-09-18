@@ -83,7 +83,69 @@ requested size.
 | `recon HLLib.dll` | 1,157 functions, 668 exports (625/43), 0 problems |
 | `objdump -p` on both | import rows and exception directory sizes match recon |
 
+## P2: lift, compile, execute, compare
+
+Remill is built and installed at `.deps/src/remill/install` (`remill-lift-22`,
+`remill-clang-22`, `remill-llvm-link-22`). Two notes for anyone rebuilding it:
+
+* the dependencies superbuild needs `-DENABLE_SLEIGH=ON`, because Remill's own
+  configure fails with `Could not find a package configuration file provided by
+  "sleigh"` even when only x86 lifting is wanted;
+* the pinned revision's CI matrix covers LLVM 17 through 22, so the system LLVM
+  22 works and no second LLVM is needed.
+
+Lifting `0x140006D80` produces the shape the architecture assumed:
+
+```llvm
+define ptr @sub_140006d80(ptr noalias %state, i64 %program_counter, ptr noalias %memory)
+```
+
+with `__remill_read_memory_64`, `__remill_write_memory_64`,
+`__remill_flag_computation_{carry,zero,sign,overflow}` and
+`__remill_function_return` left as declarations for the consumer. Remill 2.x has
+no runtime library of its own; its test runner defines those functions, and so
+does `runtime/linux64/lifted_runtime.cpp`.
+
+New pieces: `tools/linux64/lift.py` (lift front end plus manifest and schema),
+`runtime/linux64/lifted_runtime.{h,cpp}` (the `__remill_*` contract),
+`runtime/linux64/lifted_harness.cpp` (runs one lifted function and prints the
+same report as `refexec`), `scripts/build-lifted-harness.sh` (compiles the IR,
+generates the dispatch table from manifests whose image hash matches, links), and
+`tools/linux64/difftest.py` (the differential test with a fixed case list).
+
+Evidence:
+
+| Check | Result |
+|---|---|
+| `python -m tools.linux64 lift HLExtract.exe --function 0x140006D80` | 26 bytes to `sub_140006d80.ll`, manifest validated |
+| `lifted_harness HLExtract.exe 0x140006D80` | `result=0x1`, `stop returned` |
+| `refexec HLExtract.exe 0x140006D80` | `result=0x1` |
+| `lifted_harness HLExtract.exe 0x14000C5F0` with a poked `0xC0000005` | `result=0x1` |
+| same with a poked `0xC0000006` | `result=0x0` |
+| `python -m tools.linux64 difftest HLExtract.exe` | 4 of 4 cases matched |
+
+The second function matters more than the first: its result comes from
+`cmpl` followed by `sete`, so it exercises the flag path through
+`__remill_flag_computation_*`, and it reads through two levels of pointer, so it
+exercises guest memory access. Both directions of the comparison agree with the
+real CPU.
+
+Two corrections came out of building this:
+
+* the first `Case.expect` value in the difftest list was wrong, not the lifter:
+  the case helper wrote the pointer slot's own address instead of the dword's
+  address, so the reference correctly returned 0. Keeping an expected reference
+  result in each case is what made that visible.
+* `image_pe64.h` needed `extern "C"` guards: the runtime is C++ and the loader is
+  C, and without the guards the link failed on mangled names.
+
+Known limits recorded in `docs/linux64/LIFTING.md`: no cross-function calls or
+jumps yet (the trace stops and reports the target, which is P3's entry point),
+flags start zeroed at entry, no x87 or 128-bit memory access, no atomics.
+
 ## Next
 
-P2: build Remill against a compatible LLVM, lift one function from
-`program.json`, execute it, and compare against a reference execution.
+P3: lift every recovered function in the target, dispatch calls and jumps by
+guest VA, keep the original data sections addressable, and grow the differential
+tests from four fixed cases to many.
+
