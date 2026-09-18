@@ -516,3 +516,44 @@ The behavioural question is unchanged and now better instrumented: the startup c
 `sub_14000c410` and `sub_14000c2f0`, the failure trio is never called, and the next step on
 the normal path - `call 0x14000bbb0` - never happens. The run is ending inside the callee
 instead of returning to the startup and going on.
+
+
+## The program now runs 113 functions and faults on a TEB read
+
+With the return chase unified, the coverage loop ran six rounds and the program went from
+stopping at a missing function to running deep into its own startup:
+
+```
+round 1: entered=76  -> return to unlifted address 0x1400051f2, inside the startup
+round 2: entered=95  -> 0x14000c9bd
+round 3: entered=97  -> 0x14000ca21
+round 4: entered=98  -> 0x14000cf5c
+round 5: entered=111 -> error at 0x10 (read of unmapped guest address 0x10 (8 bytes))
+round 6: entered=113, missing=0, coverage complete
+```
+
+Entered functions went 71 -> 113, and the stop is no longer a tooling gap at all: it is a
+guest fault. The first round's target confirms the chase is right - 0x1400051f2 is exactly
+the instruction after the startup's `call 0x14000c2f0`, so the chain returned to its proper
+caller at last.
+
+Memory tracing names the fault:
+
+```
+mem: write 8 at 0x7ffffe8de7f8 = 0x140013616
+mem: write 8 at 0x7ffffe8de7e8 = 0x1
+mem: write 8 at 0x7ffffe8de7f0 = 0x7fda668c4940
+lifted runtime: undefined value read (8)
+mem: read 8 at 0x10
+```
+
+A read at guest address 0x10 with the segment base at zero is the shape of `gs:[0x10]`, which
+in a Windows TEB is StackLimit - one of the first things CRT startup code reads to sanity
+check the stack. Remill's AMD64 state carries no segment base for the runtime to set (the
+runtime has no segment handling at all), so any `gs:`-relative access lands at a raw offset
+like 0x10.
+
+That is the next thing to fix: give the guest a TEB and a segment base, so `gs:`-relative
+reads address guest memory instead of zero-based offsets. It is also the reason the read is
+reported as an undefined value first: the lifted code used an undetermined value as an
+address, and zero-based offsets are where that lands.
