@@ -8,3 +8,23 @@
 
 ---
 
+## 2026-09-18 16:33
+
+**What happened:** gdb is unusable on this host (libboost_regex.so.1.91.0 missing), so core dumps plus eu-stack/coredumpctl were the only way to unwind a Wine process crash
+
+**Probable cause:** system gdb built against a newer boost than installed
+
+**Fix or workaround:** use coredumpctl info / eu-stack for crash analysis; treat gdb as unavailable
+
+---
+
+## 2026-09-18 16:33
+
+**What happened:** WINEDEBUG=+seh makes failing wine runs hang instead of reporting; +virtual is reliable
+
+**Probable cause:** Wine's debug channels change timing and output volume
+
+**Fix or workaround:** use WINEDEBUG=+virtual for memory questions, and avoid +seh
+
+---
+
