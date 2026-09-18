@@ -233,3 +233,41 @@ The native path is unchanged in behaviour: `host_guest.c` (pthread) and the
 default `mmap` backend are what the native harness uses, and `check-winelib.sh`
 verifies the Wine-side rules independently. Removing the winelib harness build
 step from `scripts/build-lifted-harness.sh` leaves P0-P3 exactly as they were.
+
+
+## Follow-up: the end-to-end run's frame accounting
+
+HLExtract's program run (entry 0x140005310) now maps the image, binds 130 imports, makes
+96 Wine calls, and enters 71 lifted functions, then ends with a top-level return. What it
+does not do is reach `main`: the real program prints its banner and usage and exits 2.
+
+Three runtime defects were found on the way, all in frame handling, and all fixed:
+
+1. `call_import` did not record the return address the import's own `ret` would use, so a
+   tail jump into an import propagated whatever `g_stop_pc` held.
+2. A consumed return (a callee returning into its caller's lifted code) left its address
+   in `g_stop_pc`, where a later frame could report it as its own.
+3. A tail jump into an import popped the caller's return address, and then the caller
+   popped it again. Only a call pushes, so only a call should pop.
+
+Direct calls between lifted functions were also invisible: Remill links them by symbol, so
+they never reach the dispatcher. The build now renames each lifted definition and emits a
+wrapper under the original name, which is what turned a count of 3 functions into 71, and
+what let the stop state and the guest stack be checked per direct call.
+
+The measurement that matters now: the harness reports the guest stack pointer at entry
+and when the run finishes, and `trace_once` reports any function that returns with a
+stack other than its entry plus 8.
+
+```
+trace: stack: entry rsp 0x7ffffe8deff8 final rsp 0x7ffffe8def38 delta -192
+dispatch: stack leak: sub_140005070 at 0x140005070 entry rsp 0x7ffffe8deff8 final rsp 0x7ffffe8def38 delta -192
+```
+
+The program's own run ends 192 bytes (24 slots) below where it started, and the startup
+is where it is first visible, because everything under it is a direct call inside its
+trace. Correct guest code cannot do that, so 24 pops are missing in the emulation. The
+places the runtime touches the guest's RSP are `call_import` (one pop, for a call) and the
+lifted code's own push/pop at call and ret; the next step is to log the guest RSP at every
+import call and every ret together with the instruction that caused it, and find the 24
+transitions where the stack moves without a matching restore.

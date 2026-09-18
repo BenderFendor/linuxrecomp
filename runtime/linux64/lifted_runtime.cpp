@@ -95,6 +95,10 @@ bool g_report_undefined = false;
  * return address". */
 bool g_program_mode = false;
 
+/* The guest's stack pointer, for the balance checks. Kept current by the wrappers and
+ * by the dispatch path so a leak can be attributed to the function that caused it. */
+uint64_t g_trace_rsp = 0;
+
 /* Imports the host bound for this image, if any. Mutable: a program can obtain a
  * callable host address at run time, and the dispatcher has to know it. */
 import_table *g_imports = nullptr;
@@ -264,8 +268,21 @@ StopReason trace_once(lifted_function function, State *state, uint64_t pc,
     g_reason = StopReason::kReturned;
     g_stop_pc = 0;
     g_detail[0] = '\0';
+    const uint64_t rsp_at_entry = state->gpr.rsp.qword;
     if (__builtin_setjmp(context.jump) == 0) {
         function(state, pc, memory);
+    }
+    /* A trace that ends by returning should leave the guest's stack 8 bytes above
+     * where it started: the return popped its own address. Anything else means the
+     * function (or something it called) moved the stack without putting it back, and
+     * every later frame in the program inherits the error. Naming the function is the
+     * difference between hunting for a leaked frame and reading its address. */
+    if (g_reason == StopReason::kReturned && state->gpr.rsp.qword != rsp_at_entry + 8) {
+        const LiftedEntry *self = lifted_lookup(pc);
+        trace_dispatch("stack leak: %s at %#" PRIx64 " entry rsp %#" PRIx64
+                       " final rsp %#" PRIx64 " delta %" PRId64,
+                       self ? self->name : "?", pc, rsp_at_entry, state->gpr.rsp.qword,
+                       (int64_t)(state->gpr.rsp.qword - rsp_at_entry));
     }
     trace_dispatch("leave %#" PRIx64 " with %s", pc, reason_name(g_reason));
     g_current = context.previous;
@@ -543,18 +560,25 @@ struct SavedStop {
     StopReason reason;
     uint64_t pc;
     char detail[256];
+    uint64_t rsp;
 };
 constexpr int kMaxDirectDepth = 256;
 SavedStop g_saved_stop[kMaxDirectDepth];
 int g_saved_depth = 0;
 
+void lifted_set_trace_rsp(uint64_t rsp) {
+    g_trace_rsp = rsp;
+}
+
 void lifted_trace_enter(uint64_t va, uint64_t pc) {
     (void)pc;
     g_functions_entered++;
+    (void)va;
     if (g_saved_depth < kMaxDirectDepth) {
         SavedStop &saved = g_saved_stop[g_saved_depth++];
         saved.reason = g_reason;
         saved.pc = g_stop_pc;
+        saved.rsp = g_trace_rsp;
         std::snprintf(saved.detail, sizeof(saved.detail), "%s", g_detail);
     }
     const LiftedEntry *entry = lifted_lookup(va);
@@ -564,7 +588,18 @@ void lifted_trace_enter(uint64_t va, uint64_t pc) {
 void lifted_trace_leave(uint64_t va, uint64_t pc) {
     (void)pc;
     if (g_saved_depth > 0) {
-        const SavedStop &saved = g_saved_stop[--g_saved_depth];
+        const SavedStop &saved = g_saved_stop[g_saved_depth - 1];
+        /* The same balance check as a dispatched trace: a directly called function runs
+         * inside its caller's trace, so a stack it does not put back is attributed to
+         * the caller unless it is reported here. */
+        if (g_trace_rsp != saved.rsp + 8) {
+            const LiftedEntry *entry = lifted_lookup(va);
+            trace_dispatch("stack leak: %s at %#" PRIx64 " entry rsp %#" PRIx64
+                           " final rsp %#" PRIx64 " delta %" PRId64,
+                           entry ? entry->name : "?", va, saved.rsp, g_trace_rsp,
+                           (int64_t)(g_trace_rsp - saved.rsp));
+        }
+        g_saved_depth--;
         g_reason = saved.reason;
         g_stop_pc = saved.pc;
         std::snprintf(g_detail, sizeof(g_detail), "%s", saved.detail);

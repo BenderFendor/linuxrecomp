@@ -56,6 +56,7 @@ extern "C" {
 /* Called by the generated wrappers, so a direct call between two lifted functions is
  * visible in the trace and counted. */
 void lifted_trace_enter(uint64_t va, uint64_t pc);
+void lifted_set_trace_rsp(uint64_t rsp);
 void lifted_trace_leave(uint64_t va, uint64_t pc);
 
 StopReason lifted_stop_reason(void);

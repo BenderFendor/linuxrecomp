@@ -117,8 +117,10 @@ with open(inc_path.replace("lifted_symbols.inc", "lifted_wrappers.cpp"), "w") as
     for va, symbol, _ir in entries:
         handle.write(f'extern "C" Memory *lifted_{symbol}(State *, uint64_t, Memory *);\n')
         handle.write(f'extern "C" Memory *{symbol}(State *state, uint64_t pc, Memory *memory) {{\n')
+        handle.write(f'    lifted_set_trace_rsp(state ? state->gpr.rsp.qword : 0);\n')
         handle.write(f'    lifted_trace_enter({hex(va)}, pc);\n')
         handle.write(f'    Memory *result = lifted_{symbol}(state, pc, memory);\n')
+        handle.write('    lifted_set_trace_rsp(state ? state->gpr.rsp.qword : 0);\n')
         handle.write(f'    lifted_trace_leave({hex(va)}, pc);\n')
         handle.write('    return result;\n}\n')
 

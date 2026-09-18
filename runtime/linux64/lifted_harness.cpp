@@ -189,6 +189,7 @@ struct ExecutionJob {
     uint64_t entered    = 0;
     uint64_t deepest    = 0;
     size_t missing      = 0;
+    uint64_t final_rsp  = 0;
 };
 
 
@@ -201,6 +202,7 @@ void *run_guest(void *argument) {
     job->entered = lifted_functions_entered();
     job->deepest = lifted_deepest_dispatch();
     job->missing = lifted_missing_target_count();
+    job->final_rsp = job->state->gpr.rsp.qword;
     return nullptr;
 }
 
@@ -345,8 +347,8 @@ int main(int argc, char **argv) {
             continue;
         }
         if (strcmp(argv[i], "--program") == 0) {
+            /* No argument to consume: advancing here would eat the next flag. */
             lifted_set_program_mode(true);
-            i++;
             continue;
         }
         if (strcmp(argv[i], "--trace") == 0) {
@@ -525,6 +527,7 @@ int main(int argc, char **argv) {
      * land past the region and stop the trace for a reason that has nothing to do
      * with the function being tested. */
     state.gpr.rsp.qword = stack_top - kStackHeadroom;
+    const uint64_t entry_rsp = state.gpr.rsp.qword;
     uint64_t *return_slot = (uint64_t *)guest_ptr(&memory, stack_top - kStackHeadroom, 8);
     if (return_slot) {
         *return_slot = 0;
@@ -545,6 +548,12 @@ int main(int argc, char **argv) {
     }
 
     StopReason reason = job.reason;
+    /* A guest stack that did not come back to where it started means some frame
+     * pushed without popping (or the reverse), and every later return address is off
+     * by that much. It is the first thing to check when a run ends somewhere
+     * surprising. */
+    trace("stack: entry rsp %#" PRIx64 " final rsp %#" PRIx64 " delta %" PRId64,
+          entry_rsp, job.final_rsp, (int64_t)(job.final_rsp - entry_rsp));
     trace("returned from %s with %s", entry->name, lifted_stop_reason_name(reason));
 
     trace("looking up the section name");
