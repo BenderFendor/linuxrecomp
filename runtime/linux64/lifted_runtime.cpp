@@ -527,17 +527,48 @@ extern "C" {
 
 /* Declared here, where the dispatcher that uses it lives, so it has the same
  * linkage as its definition. */
-Memory *call_import(State *state, const import_entry *import, Memory *memory);
+Memory *call_import(State *state, const import_entry *import, Memory *memory, bool is_call);
+
+/* A direct call between two lifted functions runs inside the caller's trace: the
+ * callee's `ret` is handled by the C call itself, and the caller carries on in its own
+ * lifted code. Its effect on the stop state must therefore be invisible, or the
+ * caller's trace finishes reporting a return that belongs to a callee it already
+ * handled. Measured on HLExtract: the run ended after 71 functions reporting a return
+ * to 0x14000bfdd, an address written by a caller that had already continued.
+ *
+ * The wrapper is exactly that boundary - dispatched entries call the renamed
+ * `lifted_` symbols directly - so it saves the stop state on entry and restores it on
+ * return. The stack covers nesting. */
+struct SavedStop {
+    StopReason reason;
+    uint64_t pc;
+    char detail[256];
+};
+constexpr int kMaxDirectDepth = 256;
+SavedStop g_saved_stop[kMaxDirectDepth];
+int g_saved_depth = 0;
 
 void lifted_trace_enter(uint64_t va, uint64_t pc) {
     (void)pc;
     g_functions_entered++;
+    if (g_saved_depth < kMaxDirectDepth) {
+        SavedStop &saved = g_saved_stop[g_saved_depth++];
+        saved.reason = g_reason;
+        saved.pc = g_stop_pc;
+        std::snprintf(saved.detail, sizeof(saved.detail), "%s", g_detail);
+    }
     const LiftedEntry *entry = lifted_lookup(va);
     trace_dispatch("direct enter %s %#" PRIx64, entry ? entry->name : "?", va);
 }
 
 void lifted_trace_leave(uint64_t va, uint64_t pc) {
     (void)pc;
+    if (g_saved_depth > 0) {
+        const SavedStop &saved = g_saved_stop[--g_saved_depth];
+        g_reason = saved.reason;
+        g_stop_pc = saved.pc;
+        std::snprintf(g_detail, sizeof(g_detail), "%s", saved.detail);
+    }
     trace_dispatch("direct leave %#" PRIx64, va);
 }
 
@@ -633,7 +664,13 @@ bool __remill_compare_uge(bool result) { return result; }
  * The lifted `call` has already pushed the return address on the guest stack, so
  * the import's own `ret` is emulated by popping it. The result goes to RAX, which is
  * where the Microsoft x64 convention returns an integer or a pointer. */
-Memory *call_import(State *state, const import_entry *import, Memory *memory) {
+/* `is_call` distinguishes the two ways a program reaches an import. A `call` pushed a
+ * return address, so the import's ret pops it. A tail `jmp` pushed nothing: the frame
+ * ends and its return propagates to the caller, whose own ret pops the address. Popping
+ * in both cases pops it twice, which moves the guest's stack for the rest of the run -
+ * measured on HLExtract as a run ending with a return address written by a caller that
+ * had already continued. */
+Memory *call_import(State *state, const import_entry *import, Memory *memory, bool is_call) {
     uint64_t arguments[IMPORT_ARGS];
     arguments[0] = state->gpr.rcx.qword;
     arguments[1] = state->gpr.rdx.qword;
@@ -656,7 +693,9 @@ Memory *call_import(State *state, const import_entry *import, Memory *memory) {
     if (const thunk_function thunk = find_thunk(import)) {
         const uint64_t thunked = thunk(state, arguments, memory);
         state->gpr.rax.qword = thunked;
-        state->gpr.rsp.qword = state->gpr.rsp.qword + 8;
+        if (is_call) {
+            state->gpr.rsp.qword = state->gpr.rsp.qword + 8;
+        }
         trace_dispatch("thunk %s returned %#llx", import->name, (unsigned long long)thunked);
         return memory;
     }
@@ -676,10 +715,15 @@ Memory *call_import(State *state, const import_entry *import, Memory *memory) {
     if (uint8_t *slot = guest_ptr(memory, stack_pointer, 8)) {
         std::memcpy(&return_address, slot, sizeof(return_address));
     }
-    g_stop_pc = return_address;
+    if (!is_call) {
+        /* A tail jump: the frame's return is the address the import's ret would use. */
+        g_stop_pc = return_address;
+    }
 
     state->gpr.rax.qword = result;
-    state->gpr.rsp.qword = stack_pointer + 8; /* the callee's ret */
+    if (is_call) {
+        state->gpr.rsp.qword = stack_pointer + 8; /* the callee's ret */
+    }
     trace_dispatch("import %s returned %#llx", import->name[0] ? import->name : import->dll,
                    (unsigned long long)result);
     return memory;
@@ -696,7 +740,7 @@ Memory *__remill_function_return(State &state, uint64_t address, Memory *memory)
 Memory *__remill_function_call(State &state, uint64_t target, Memory *memory) {
     trace_dispatch("call  %#" PRIx64 " rsp=%#" PRIx64, target, state.gpr.rsp.qword);
     if (const import_entry *import = imports_find_host(g_imports, target)) {
-        return call_import(&state, import, memory);
+        return call_import(&state, import, memory, true);
     }
     if (!lifted_lookup(target)) {
         record_missing(target);
@@ -723,7 +767,7 @@ Memory *__remill_jump(State &state, uint64_t target, Memory *memory) {
      * import's return is this frame's return, and the return address the caller
      * pushed is still on the guest stack, which call_import pops. */
     if (const import_entry *import = imports_find_host(g_imports, target)) {
-        call_import(&state, import, memory);
+        call_import(&state, import, memory, false);
         return propagate(StopReason::kReturned, g_stop_pc);
     }
     if (!lifted_lookup(target)) {
