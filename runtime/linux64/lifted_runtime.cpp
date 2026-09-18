@@ -207,28 +207,69 @@ bool same_module_name(const char *requested, const char *image_path) {
             have = at + 1;
         }
     }
-    while (*wanted && *have) {
-        char a = *wanted++;
-        char b = *have++;
-        if (a >= 'A' && a <= 'Z') {
-            a = (char)(a - 'A' + 'a');
+    /* Ignore a .exe suffix on either side: GetModuleHandle accepts a module with or
+     * without it, and the image path always carries one. */
+    const char *a = wanted;
+    const char *b = have;
+    size_t alen = 0;
+    size_t blen = 0;
+    while (a[alen]) {
+        alen++;
+    }
+    while (b[blen]) {
+        blen++;
+    }
+    if (alen > 4 && a[alen - 4] == '.') {
+        alen -= 4;
+    }
+    if (blen > 4 && b[blen - 4] == '.') {
+        blen -= 4;
+    }
+    if (alen != blen) {
+        return false;
+    }
+    for (size_t i = 0; i < alen; i++) {
+        char x = a[i];
+        char y = b[i];
+        if (x >= 'A' && x <= 'Z') {
+            x = (char)(x - 'A' + 'a');
         }
-        if (b >= 'A' && b <= 'Z') {
-            b = (char)(b - 'A' + 'a');
+        if (y >= 'A' && y <= 'Z') {
+            y = (char)(y - 'A' + 'a');
         }
-        if (a != b) {
+        if (x != y) {
             return false;
         }
     }
-    return *wanted == '\0' && *have == '\0';
+    return true;
 }
 
 uint64_t g_guest_image_base = 0;
 const char *g_guest_image_path = nullptr;
 
-uint64_t thunk_get_module_handle(State *, const uint64_t *arguments, Memory *) {
+uint64_t thunk_get_module_handle(State *, const uint64_t *arguments, Memory *memory) {
     /* GetModuleHandleA/W(name) */
     const char *name = (const char *)(uintptr_t)arguments[0];
+    {
+        /* What the program asks for, since a module handle that is not its own sends it
+         * looking at the wrong headers. */
+        char text[128];
+        text[0] = '\0';
+        if (name) {
+            const char *source = (const char *)guest_ptr(memory, arguments[0], sizeof(text));
+            if (!source) {
+                source = name;
+            }
+            size_t i = 0;
+            while (i + 1 < sizeof(text) && source[i]) {
+                text[i] = source[i];
+                i++;
+            }
+            text[i] = '\0';
+        }
+        trace_dispatch("module handle asked for \"%s\" (image %s)", text,
+                       g_guest_image_path ? g_guest_image_path : "?");
+    }
     if (!name || !*name) {
         return g_guest_image_base;
     }
