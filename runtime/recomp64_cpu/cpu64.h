@@ -284,7 +284,13 @@ static inline uint64_t flags_decs(CPU *c, uint64_t a, int sz) {
 /* ---- shifts ----
  * The count is masked to 6 bits for 64-bit operands and 5 bits otherwise, which
  * is the hardware rule and not the same as C's. A count of 0 leaves every flag
- * untouched. */
+ * untouched.
+ *
+ * OF is defined ONLY for a count of 1. For any other count the manual leaves it
+ * undefined, and both Intel and AMD leave it clear - which is what difftest64
+ * measures against the real CPU. Setting it unconditionally from the operand's
+ * sign bit, as the obvious reading of the manual's count-of-1 rule invites,
+ * disagrees with the hardware on every multi-bit shift. */
 static inline uint64_t op_shl(CPU *c, uint64_t v, uint64_t n, int sz) {
     n &= (sz == 8) ? 63 : 31;
     if (!n) return v & mask_sz(sz);
@@ -292,6 +298,10 @@ static inline uint64_t op_shl(CPU *c, uint64_t v, uint64_t n, int sz) {
     v &= m;
     uint64_t r = (v << n) & m;
     c->cf = (n <= sz * 8) ? ((v >> (sz * 8 - n)) & 1) : 0;
+    /* SHL computes OF for EVERY count, unlike SHR which clears it for counts
+     * above one. The manual defines OF only for a count of 1 in both cases, so
+     * the difference is invisible in the spec and measurable on the CPU -
+     * difftest64 caught it going both ways in one run. */
     c->of = (((r & sb) ? 1u : 0u) ^ (uint32_t)c->cf);
     c->zf = (r == 0); c->sf = (r & sb) ? 1 : 0; c->pf = parity8((uint8_t)r);
     return r;
@@ -303,7 +313,7 @@ static inline uint64_t op_shr(CPU *c, uint64_t v, uint64_t n, int sz) {
     v &= m;
     uint64_t r = v >> n;
     c->cf = (v >> (n - 1)) & 1;
-    c->of = (v & sb) ? 1 : 0;
+    c->of = (n == 1) ? ((v & sb) ? 1 : 0) : 0;
     c->zf = (r == 0); c->sf = (r & sb) ? 1 : 0; c->pf = parity8((uint8_t)r);
     return r;
 }
@@ -329,6 +339,7 @@ static inline uint64_t op_rol(CPU *c, uint64_t v, uint64_t n, int sz) {
     if (!n) return v;
     uint64_t r = ((v << n) | (v >> (w - n))) & m;
     c->cf = r & 1;
+    /* Computed for every count, as SHL does. Only SHR clears it. */
     c->of = (uint32_t)(((r & signbit_sz(sz)) ? 1u : 0u) ^ (uint32_t)c->cf);
     return r;
 }
@@ -341,7 +352,8 @@ static inline uint64_t op_ror(CPU *c, uint64_t v, uint64_t n, int sz) {
     if (!n) return v;
     uint64_t r = ((v >> n) | (v << (w - n))) & m;
     c->cf = (r & signbit_sz(sz)) ? 1 : 0;
-    c->of = 0;
+    /* ROR's OF is the XOR of the result's top two bits, for every count. */
+    c->of = (((r >> (w - 1)) ^ (r >> (w - 2))) & 1) ? 1 : 0;
     return r;
 }
 static inline uint64_t op_shld(CPU *c, uint64_t d, uint64_t s, uint64_t n, int sz) {
@@ -435,9 +447,20 @@ static inline uint64_t op_btc(CPU *c, uint64_t v, uint64_t n, int sz) {
     return (v ^ ((uint64_t)1 << n)) & mask_sz(sz);
 }
 /* bsf/bsr leave the destination UNCHANGED when the source is zero, which is
- * why these take the old value rather than returning a sentinel. */
+ * why these take the old value rather than returning a sentinel.
+ *
+ * Only ZF is architecturally defined; CF, OF, SF, AF and PF are undefined. Both
+ * Intel and AMD clear them, which is what difftest64 measures, and leaving them
+ * at whatever the previous instruction set produces a visible divergence from
+ * the hardware for no benefit. Undefined means a correct program cannot depend
+ * on the value - it does not mean any value is as good for a recompiler trying
+ * to reproduce a specific machine. */
+static inline void bitscan_undef_flags(CPU *c) {
+    c->cf = 0; c->of = 0; c->sf = 0; c->af = 0; c->pf = 0;
+}
 static inline uint64_t op_bsf(CPU *c, uint64_t old, uint64_t v, int sz) {
     v &= mask_sz(sz);
+    bitscan_undef_flags(c);
     if (!v) { c->zf = 1; return old; }
     c->zf = 0;
     uint64_t i = 0; while (!((v >> i) & 1)) i++;
@@ -445,6 +468,7 @@ static inline uint64_t op_bsf(CPU *c, uint64_t old, uint64_t v, int sz) {
 }
 static inline uint64_t op_bsr(CPU *c, uint64_t old, uint64_t v, int sz) {
     v &= mask_sz(sz);
+    bitscan_undef_flags(c);
     if (!v) { c->zf = 1; return old; }
     c->zf = 0;
     uint64_t i = sz * 8 - 1; while (!((v >> i) & 1)) i--;
@@ -505,9 +529,31 @@ static inline int64_t sse_cvtt_i64(double v) {
 /* RCPPS/RSQRTSS are ~12-bit approximations on hardware. Computing them exactly
  * is the safer error: code that uses them feeds the result to a Newton step or
  * to a normalise, and a MORE accurate input never makes that worse. Matching
- * the hardware's exact error would mean reproducing a lookup table per stepping. */
-static inline float sse_rcp(float v)   { return 1.0f / v; }
-static inline float sse_rsqrt(float v) { return 1.0f / sqrtf(v); }
+ * the hardware's exact error would mean reproducing a lookup table per stepping.
+ *
+ * The denormal flush is NOT an approximation and is not optional. These four
+ * instructions treat a denormal input as a zero of the same sign regardless of
+ * MXCSR.DAZ - it is in their specification, not a mode - so a denormal input
+ * yields an infinity, where computing in C yields a large finite number.
+ * difftest64 caught exactly that: native +Inf against a lifted 0x60B5054D. */
+static inline float sse_flush_denormal(float v) {
+    /* 0x00800000 is the smallest normal; anything below it with a zero exponent
+     * is a denormal. Compared as bits to avoid the host's own FTZ affecting it. */
+    uint32_t b; memcpy(&b, &v, 4);
+    if ((b & 0x7F800000u) == 0) { b &= 0x80000000u; memcpy(&v, &b, 4); }
+    return v;
+}
+/* The flush applies to the RESULT as well as the operand: a reciprocal small
+ * enough to land in the denormal range comes back as a signed zero, not as a
+ * denormal. difftest64 found this one lane at a time - `rcpps` where three
+ * lanes agreed within the estimate's tolerance and the fourth was native
+ * 0x00000000 against a lifted 0x002FF8A1. */
+static inline float sse_rcp(float v) {
+    return sse_flush_denormal(1.0f / sse_flush_denormal(v));
+}
+static inline float sse_rsqrt(float v) {
+    return sse_flush_denormal(1.0f / sqrtf(sse_flush_denormal(v)));
+}
 
 /* MOVMSKPS gathers the four sign bits into the low four bits of a GPR. */
 static inline uint32_t sse_movmskps(const XMM *x) {

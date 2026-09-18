@@ -737,7 +737,21 @@ class Lifter:
             cond = self._cond('j' + m[4:])
             if cond:
                 d, sop = ops[0], ops[1]
-                return ['if (%s) { %s }' % (cond, self.dst_write(insn, d, self.src(insn, sop)))]
+                # A 32-bit destination is zero-extended EVEN WHEN THE CONDITION
+                # IS FALSE. The hardware always writes the register - with the
+                # source or with the destination's own old value - and a 32-bit
+                # write always clears bits 63:32. Guarding the write with an
+                # `if` skips that, leaving a stale high half that the next
+                # address computation folds in. Caught by difftest64 against
+                # the real CPU; it is invisible in any test that only checks
+                # the taken path.
+                if d.size == 4:
+                    return [self.dst_write(
+                        insn, d, '(%s) ? (uint32_t)(%s) : %s'
+                                 % (cond, self.src(insn, sop),
+                                    self._read_dst(insn, d)))]
+                return ['if (%s) { %s }'
+                        % (cond, self.dst_write(insn, d, self.src(insn, sop)))]
 
         # ---- data movement ----
         if m in ('mov', 'movabs'):
@@ -840,9 +854,18 @@ class Lifter:
         if m in ('bsf', 'bsr'):
             d, s = two()
             fn = 'op_' + m
-            return [self.dst_write(insn, d, '%s(c, %s, %s, %d)'
-                                   % (fn, self._read_dst(insn, d),
-                                      self.src(insn, s), s.size))]
+            # A zero source means the destination is NOT WRITTEN - and with a
+            # 32-bit destination that also means the usual zero-extension does
+            # not happen, so the high half survives. Exactly the opposite of
+            # CMOVcc, which writes (and zero-extends) even when not taken.
+            # Writing unconditionally clears bits 63:32 that the hardware keeps.
+            # Both were found by difftest64; neither is visible in the manual,
+            # which calls the destination "undefined" here.
+            return ['{ uint64_t _s = %s;' % self.src(insn, s),
+                    '  if (_s) { %s }'
+                    % self.dst_write(insn, d, '%s(c, %s, _s, %d)'
+                                     % (fn, self._read_dst(insn, d), s.size)),
+                    '  else { c->zf = 1; bitscan_undef_flags(c); } }']
 
         # ---- sign-extension of the accumulator ----
         # Four mnemonics, three widths, and the names do not say which is which.
