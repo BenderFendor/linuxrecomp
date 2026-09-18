@@ -668,6 +668,16 @@ Memory *call_import(State *state, const import_entry *import, Memory *memory) {
 
     const uint64_t result = call_host_import(import->host_address, arguments);
 
+    /* The import's ret would pop the return address at [rsp]. Read it before popping:
+     * a tail jump into an import propagates its return as the frame's return, and that
+     * address is what tells the dispatcher where the frame goes. Leaving g_stop_pc
+     * stale here is what made a later tail call report an earlier return address. */
+    uint64_t return_address = 0;
+    if (uint8_t *slot = guest_ptr(memory, stack_pointer, 8)) {
+        std::memcpy(&return_address, slot, sizeof(return_address));
+    }
+    g_stop_pc = return_address;
+
     state->gpr.rax.qword = result;
     state->gpr.rsp.qword = stack_pointer + 8; /* the callee's ret */
     trace_dispatch("import %s returned %#llx", import->name[0] ? import->name : import->dll,
@@ -675,7 +685,8 @@ Memory *call_import(State *state, const import_entry *import, Memory *memory) {
     return memory;
 }
 
-Memory *__remill_function_return(State &, uint64_t address, Memory *memory) {
+Memory *__remill_function_return(State &state, uint64_t address, Memory *memory) {
+    trace_dispatch("ret   %#" PRIx64 " rsp=%#" PRIx64, address, state.gpr.rsp.qword);
     g_reason = StopReason::kReturned;
     g_stop_pc = address;
     std::snprintf(g_detail, sizeof(g_detail), "return to %#" PRIx64, address);
@@ -683,6 +694,7 @@ Memory *__remill_function_return(State &, uint64_t address, Memory *memory) {
 }
 
 Memory *__remill_function_call(State &state, uint64_t target, Memory *memory) {
+    trace_dispatch("call  %#" PRIx64 " rsp=%#" PRIx64, target, state.gpr.rsp.qword);
     if (const import_entry *import = imports_find_host(g_imports, target)) {
         return call_import(&state, import, memory);
     }
@@ -701,6 +713,7 @@ Memory *__remill_function_call(State &state, uint64_t target, Memory *memory) {
 }
 
 Memory *__remill_jump(State &state, uint64_t target, Memory *memory) {
+    trace_dispatch("jump  %#" PRIx64 " rsp=%#" PRIx64, target, state.gpr.rsp.qword);
     /* A tail jump into an import: the thunk pattern `jmp qword ptr [IAT]`. The
      * import's return is this frame's return, and the return address the caller
      * pushed is still on the guest stack, which call_import pops. */
@@ -728,6 +741,7 @@ Memory *__remill_error(State &, uint64_t address, Memory *) {
 }
 
 Memory *__remill_missing_block(State &state, uint64_t address, Memory *memory) {
+    trace_dispatch("block %#" PRIx64 " rsp=%#" PRIx64, address, state.gpr.rsp.qword);
     /* Remill calls this when control leaves the region it lifted for one function:
      * an indirect jump or a tail call out of the function. That is ordinary
      * cross-function control flow, so continue at the target when it is lifted
