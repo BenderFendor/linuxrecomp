@@ -99,6 +99,35 @@ bool g_program_mode = false;
  * by the dispatch path so a leak can be attributed to the function that caused it. */
 uint64_t g_trace_rsp = 0;
 
+/* A shadow of the guest's call stack, for one purpose: to say *where* a program's stack
+ * stops balancing. HLExtract's run ends 184 bytes (23 slots) below where it started, and
+ * correct guest code cannot do that, so 23 pops are missing somewhere in the emulation.
+ * Each call records the caller's stack pointer; each return must find its frame on top.
+ * The mismatches name the transitions to look at instead of guessing. */
+constexpr int kShadowDepth = 8192;
+uint64_t g_shadow[kShadowDepth];
+int g_shadow_depth = 0;
+
+void shadow_push(uint64_t rsp, const char *what, uint64_t target) {
+    if (g_shadow_depth < kShadowDepth) {
+        g_shadow[g_shadow_depth++] = rsp;
+    }
+    (void)what;
+    (void)target;
+}
+
+void shadow_pop(uint64_t rsp, uint64_t address) {
+    if (g_shadow_depth > 0 && rsp != g_shadow[g_shadow_depth - 1]) {
+        /* The frame on top is not the one this return belongs to. */
+        trace_dispatch("unbalanced ret to %#" PRIx64 " rsp=%#" PRIx64
+                       " expected=%#" PRIx64 " depth=%d",
+                       address, rsp, g_shadow[g_shadow_depth - 1], g_shadow_depth);
+    }
+    if (g_shadow_depth > 0) {
+        g_shadow_depth--;
+    }
+}
+
 /* Imports the host bound for this image, if any. Mutable: a program can obtain a
  * callable host address at run time, and the dispatcher has to know it. */
 import_table *g_imports = nullptr;
@@ -728,9 +757,7 @@ Memory *call_import(State *state, const import_entry *import, Memory *memory, bo
     if (const thunk_function thunk = find_thunk(import)) {
         const uint64_t thunked = thunk(state, arguments, memory);
         state->gpr.rax.qword = thunked;
-        if (is_call) {
-            state->gpr.rsp.qword = state->gpr.rsp.qword + 8;
-        }
+        state->gpr.rsp.qword = state->gpr.rsp.qword + 8;
         trace_dispatch("thunk %s returned %#llx", import->name, (unsigned long long)thunked);
         return memory;
     }
@@ -751,14 +778,15 @@ Memory *call_import(State *state, const import_entry *import, Memory *memory, bo
         std::memcpy(&return_address, slot, sizeof(return_address));
     }
     if (!is_call) {
-        /* A tail jump: the frame's return is the address the import's ret would use. */
+        /* A tail jump: the frame's return is the address the import's ret used. */
         g_stop_pc = return_address;
     }
 
     state->gpr.rax.qword = result;
-    if (is_call) {
-        state->gpr.rsp.qword = stack_pointer + 8; /* the callee's ret */
-    }
+    /* The import's ret pops the return address in both cases: for a call it is the one
+     * the call pushed, for a tail jump it is the frame's own. Exactly one pop either
+     * way, which is why this is not conditional. */
+    state->gpr.rsp.qword = stack_pointer + 8;
     trace_dispatch("import %s returned %#llx", import->name[0] ? import->name : import->dll,
                    (unsigned long long)result);
     return memory;
@@ -766,6 +794,7 @@ Memory *call_import(State *state, const import_entry *import, Memory *memory, bo
 
 Memory *__remill_function_return(State &state, uint64_t address, Memory *memory) {
     trace_dispatch("ret   %#" PRIx64 " rsp=%#" PRIx64, address, state.gpr.rsp.qword);
+    shadow_pop(state.gpr.rsp.qword, address);
     g_reason = StopReason::kReturned;
     g_stop_pc = address;
     std::snprintf(g_detail, sizeof(g_detail), "return to %#" PRIx64, address);
@@ -775,7 +804,10 @@ Memory *__remill_function_return(State &state, uint64_t address, Memory *memory)
 Memory *__remill_function_call(State &state, uint64_t target, Memory *memory) {
     trace_dispatch("call  %#" PRIx64 " rsp=%#" PRIx64, target, state.gpr.rsp.qword);
     if (const import_entry *import = imports_find_host(g_imports, target)) {
-        return call_import(&state, import, memory, true);
+        shadow_push(state.gpr.rsp.qword, "import", target);
+        Memory *result = call_import(&state, import, memory, true);
+        shadow_pop(state.gpr.rsp.qword, target);
+        return result;
     }
     if (!lifted_lookup(target)) {
         record_missing(target);
@@ -784,8 +816,10 @@ Memory *__remill_function_call(State &state, uint64_t target, Memory *memory) {
                       target);
         return halt(StopReason::kFunctionCall, target, detail);
     }
+    shadow_push(state.gpr.rsp.qword, "call", target);
     StopReason reason = dispatch_from(target, &state, memory);
     if (reason == StopReason::kReturned) {
+        shadow_pop(state.gpr.rsp.qword, target);
         /* The callee returned and the caller continues in its own lifted code, so the
          * return address has been consumed. Leaving it in g_stop_pc lets a later frame
          * that returns propagate a stale address as its own, which is how a run ended
@@ -812,8 +846,10 @@ Memory *__remill_jump(State &state, uint64_t target, Memory *memory) {
                       target);
         return halt(StopReason::kJump, target, detail);
     }
+    shadow_push(state.gpr.rsp.qword, "call", target);
     StopReason reason = dispatch_from(target, &state, memory);
     if (reason == StopReason::kReturned) {
+        shadow_pop(state.gpr.rsp.qword, target);
         /* A tail jump: the target's return is this frame's return. */
         return propagate(StopReason::kReturned, g_stop_pc);
     }
