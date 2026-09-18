@@ -635,6 +635,25 @@ StopReason dispatch_from(uint64_t va, State *state, Memory *memory) {
     const LiftedEntry *entry = lifted_lookup(va);
     if (!entry) {
         record_missing(va);
+        if (g_skip_missing) {
+            /* Collecting: a function with no lifted body is treated as one that returns to
+             * its caller at once, so control goes where the guest's own return address
+             * points and the run keeps finding more. Without this the collection stops at
+             * the first function reached this way - for HLExtract, an initialiser table
+             * entry - and the whole point of collecting is one lift per round, not one per
+             * missing function. */
+            const uint64_t *slot =
+                (const uint64_t *)guest_ptr(memory, state->gpr.rsp.qword, sizeof(uint64_t));
+            const uint64_t return_address = slot ? *slot : 0;
+            state->gpr.rsp.qword += 8;
+            if (return_address && lifted_lookup(return_address)) {
+                return dispatch_from(return_address, state, memory);
+            }
+            g_reason = StopReason::kError;
+            g_stop_pc = 0;
+            g_detail[0] = '\0';
+            return StopReason::kError;
+        }
         g_reason = StopReason::kMissingDispatch;
         g_stop_pc = va;
         std::snprintf(g_detail, sizeof(g_detail), "no lifted function for %#" PRIx64, va);
@@ -1299,9 +1318,27 @@ size_t lifted_entry_count(void) {
  * one of these stops the program with the address, which is how an unlifted
  * target reports itself instead of failing to link. */
 Memory *lifted_missing_function(State *state, uint64_t pc, Memory *memory) {
-    (void)state;
-    (void)memory;
     record_missing(pc);
+    if (g_skip_missing) {
+        /* This stub stands in for a function with no lifted body. Collecting, we treat it
+         * as one that returns at once: control goes to the guest's own return address and
+         * the run keeps finding more. The state is used here rather than discarded, which
+         * is why this cannot be the halting stub. */
+        const uint64_t *slot =
+            (const uint64_t *)guest_ptr(memory, state->gpr.rsp.qword, sizeof(uint64_t));
+        const uint64_t return_address = slot ? *slot : 0;
+        state->gpr.rsp.qword += 8;
+        if (return_address && lifted_lookup(return_address)) {
+            StopReason reason = dispatch_from(return_address, state, memory);
+            if (reason != StopReason::kReturned) {
+                return propagate(reason, g_stop_pc);
+            }
+        }
+        g_reason = StopReason::kError;
+        g_stop_pc = 0;
+        g_detail[0] = '\0';
+        return memory;
+    }
     char detail[96];
     std::snprintf(detail, sizeof(detail), "called unlifted function %#" PRIx64, pc);
     return halt(StopReason::kMissingDispatch, pc, detail);

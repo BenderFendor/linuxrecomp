@@ -356,3 +356,39 @@ trace. The remaining question is whether the 184-byte leak is real guest behavio
 handling of a jumped import, and the two ways to tell are: check the startup's prologue for
 a 0xb8 (or 0xb0 plus a push) frame, and confirm the epilogue at 0x1400052d6 runs on the
 path taken.
+
+
+## Function coverage is complete
+
+The recovery returns 262 functions against 405 exception-directory entries, because code
+with no unwind record is invisible to `.pdata`; the compiler omits it for leaf functions and
+for functions described entirely in the prologue. Six addresses HLExtract asked for were in
+that gap, and a bulk lift of all 405 range starts did not cover them either.
+
+The run knows them exactly, so it names them. `--skip-missing` records every function the
+run needed and did not have, treating each as one that returns at once (a jump continues at
+the guest's own return address), and carries on instead of stopping at the first. Four halt
+sites had to honour it: the call path, the jump path, `dispatch_from`, and the generated
+stub `lifted_missing_function`, which had been discarding the state it needs to pop a return
+address.
+
+With that, `scripts/lift-until-complete.sh` converges in one round:
+
+```
+round 1: unresolved=0 | lifted: entered=71 deepest=2 missing=0 | lifted: stop returned at 0x14000bfdd ()
+coverage complete: the run needs nothing that is not lifted
+```
+
+So the coverage problem is closed. The run still returns at `0x14000bfdd` with `main` not
+entered, which is now a behavioural divergence rather than a missing code problem:
+
+* only the first of the six initialiser-table entries (`0x140003ee0`) is called, and the
+  other five are never reached, although all six are lifted now;
+* the top-level result is 0, not 255, so the startup did **not** take its `GetVersionExA`
+  failure exit at `0x1400050f5`;
+* the returning function is `sub_14000bec0`, which is not among the startup's direct call
+  targets, so it is reached indirectly - through the initialiser table it is an entry of.
+
+The next question is therefore narrow: what does the walker do between calling the first
+entry and the second. The walker is not a separate `_initterm` in the entered set, so it is
+inlined in the startup.
