@@ -707,7 +707,12 @@ Memory *__remill_function_call(State &state, uint64_t target, Memory *memory) {
     }
     StopReason reason = dispatch_from(target, &state, memory);
     if (reason == StopReason::kReturned) {
-        return memory;             /* the callee returned; the caller continues */
+        /* The callee returned and the caller continues in its own lifted code, so the
+         * return address has been consumed. Leaving it in g_stop_pc lets a later frame
+         * that returns propagate a stale address as its own, which is how a run ended
+         * reporting a return from earlier in the program. */
+        g_stop_pc = 0;
+        return memory;
     }
     return propagate(reason, g_stop_pc);
 }
