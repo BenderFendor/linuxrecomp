@@ -53,6 +53,11 @@ enum class StopReason {
 };
 
 extern "C" {
+/* Called by the generated wrappers, so a direct call between two lifted functions is
+ * visible in the trace and counted. */
+void lifted_trace_enter(uint64_t va, uint64_t pc);
+void lifted_trace_leave(uint64_t va, uint64_t pc);
+
 StopReason lifted_stop_reason(void);
 uint64_t lifted_stop_pc(void);
 const char *lifted_stop_detail(void);
@@ -71,6 +76,9 @@ void lifted_set_memory_trace(bool enabled);
  * call to a host import (whose target is a host address, not a guest one) from a
  * call to lifted guest code. */
 void lifted_set_imports(import_table *table);
+
+/* Entry is the program's root: a top-level return ends the run. */
+void lifted_set_program_mode(bool enabled);
 size_t lifted_import_count(void);
 
 /* Print each trace boundary: entry, finish and halt. For locating a fault that

@@ -61,7 +61,9 @@ def run_once(image: str, entry: int, flavour: str, arguments: Sequence[str],
     binary = harness_path(image, flavour)
     if not binary.exists():
         raise SystemExit(f"no harness at {binary}; build it first")
-    command = [str(binary), image, hex(entry), *arguments]
+    # --program: the entry is the program's root, so a return ends the run instead of
+    # chaining into whatever the return address happens to be.
+    command = [str(binary), image, hex(entry), "--program", *arguments]
     if flavour == "winelib":
         command = ["env", "WINEDEBUG=-all", *command]
     try:

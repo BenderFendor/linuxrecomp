@@ -344,6 +344,11 @@ int main(int argc, char **argv) {
             report_undefined = true;
             continue;
         }
+        if (strcmp(argv[i], "--program") == 0) {
+            lifted_set_program_mode(true);
+            i++;
+            continue;
+        }
         if (strcmp(argv[i], "--trace") == 0) {
             g_trace = true;
             trace_enabled = true;

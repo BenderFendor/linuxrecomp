@@ -88,6 +88,13 @@ size_t g_missing_count = 0;
  * rather than pretending the value was defined. */
 bool g_report_undefined = false;
 
+/* Running a program rather than a function: the entry is the program's root, so a
+ * top-level return ends the run instead of chaining into whatever the return address
+ * happens to be. Without this, the harness's function mode (which follows a return
+ * into the next lifted function) turns a startup returning into "keep running at the
+ * return address". */
+bool g_program_mode = false;
+
 /* Imports the host bound for this image, if any. Mutable: a program can obtain a
  * callable host address at run time, and the dispatcher has to know it. */
 import_table *g_imports = nullptr;
@@ -336,7 +343,7 @@ StopReason dispatch_from(uint64_t va, State *state, Memory *memory) {
 
     g_functions_entered++;
     StopReason reason = trace_once(entry->function, state, va, memory);
-    if (top_level) {
+    if (top_level && !g_program_mode) {
         while (reason == StopReason::kReturned) {
             const LiftedEntry *next = lifted_lookup(g_stop_pc);
             if (!next) {
@@ -484,6 +491,10 @@ StopReason lifted_run_dispatched(uint64_t va, State *state, Memory *memory) {
 
 void lifted_report_undefined(bool enabled) { g_report_undefined = enabled; }
 
+void lifted_set_program_mode(bool enabled) {
+    g_program_mode = enabled;
+}
+
 void lifted_set_imports(import_table *table) {
     g_imports = table;
 }
@@ -517,6 +528,18 @@ extern "C" {
 /* Declared here, where the dispatcher that uses it lives, so it has the same
  * linkage as its definition. */
 Memory *call_import(State *state, const import_entry *import, Memory *memory);
+
+void lifted_trace_enter(uint64_t va, uint64_t pc) {
+    (void)pc;
+    g_functions_entered++;
+    const LiftedEntry *entry = lifted_lookup(va);
+    trace_dispatch("direct enter %s %#" PRIx64, entry ? entry->name : "?", va);
+}
+
+void lifted_trace_leave(uint64_t va, uint64_t pc) {
+    (void)pc;
+    trace_dispatch("direct leave %#" PRIx64, va);
+}
 
 StopReason lifted_stop_reason(void) { return g_reason; }
 uint64_t lifted_stop_pc(void) { return g_stop_pc; }
