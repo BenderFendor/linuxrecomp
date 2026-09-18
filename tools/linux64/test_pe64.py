@@ -394,9 +394,13 @@ def test_spec_document(tmp: str) -> None:
             raise AssertionError(f"schema accepted {why}")
 
 
-def test_fixtures() -> int:
+def _fixture_dir() -> str:
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    fixture_dir = os.path.join(root, "work", "linux64", "fixtures")
+    return os.path.join(root, "work", "linux64", "fixtures")
+
+
+def test_fixtures() -> int:
+    fixture_dir = _fixture_dir()
     targets = {"return42.exe": ("Sleep", "TlsGetValue", "VirtualProtect"),
                "kernel32.exe": ("GetTickCount64", "Sleep")}
     missing = [name for name in targets if not os.path.exists(os.path.join(fixture_dir, name))]
@@ -449,6 +453,60 @@ def test_fixtures() -> int:
     return checked
 
 
+def test_msvc_rtti_fixture() -> int:
+    """Recon and the ported x64 RTTI parser must agree on the same image.
+
+    ``rtti_msvc.exe`` is MSVC-ABI on purpose, because the parser reads MSVC's
+    x64 RTTI records (locator signature 1, image-relative pointer fields).
+    A vtable slot is proof that a function starts there, so a slot landing in
+    the *interior* of a recovered range means one of the two is wrong. Leaf
+    methods carry no ``.pdata`` entry, so the check is "no interior hits",
+    not "every method is covered" — methods outside any range must still be
+    inside executable code.
+    """
+    path = os.path.join(_fixture_dir(), "rtti_msvc.exe")
+    if not os.path.exists(path):
+        print("rtti fixture: SKIP (run ./scripts/build-win64-fixtures.sh)")
+        return 0
+
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cpp"))
+    import rtti
+
+    image = PE64Image.load(path)
+    functions, _notes = fn.recover_functions(image)
+    result = rtti.recover(path)
+
+    classes = sorted({rtti.demangle(name) for _, name, _, _ in result["vtables"]})
+    assert "Derived" in classes, classes
+    methods = rtti.seeds(result)
+    assert len(methods) >= 3, [hex(m) for m in methods]
+
+    code = image.code_ranges()
+    starts = {image.va(function.start_rva) for function in functions}
+    interior = []
+    for method in methods:
+        rva = image.rva_of(method)
+        assert any(start <= rva < end for start, end in code), \
+            f"RTTI method 0x{method:X} is not in executable code"
+        for function in functions:
+            if function.end_rva is None:
+                continue
+            if image.va(function.start_rva) < method < image.va(function.end_rva):
+                interior.append((method, function))
+    assert not interior, [(hex(m), hex(image.va(f.start_rva))) for m, f in interior]
+    assert starts & set(methods), "no RTTI method matched a recovered function start"
+
+    export = [symbol for symbol in image.exports if symbol.name == "mainCRTStartup"]
+    assert len(export) == 1, [symbol.name for symbol in image.exports]
+    assert image.va(export[0].rva) in starts, hex(image.va(export[0].rva))
+
+    assert fn.validate_ranges(image, functions) == ()
+    print(f"rtti fixture: ok ({len(classes)} class, {len(methods)} methods, "
+          f"{len(starts & set(methods))} on recovered starts, 0 interior)")
+    return len(methods)
+
+
 def main() -> int:
     import tempfile
 
@@ -464,6 +522,7 @@ def main() -> int:
         test_spec_document(tmp)
     print("pe64 synthetic: ok")
     test_fixtures()
+    test_msvc_rtti_fixture()
     return 0
 
 

@@ -24,9 +24,12 @@ a normal result, not a failure: callers get empty dicts and should carry on.
     python tools/cpp/rtti.py game.exe -o rtti.json --seeds config/seeds.json
     python tools/disasm/disasm32.py game.exe --seed-functions config/seeds.json
 
-Structures (32-bit MSVC; all fields are plain VAs, with none of the
-image-relative indirection x64 RTTI uses -- which is what makes this port from
-the Xbox original almost free, since the original Xbox is 32-bit MSVC too):
+Both MSVC layouts are parsed, and they are different code rather than one code
+path with a wider word. In the PE32 one every inter-record pointer is an
+absolute VA and the locator's sig reads 0; in the PE32+ one every such pointer
+is a 4-byte image-relative offset and sig reads 1. Read `pointer` fields
+through `Image.va_of`, or a PE32+ offset gets used as an address and whatever
+lives there is reported as a class.
 
     TypeDescriptor            { void *vfptr; void *spare; char name[]; }
     CompleteObjectLocator     { u32 sig; u32 offset; u32 cdOffset;
@@ -72,6 +75,13 @@ class Image:
         with open(path, "rb") as f:
             self.d = f.read()
         self.image_base = info.image_base
+        # MSVC RTTI is pointer-shaped twice over: the records are framed by
+        # pointer fields, and the records refer to each other with one. In
+        # PE32 that pointer is an absolute VA. In PE32+ it is a 4-byte
+        # image-relative offset and the locator's signature reads 1, so the
+        # two are different code, not the same code with a wider word.
+        self.ptr = 8 if info.pe_type == 'PE32+' else 4
+        self.sig = 1 if self.ptr == 8 else 0
         # (va, raw_offset, raw_size, name, is_code)
         self.secs = [(info.image_base + s.virtual_address, s.raw_offset,
                       s.raw_size, s.name, s.is_code)
@@ -89,6 +99,25 @@ class Image:
         if r is None or r + 4 > len(self.d):
             return None
         return struct.unpack_from("<I", self.d, r)[0]
+
+    def uptr(self, va):
+        r = self.raw(va)
+        if r is None or r + self.ptr > len(self.d):
+            return None
+        return struct.unpack_from("<Q" if self.ptr == 8 else "<I", self.d, r)[0]
+
+    def va_of(self, field):
+        """Resolve an RTTI record's pointer field to an address.
+
+        PE32 stores an absolute VA there. PE32+ stores a 32-bit offset from the
+        image base, so the base has to go back on before the field can be used
+        as an address. Feeding a PE32+ offset straight into a VA lookup is how
+        a parser "finds" type descriptors at addresses that hold something
+        else.
+        """
+        if field is None:
+            return None
+        return self.image_base + field if self.ptr == 8 else field
 
     def is_code(self, va):
         return any(lo <= va < hi for lo, hi in self.code)
@@ -116,16 +145,18 @@ class Image:
         b = self.raw(va)
         if b is None or b + 5 > len(self.d) or self.d[b] != 0xE9:
             return None
-        target = (va + 5 + struct.unpack_from("<i", self.d, b + 1)[0]) & 0xFFFFFFFF
+        mask = 0xFFFFFFFFFFFFFFFF if self.ptr == 8 else 0xFFFFFFFF
+        target = (va + 5 + struct.unpack_from("<i", self.d, b + 1)[0]) & mask
         return target if self.is_code(target) else None
 
 
 def type_descriptors(img):
-    """{typedescriptor_va: decorated_name}. The name field is 8 bytes in."""
+    """{typedescriptor_va: decorated_name}. Two pointer fields precede the name."""
+    header = 2 * img.ptr
     out = {}
     for v, r, rs, _, _ in img.secs:
         for m in TD_NAME.finditer(img.d[r:r + rs]):
-            out[v + m.start() - 8] = m.group()[:-1].decode("latin1")
+            out[v + m.start() - header] = m.group()[:-1].decode("latin1")
     return out
 
 
@@ -136,9 +167,15 @@ def locators(img, td):
         limit = min(rs, len(img.d) - r)
         for off in range(0, max(0, limit - 20), 4):
             sig, sub, _cd, ptd, pcd = struct.unpack_from("<5I", img.d, r + off)
-            # sig is 0 for 32-bit MSVC RTTI; 1 means the image-relative x64
-            # layout, which this does not parse.
-            if sig != 0 or ptd not in td or img.raw(pcd) is None:
+            # sig names the layout: 0 is the 32-bit one, 1 the 64-bit one.
+            # Accept only the one this image should have. A 32-bit binary never
+            # carries a 1 and a 64-bit one never carries a 0, and a record read
+            # at the wrong width resolves by coincidence often enough to name
+            # the wrong class instead of failing.
+            if sig != img.sig:
+                continue
+            ptd, pcd = img.va_of(ptd), img.va_of(pcd)
+            if ptd not in td or img.raw(pcd) is None:
                 continue
             out[v + off] = (td[ptd], sub, pcd)
     return out
@@ -154,15 +191,18 @@ def hierarchy(img, td, cols):
     for name, _sub, pcd in cols.values():
         if name in out:
             continue
-        n, pba = img.u32(pcd + 8), img.u32(pcd + 12)
+        n = img.u32(pcd + 8)
+        pba = img.va_of(img.u32(pcd + 12))
         if not n or not (0 < n < 200) or pba is None or img.raw(pba) is None:
             continue
         bases = []
         for i in range(n):
-            b = img.u32(pba + i * 4)
+            # The base class array holds the same flavour of pointer as the
+            # rest of this RTTI: absolute on PE32, image-relative on PE32+.
+            b = img.va_of(img.u32(pba + i * 4))
             if b is None or img.raw(b) is None:
                 break
-            ptd = img.u32(b)
+            ptd = img.va_of(img.u32(b))
             if ptd not in td:
                 break
             bases.append(td[ptd])
@@ -190,14 +230,17 @@ def vtables(img, cols):
         # exactly equal to the address of a CompleteObjectLocator this image
         # actually contains, and the array after it must be code pointers.
         limit = min(rs, len(img.d) - r)
-        for off in range(0, max(0, limit - 4), 4):
-            w = struct.unpack_from("<I", img.d, r + off)[0]
+        # Vtable slots are pointer-sized and pointer-aligned, so the scan steps
+        # by the width. Stepping by 4 on a 64-bit image straddles every slot
+        # and matches nothing.
+        for off in range(0, max(0, limit - img.ptr), img.ptr):
+            w = img.uptr(v + off)
             if w not in cols:
                 continue
-            start = v + off + 4
+            start = v + off + img.ptr
             methods = []
-            while img.is_code(img.u32(start + len(methods) * 4) or 0):
-                methods.append(img.u32(start + len(methods) * 4))
+            while img.is_code(img.uptr(start + len(methods) * img.ptr) or 0):
+                methods.append(img.uptr(start + len(methods) * img.ptr))
             if methods:
                 name, sub, _ = cols[w]
                 out.append((start, name, sub, methods))
@@ -382,48 +425,62 @@ def main(argv=None):
     return 0
 
 
-def demo():
-    """One runnable check: build a tiny image with real RTTI records in it."""
-    class _Sec:
-        def __init__(self, name, va, off, size, chars):
-            self.name, self.virtual_address = name, va
-            self.raw_offset, self.raw_size = off, size
-            self.virtual_size, self.characteristics = size, chars
+def _selftest_image(ptr):
+    """A synthetic image carrying one real RTTI record set, `ptr` bytes wide.
 
-        @property
-        def is_code(self):
-            return bool(self.characteristics & 0x20000020)
-
+    Parameterised by width because the two MSVC layouts are different code:
+    the inter-record pointers are absolute VAs at 4 bytes and image-relative
+    offsets at 8, and the locator sig is what tells them apart. A case that
+    covers one width cannot fail when the other is wrong.
+    """
     BASE = 0x400000
     # Layout: .text at RVA 0x1000 (file 0x400), .rdata at RVA 0x2000 (file 0x1400).
     TEXT_VA, RDATA_VA = BASE + 0x1000, BASE + 0x2000
     rdata = bytearray(0x200)
 
-    def put(off, *words):
+    def put32(off, *words):
+        """An RTTI record's fields are u32 at BOTH widths.
+
+        Only the *meaning* of a pointer field changes: an absolute VA in
+        PE32, a 4-byte image-relative offset in PE32+. The record frame stays
+        four bytes wide, so packing these at pointer width puts the fields in
+        the wrong places and the parser is then tested against a layout no
+        compiler emits.
+        """
         struct.pack_into("<%dI" % len(words), rdata, off, *words)
 
-    # TypeDescriptor at rdata+0x00: vfptr, spare, then the name at +8.
+    def putptr(off, *words):
+        """Vtable slots: pointer-sized and pointer-aligned."""
+        struct.pack_into("<%dQ" % len(words) if ptr == 8 else "<%dI" % len(words),
+                         rdata, off, *words)
+
+    def field(va):
+        """A pointer *inside* an RTTI record: absolute VA, or image-relative."""
+        return va if ptr == 4 else va - BASE
+
+    # TypeDescriptor at rdata+0x00: vfptr, spare, then the name. This header
+    # IS pointer-framed, unlike the records below it.
     name = b".?AVCWidget@@\x00"
-    put(0x00, 0, 0)
-    rdata[0x08:0x08 + len(name)] = name
+    rdata[2 * ptr:2 * ptr + len(name)] = name
     td_va = RDATA_VA + 0x00
 
     # ClassHierarchyDescriptor at +0x40: sig, attrs, numBases, pBaseArray
     chd_va = RDATA_VA + 0x40
     bca_va = RDATA_VA + 0x60
-    put(0x40, 0, 0, 1, bca_va)
+    put32(0x40, 0, 0, 1, field(bca_va))
     # BaseClassDescriptor array: one entry, pointing at a BCD at +0x70
     bcd_va = RDATA_VA + 0x70
-    put(0x60, bcd_va)
-    put(0x70, td_va, 0, 0, 0)
+    put32(0x60, field(bcd_va))
+    put32(0x70, field(td_va), 0, 0, 0, 0, 0)     # 24 bytes, ends at +0x88
 
-    # CompleteObjectLocator at +0x80: sig=0, offset=0, cdOffset=0, pTD, pCHD
-    col_va = RDATA_VA + 0x80
-    put(0x80, 0, 0, 0, td_va, chd_va)
+    # CompleteObjectLocator at +0x90: sig, offset, cdOffset, pTD, pCHD
+    col_va = RDATA_VA + 0x90
+    put32(0x90, 1 if ptr == 8 else 0, 0, 0, field(td_va), field(chd_va))
 
-    # The vtable: the COL word, then three method pointers into .text.
+    # The vtable at +0xB0: the COL word, then three method pointers.
     m = [TEXT_VA + 0x10, TEXT_VA + 0x40, TEXT_VA + 0x80]
-    put(0xA0, col_va, m[0], m[1], m[2], 0)
+    putptr(0xB0, col_va, m[0], m[1], m[2], 0)
+    vt_va = RDATA_VA + 0xB0 + ptr
 
     data = bytearray(0x1600)
     data[0x1400:0x1400 + len(rdata)] = rdata
@@ -431,25 +488,34 @@ def demo():
     img = Image.__new__(Image)
     img.d = bytes(data)
     img.image_base = BASE
+    img.ptr = ptr
+    img.sig = 1 if ptr == 8 else 0
     img.secs = [(TEXT_VA, 0x400, 0x1000, ".text", True),
                 (RDATA_VA, 0x1400, 0x200, ".rdata", False)]
     img.code = [(TEXT_VA, TEXT_VA + 0x1000)]
+    return img, td_va, col_va, vt_va, m
+
+
+def _selftest_case(ptr):
+    """Every recovery step, over one width's synthetic image."""
+    img, td_va, col_va, vt_va, m = _selftest_image(ptr)
+    where = f"ptr={ptr}"
 
     td = type_descriptors(img)
-    assert td == {td_va: ".?AVCWidget@@"}, td
+    assert td == {td_va: ".?AVCWidget@@"}, (where, td)
 
     cols = locators(img, td)
-    assert col_va in cols, f"the COL should be found: {[hex(k) for k in cols]}"
-    assert cols[col_va][0] == ".?AVCWidget@@" and cols[col_va][1] == 0, cols[col_va]
+    assert col_va in cols, f"{where}: the COL should be found: {[hex(k) for k in cols]}"
+    assert cols[col_va][0] == ".?AVCWidget@@" and cols[col_va][1] == 0, (where, cols)
 
     h = hierarchy(img, td, cols)
-    assert h == {".?AVCWidget@@": [".?AVCWidget@@"]}, h
+    assert h == {".?AVCWidget@@": [".?AVCWidget@@"]}, (where, h)
 
     vts = vtables(img, cols)
-    assert len(vts) == 1, vts
+    assert len(vts) == 1, (where, vts)
     va, nm, sub, ms = vts[0]
-    assert va == RDATA_VA + 0xA4, hex(va)
-    assert ms == m, [hex(x) for x in ms]
+    assert va == vt_va, (where, hex(va))
+    assert ms == m, (where, [hex(x) for x in ms])
     assert sub == 0
 
     r = {"image": img, "type_descriptors": td, "locators": cols,
@@ -457,18 +523,24 @@ def demo():
          "primary_len": {".?AVCWidget@@": 3},
          "primary_va": {".?AVCWidget@@": va}}
     assert seeds(r) == sorted(m), "every vtable slot is a function entry point"
-    assert owning_class(r) == {a: "CWidget" for a in m}
-    assert names(r)[f"0x{m[0]:08X}"] == f"CWidget__{m[0]:08X}"
+    assert owning_class(r) == {a: "CWidget" for a in m}, where
+    assert names(r)[f"0x{m[0]:08X}"] == f"CWidget__{m[0]:08X}", where
 
     # The method array stops at the first non-code word: the trailing 0 above
     # must not be swallowed, or every vtable runs into whatever follows it.
     assert len(ms) == 3, "the array ends where the code pointers end"
 
+
+def demo():
+    """One runnable check per pointer width, over real RTTI records."""
+    _selftest_case(4)
+    _selftest_case(8)
+
     assert demangle(".?AUPlainStruct@@") == "PlainStruct"
     assert demangle(".?AV?$vector@H@std@@").startswith("vector@H@std"), \
         "template arguments stay decorated rather than being half-parsed"
 
-    print("rtti.py self-test OK")
+    print("rtti.py self-test OK (PE32 and PE32+ layouts)")
 
 
 if __name__ == "__main__":

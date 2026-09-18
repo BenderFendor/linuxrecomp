@@ -3,10 +3,13 @@
 Two kinds of checkable thing live here, both runnable without a full target.
 
 `fixtures/win64/` — PE32+/AMD64 programs cross-compiled by
-`scripts/build-win64-fixtures.sh` with `x86_64-w64-mingw32-gcc` into
-`work/linux64/fixtures/`. They are inputs to reconnaissance and, from P2 onward,
-to the lifter. `return42.exe` has one exported function and a known return
-value; `kernel32.exe` imports `GetTickCount64`/`Sleep`.
+`scripts/build-win64-fixtures.sh` into `work/linux64/fixtures/`. They are inputs
+to reconnaissance and, from P2 onward, to the lifter. `return42.exe` has one
+exported function and a known return value; `kernel32.exe` imports
+`GetTickCount64`/`Sleep`; `rtti_msvc.exe` carries MSVC-ABI x64 RTTI records and
+is built with `clang --target=x86_64-pc-windows-msvc` plus `lld-link` rather
+than MinGW, because GCC emits Itanium RTTI and would not exercise the parser
+that `tools/cpp/rtti.py` runs.
 
 `winelib/` — the probes that prove the Win32 API strategy: winegcc-built code is
 native ELF, Win32 calls reach Wine's DLLs, a plain native ELF library stands in

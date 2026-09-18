@@ -334,6 +334,12 @@ def _analyze_with_struct(filepath: str, info: PEInfo) -> None:
     opt = coff + 20
     opt_magic = struct.unpack_from('<H', data, opt)[0]
     info.pe_type = 'PE32' if opt_magic == 0x10B else 'PE32+' if opt_magic == 0x20B else 'unknown'
+    # Import thunks are pointer-sized: 4 bytes in PE32, 8 in PE32+. Reading a
+    # PE32+ thunk as a u32 takes the low half (a valid RVA, so exactly one name
+    # comes out of it) and then the high half (zero for every RVA in an
+    # ordinary image, so the walk stops there). The failure is one import per
+    # DLL, silently, and only on 64-bit binaries.
+    ptr_size = 8 if opt_magic == 0x20B else 4
 
     linker_major = data[opt + 2]
     linker_minor = data[opt + 3]
@@ -430,10 +436,13 @@ def _analyze_with_struct(filepath: str, info: PEInfo) -> None:
                             slot_rva = lookup_rva
                             p = loff
                             while True:
-                                entry = struct.unpack_from('<I', data, p)[0]
+                                entry = struct.unpack_from(
+                                    '<Q' if ptr_size == 8 else '<I', data, p)[0]
+                                ordinal_flag = (0x8000000000000000 if ptr_size == 8
+                                                else 0x80000000)
                                 if entry == 0:
                                     break
-                                if entry & 0x80000000:
+                                if entry & ordinal_flag:
                                     info.imports.append(ImportEntry(
                                         dll=dll_name,
                                         name=None,
@@ -441,7 +450,7 @@ def _analyze_with_struct(filepath: str, info: PEInfo) -> None:
                                         iat_rva=slot_rva,
                                     ))
                                 else:
-                                    hint_off = rva_to_offset(entry)
+                                    hint_off = rva_to_offset(entry & 0xFFFFFFFF)
                                     if hint_off and hint_off + 2 < len(data):
                                         end2 = data.index(b'\x00', hint_off + 2)
                                         fname = data[hint_off + 2:end2].decode('ascii', errors='replace')
@@ -451,8 +460,8 @@ def _analyze_with_struct(filepath: str, info: PEInfo) -> None:
                                             ordinal=None,
                                             iat_rva=slot_rva,
                                         ))
-                                p += 4
-                                slot_rva += 4
+                                p += ptr_size
+                                slot_rva += ptr_size
                     pos += 20
 
     # ── Exports ───────────────────────────────────────────────────

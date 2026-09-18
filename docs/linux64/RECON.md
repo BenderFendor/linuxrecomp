@@ -79,21 +79,50 @@ Real-world check, Wine's own `kernel32.dll` (450 KB, 13 sections): 932 imports
 from 2 DLLs, 1,362 exports (1,260 code, 102 forwarders), 1,869 `.pdata` entries,
 2,668 functions, 158,627 covered code bytes, zero range problems.
 
-## Why this does not reuse `tools/pe/pe_analyze.py`
+## Relation to the upstream PE tools
 
-That analyzer is 32-bit first, and its `struct` fallback walks import thunks in
-4-byte steps with a 32-bit ordinal flag. On a PE32+ image the thunk array is
-8 bytes per entry, so the walk reads the low half of thunk 0 (a name RVA), then
-the high half of the same thunk (always zero) and stops — reporting exactly one
-import per DLL. On the fixture above it reports 9 imports from 9 DLLs where the
-image has 45 (KERNEL32 alone has 14).
+`tools/pe/pe_analyze.py` remains the repo's general PE analyzer and everything
+architecture-neutral still uses it (`catalog.py`, `rsrc.py`, `map_names.py`,
+`debug_symbols.py`). Its `struct` fallback — the path taken when `pefile` is
+absent — used to walk import thunks in 4-byte steps with a 32-bit ordinal flag.
+On a PE32+ image that reads thunk 0's low half (a valid name RVA), then the same
+thunk's high half (zero) and stops, reporting exactly one import per DLL.
 
-`tools/linux64/pe64.py` therefore exists as a PE32+ reader with the
-architecture-specific rules in one place: 8-byte thunks, 64-bit image base and
-TLS addresses stored as VAs, `DIR64` relocations, and the `.pdata`
-`RUNTIME_FUNCTION` table. It is stdlib-only, bounds-checks every read, and
-refuses a PE32 image with a message pointing at the 32-bit pipeline. The 16/32-bit
-paths in `tools/pe` and `tools/disasm` are untouched.
+That defect is fixed in this fork, ported from work already verified against a
+189 MB x64 binary where it took the import count from 109 to 3,928, matching
+`objdump -p` exactly. On the fixture below the patched analyzer now reports 45
+imports from 9 DLLs; `python tools/pe/pe_analyze.py
+work/linux64/fixtures/return42.exe` checks that in one command.
+
+`tools/linux64/pe64.py` is not a reimplementation of that fix. Recon needs what
+`pe_analyze` does not model: base relocations with decoded kinds, the TLS
+directory and its callback array, exports with forwarders, `.pdata` plus decoded
+`UNWIND_INFO`, every data directory, and the loader's section mapping rule for
+raw tails. Those are what the spec is built from. `pe64.py` also refuses a PE32
+image outright rather than half-parsing one.
+
+## C++ RTTI as a second source of function starts
+
+`tools/cpp/rtti.py` reads MSVC RTTI, and in this fork it handles the x64 layout
+as well: locator signature reads 1 instead of 0, and every inter-record pointer
+is a 4-byte image-relative offset rather than an absolute VA. Getting that wrong
+is not a crash — the parser "finds" type descriptors at addresses that hold
+something else and names the wrong class.
+
+On a large x64 binary this recovers tens of thousands of classes and vtable
+slots. A vtable slot is proof of a function start, including the virtual-only
+methods that no CALL site names and `.pdata` may omit.
+
+The two recoveries are checked against each other on `rtti_msvc.exe`, which is
+MSVC-ABI on purpose: GCC emits Itanium RTTI, so a MinGW fixture would not
+exercise the parser at all. The checks are that every RTTI method address falls
+inside executable code, that none falls in the *interior* of a recovered range,
+and that at least one coincides with a recovered start. "No interior hits" is
+the load-bearing one: a wrongly matched RTTI record produces an interior
+address, and an interior address is junk for a lifter.
+
+Ingesting those starts into the spec is P8 work; it would add an `rtti` value to
+the function `source` enum.
 
 ## Known gaps (deliberate, tracked in ROADMAP.md)
 
@@ -103,14 +132,17 @@ paths in `tools/pe` and `tools/disasm` are untouched.
 * No direct call/jump edges or indirect-call sites yet (P3).
 * Delay imports are not parsed; `tools/pe/delay_imports.py` covers that question
   today.
-* Load-config, RTTI, and `.xdata` handler bodies are recorded but not yet
-  interpreted (P8).
+* Load-config and `.xdata` handler bodies are recorded but not yet interpreted
+  (P8).
+* RTTI-recovered starts are not yet merged into the spec (P8).
 
 ## Checks
 
 ```
 python -m tools.linux64 selftest        # synthetic PE32+ image + fixtures + schema
 python -m tools.linux64 doctor          # toolchain, Wine layer, pinned upstreams
+python tools/cpp/rtti.py --selftest     # RTTI parser at both pointer widths
+python tools/pe/pe_analyze.py work/linux64/fixtures/return42.exe   # 45 imports
 ```
 
 `test_pe64.py` builds a synthetic PE32+ image byte by byte and asserts exact

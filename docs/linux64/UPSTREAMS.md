@@ -8,8 +8,8 @@ should be rare and deliberate; `upstreams.lock.toml` holds the pinned revisions.
 Keep:
 
 * project organisation and pipeline philosophy;
-* PE import/section/catalog tooling that works for PE32+ (verified: `catalog.py`,
-  `rsrc.py`, `pe_analyze.py` section/header reporting);
+* PE import/section/catalog tooling — verified on PE32+ after the x64 analysis
+  port, below;
 * Ghidra and IDA helper scripts — `tools/ghidra/DumpBounds.java` is the function
   bounds source used by `recon --bounds`;
 * the differential-testing approach and `--selftest` convention;
@@ -18,8 +18,24 @@ Keep:
   hand-written shims;
 * the generated-code publishing discipline (`tools/audit_repo.py`).
 
-Do not take: `tools/pe/pe_analyze.py`'s import walk for PE64. It is a 32-bit
-walker and reports one import per DLL on a PE32+ image (see `RECON.md`).
+### x64 analysis port (applied here)
+
+Two upstream defects were found and fixed while evaluating this toolchain
+against a 189 MB x64 binary, and this fork carries the fixes:
+
+* `tools/pe/pe_analyze.py` walked import thunks at 4-byte stride with a 32-bit
+  ordinal flag. On PE32+ that reports one import per DLL: 109 instead of 3,928
+  on that binary, and 9 instead of 45 on this repo's fixture. Now
+  pointer-sized, verified against `objdump -p`.
+* `tools/cpp/rtti.py` refused the PE32+ RTTI layout. Now parses both widths
+  (locator signature 0/1, absolute VA vs. 4-byte image-relative field), which
+  took a large x64 target from 0 to 15,981 classes and 50,561 virtual methods,
+  with 80.5% of vtable slots landing exactly on `.pdata` starts and none landing
+  inside a known function.
+
+Both are `--selftest`-covered (`rtti.py` builds its synthetic image at both
+widths), and recon's fixture checks keep the import fix honest. The 16-bit and
+32-bit paths are unchanged by either.
 
 ## Wine — the Win32 API layer (required)
 

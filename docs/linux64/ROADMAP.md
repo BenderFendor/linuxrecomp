@@ -101,9 +101,24 @@ Target: a tiny tone/buffer fixture.
 
 ## P8 — C++/MSVC hard cases
 
-Added as a real target demands them: `.pdata`/`.xdata` handler bodies, MSVC
-RTTI/vtables, adjustor thunks, TLS callbacks, SEH/C++ exception strategy, delay
-imports, COM boundaries, indirect calls and function pointers.
+Added as a real target demands them: `.pdata`/`.xdata` handler bodies,
+adjustor thunks, TLS callbacks, SEH/C++ exception strategy, delay imports, COM
+boundaries, indirect calls and function pointers.
+
+Two pieces are already in the tree rather than pending:
+
+* **x64 RTTI recovery.** `tools/cpp/rtti.py` handles the PE32+ layout, and the
+  fork checks it against recon on `rtti_msvc.exe`: no recovered method may land
+  in the interior of a recovered range. Verified on a large x64 binary as well,
+  where 80.5% of vtable slots landed exactly on `.pdata` starts and none landed
+  inside a known function.
+* **`.pdata`/`.xdata` reading.** Recon records every `RUNTIME_FUNCTION` with
+  decoded `UNWIND_INFO` (prolog size, code slots, frame register, handler VA,
+  chain). Interpreting handler bodies is the remaining work.
+
+Still open: ingesting RTTI starts into the spec (adds an `rtti` value to the
+function `source` enum) and consuming them, e.g. through the Ghidra
+`SeedFunctions.java` path that was built for exactly that on a large x64 target.
 
 ## P9 — first real game
 

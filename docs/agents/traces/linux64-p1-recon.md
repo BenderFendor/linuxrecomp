@@ -96,3 +96,40 @@ untouched; the 32-bit path still uses the old analyzer.
 
 P2: build Remill, lift one function from `work/linux64/program.json`, and compare
 its execution against a reference for the same bytes.
+
+## Update after delivery: the x64 analysis port already existed in the vault
+
+The vault search turned up `linuxphotoshop/notes/pcrecomp-x64-analysis-tools-2026-09-18.md`
+and `linuxphotoshop/pcrecomp-x64-port.patch` — 136 insertions across two files,
+made against the same upstream revision this fork is based on. It fixed the same
+`pe_analyze.py` import walk this task had independently re-derived in
+`pe64.py`, and additionally taught `tools/cpp/rtti.py` the PE32+ RTTI layout.
+
+Applied with `git apply` (clean) rather than reimplemented, then verified in the
+fork:
+
+| Check | Before | After |
+|---|---|---|
+| `python3 tools/pe/pe_analyze.py work/linux64/fixtures/return42.exe` | 9 imports from 9 DLLs | **45 imports from 9 DLLs** (objdump: 45) |
+| `python3 tools/cpp/rtti.py --selftest` | `self-test OK` (PE32 only) | `self-test OK (PE32 and PE32+ layouts)` |
+| `python3 tools/cpp/rtti.py work/linux64/fixtures/rtti_msvc.exe` | n/a | 2 type descriptors, 1 COL, 1 vtable, 1 class, 3 virtual methods |
+
+The fix is now guarded inside this fork rather than living only in a vault patch:
+`tests/fixtures/win64/rtti_msvc.cpp` is MSVC-ABI on purpose (GCC emits Itanium
+RTTI, so MinGW cannot produce this fixture), built with
+`clang --target=x86_64-pc-windows-msvc` plus `lld-link` in
+`scripts/build-win64-fixtures.sh`, and `test_pe64.py` checks that recon and the
+RTTI recovery agree on it: every recovered method must be inside executable
+code, none may fall in the interior of a recovered range, and at least one must
+coincide with a recovered start. Measured: 3 methods, 1 on a recovered start, 0
+interior.
+
+`pe64.py` was kept even though `pe_analyze` now handles PE32+ imports, because
+recon needs exports with forwarders, relocations, TLS, `.pdata`/`UNWIND_INFO`
+and the section mapping rule — none of which `pe_analyze` models. `RECON.md`
+was corrected accordingly: it previously said the upstream analyzer reports 9
+imports, which is no longer true.
+
+The vault note also documents `ghidra_scripts/SeedFunctions.java`, the consumer
+for RTTI-recovered starts, which is the shape P8 should reuse when RTTI starts
+are merged into the spec.
