@@ -39,6 +39,12 @@ STOP_PATTERNS = (
     re.compile(r"stop jump at (0x[0-9a-fA-F]+) \(jump to unlifted address"),
 )
 
+# A return address is not a function entry. A return into the middle of a function
+# says the frames are wrong, not that a function is missing, and lifting it as a
+# function creates a pseudo-entry that the dispatcher will later "continue" at. It
+# happened: sub_14000BF20 exists only because a return landed inside sub_14000BEC0.
+RETURN_TO = re.compile(r"stop [a-z-]+ at (0x[0-9a-fA-F]+) \(return to unlifted address")
+
 
 def harness_path(image: str, flavour: str) -> pathlib.Path:
     stem = pathlib.Path(image).name
@@ -73,12 +79,39 @@ def run_once(image: str, entry: int, flavour: str, arguments: Sequence[str],
     return completed.stdout + completed.stderr
 
 
-def missing_targets(output: str) -> List[int]:
+def missing_targets(output: str, lifted_ranges: Sequence[Tuple[int, int]] = ()) -> List[int]:
     found: Dict[int, None] = {}
+    returns = {int(match.group(1), 16) for match in RETURN_TO.finditer(output)}
     for pattern in STOP_PATTERNS:
         for match in pattern.finditer(output):
-            found[int(match.group(1), 16)] = None
+            address = int(match.group(1), 16)
+            if address in returns:
+                # Inside a lifted range: a frame problem, not a missing function.
+                if any(low <= address < high for low, high in lifted_ranges):
+                    print(f"  {address:#x} is a return inside a lifted function; "
+                          f"not a lift target")
+                    continue
+            found[address] = None
     return sorted(found)
+
+
+def lifted_ranges(lift_root: pathlib.Path, image: str) -> List[Tuple[int, int]]:
+    """Guest ranges the current lifts cover, from their manifests."""
+    import hashlib
+    import json
+    digest = hashlib.sha256(pathlib.Path(image).read_bytes()).hexdigest()[:8]
+    ranges = []
+    for manifest in lift_root.glob(f"*/sub_*/sub_*.manifest.json"):
+        if digest not in str(manifest.parent.parent.name):
+            continue
+        source = json.loads(manifest.read_text()).get("source", {})
+        start = source.get("function_start_rva")
+        length = source.get("byte_length")
+        base = source.get("function_va", 0) - start if start is not None else 0
+        if start is None or not length:
+            continue
+        ranges.append((base + start, base + start + length))
+    return ranges
 
 
 def report_line(output: str) -> str:
@@ -121,7 +154,7 @@ def run(image: str, entry: int, rounds: int, jobs: int, flavour: str,
             handle.write(f"===== round {round_number} =====\n{output}\n")
             handle.flush()
             print(f"round {round_number}: {report_line(output)}")
-            targets = missing_targets(output)
+            targets = missing_targets(output, lifted_ranges(lift_root, image))
             if not targets:
                 print(f"no unlifted code reached; full output in {transcript}")
                 return 0
