@@ -676,6 +676,18 @@ StopReason dispatch_from(uint64_t va, State *state, Memory *memory) {
 
     g_functions_entered++;
     StopReason reason = trace_once(entry->function, state, va, memory);
+    if (top_level && g_program_mode && reason == StopReason::kReturned && g_stop_pc != 0 &&
+        !lifted_lookup(g_stop_pc)) {
+        /* A program that returns to an address with no entry of its own has returned into
+         * the middle of lifted code: the tail of a function the compiler split, reached by
+         * a transfer the recovery did not model as a call. That address needs its own
+         * lifted entry, and the coverage loop can only learn that if the run says so -
+         * otherwise it reports nothing missing and stops here, which is exactly what
+         * HLExtract did at 0x14000bfdd, inside sub_14000bec0's range. */
+        record_missing(g_stop_pc);
+        std::snprintf(g_detail, sizeof(g_detail),
+                      "return into lifted code at %#" PRIx64 " with no entry", g_stop_pc);
+    }
     if (top_level && !g_program_mode) {
         while (reason == StopReason::kReturned) {
             const LiftedEntry *next = lifted_lookup(g_stop_pc);
@@ -1099,7 +1111,18 @@ Memory *__remill_function_call(State &state, uint64_t target, Memory *memory) {
     trace_dispatch("call  %#" PRIx64 " rsp=%#" PRIx64, target, state.gpr.rsp.qword);
     if (const import_entry *import = imports_find_host(g_imports, target)) {
         shadow_push(state.gpr.rsp.qword, "import", target);
-        return call_import(&state, import, memory, true);
+        Memory *result = call_import(&state, import, memory, true);
+        /* The caller continues in its own lifted code, so a return recorded before this
+         * call is not this frame's return. call_import sets the stop state on the tail-jump
+         * path, and the lifted-callee path below clears it for the same reason; an import
+         * call left it alone, so a stale address from an earlier return survived and a
+         * later propagation reported it as this frame's - which is how a run ended
+         * reporting a return to 0x14000bfdd, an address inside a function that had already
+         * carried on. */
+        g_reason = StopReason::kError;
+        g_stop_pc = 0;
+        g_detail[0] = '\0';
+        return result;
     }
     if (!lifted_lookup(target)) {
         record_missing(target);
