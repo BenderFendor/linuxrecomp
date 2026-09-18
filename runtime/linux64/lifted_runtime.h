@@ -54,6 +54,14 @@ const char *lifted_stop_reason_name(StopReason reason);
  * treating them as zero. */
 void lifted_report_undefined(bool enabled);
 
+/* Print every guest memory access. For diagnosing an unexplained fault, where
+ * the last access before it is the useful clue. */
+void lifted_set_memory_trace(bool enabled);
+
+/* Print each trace boundary: entry, finish and halt. For locating a fault that
+ * the host cannot report. */
+void lifted_set_dispatch_trace(bool enabled);
+
 /* Dispatch table: guest VA to lifted function. Generated per build from the
  * lift manifests, so a build cannot silently reference a function nobody
  * lifted. */

@@ -84,13 +84,17 @@ def ensure_built() -> str:
 
 
 def _parse_report(text: str, stderr: str) -> RefRun:
-    """Parse one executor report. Raises when the report is missing what a
-    comparison needs."""
+    """Parse one executor report from either stream.
+
+    The reference executor writes to stdout and the lifted harness to stderr,
+    because stdout blocks in a Wine process. Scanning both means the caller does
+    not have to care which executor it ran.
+    """
     match = None
     memory: Dict[int, bytes] = {}
     stop = None
     stop_pc = None
-    for line in text.splitlines():
+    for line in [*text.splitlines(), *stderr.splitlines()]:
         found = RESULT_RE.match(line)
         if found:
             match = found

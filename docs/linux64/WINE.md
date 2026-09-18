@@ -6,7 +6,7 @@ implementations as libraries and keeps the recompiled program as our own native
 code.
 
 Run `./scripts/check-winelib.sh` to verify every claim on this page on the
-current machine. It builds and runs four probes and prints one line per check.
+current machine. It builds and runs five probes and prints one line per check.
 
 ## What is actually used
 
@@ -18,7 +18,7 @@ Three separate things come from the installed Wine:
 | Import libraries | `/usr/lib/wine/x86_64-unix/libkernel32.a`, `libuser32.a`, `libd3d11.a`, `libd3dx9.a`, `libxaudio2_8.a`, … | Link-time surface for every DLL Wine ships |
 | PE DLLs | `/usr/lib/wine/x86_64-windows/*.dll` (622 of them) | The implementations, loaded in-process |
 
-Measured on 2026-09-18 with wine-11.15, all twelve probes passing:
+Measured on 2026-09-18 with wine-11.15, all probes passing:
 
 ```
 winelib code is native ELF (win32_api.exe.so)      -> ELF 64-bit LSB shared object, x86-64
@@ -77,6 +77,47 @@ What we never do:
   entry points, TLS callbacks) is a function pointer into native code, verified
   with `CreateThread`.
 
+## Hosting guest code in a Wine process
+
+Guest code is native ELF and its memory comes from the host, so the host layer
+owns the two things Wine is opinionated about: where guest memory lives, and which
+thread runs the guest. Both were measured on wine-11.15; `scripts/check-winelib.sh`
+covers them.
+
+**Guest memory must come from Wine's allocator.** A range obtained with a plain
+`mmap` is not in Wine's view of the address space, so `VirtualQuery` reports it as
+free and Wine can hand the same addresses to its own allocator afterwards.
+`runtime/linux64/wine_memory.c` installs Wine's `VirtualAlloc`, `VirtualFree` and
+`VirtualProtect` as the loader's memory backend for the winelib build, and
+`tests/winelib/memory_visibility.c` checks the difference:
+
+```
+memory: mmap region state=65536        MEM_FREE   -- Wine believes it is free
+memory: pe_reserve region state=4096   MEM_COMMIT -- Wine knows it is ours
+memory: second reservation at the same base=(nil)
+memory: PASS
+```
+
+**Guest code runs on a thread Wine created, with Wine's signals blocked.**
+`runtime/linux64/host_guest.c` and `host_guest_wine.c` are the two hosts; the
+winelib one calls `CreateThread` with the requested stack size, because Wine has to
+own the stack it hands out. A `pthread` is not a safe home for guest code: Wine
+does not know the thread, its process-wide handlers assume a Wine thread context,
+and a signal delivered to it ends in `siglongjmp` from a corrupt frame. A
+`CreateThread` thread is known to Wine, so `SIGQUIT` and `SIGUSR1` (how Wine
+suspends and notifies threads) are blocked for its lifetime: Wine cannot unwind a
+thread whose frames are not Windows frames.
+
+**Status: the winelib bridge does not yet run a lifted function reliably.** Lifted
+code does execute and produce correct results in a Wine process, but runs are not
+reproducible: roughly one run in one dies inside the runtime's stop path, and the
+runtime's view of its own `Memory` argument stops matching the caller's. The same
+harness, same objects, same lifted code, run as a plain native process, is
+deterministic. Until that is resolved, `scripts/build-lifted-harness.sh` still
+builds the winelib flavour (so the Win32 layer stays testable) but the differential
+tests use the native harness. `docs/agents/traces/wine-host-guest-execution.md`
+records what was measured, what was ruled out, and the next experiment.
+
 ## Adding a Win32 API
 
 1. Recon lists it (`program.json` → `imports`); pick the DLL that exports it.
@@ -106,3 +147,6 @@ What we never do:
 * **Wine's DLLs are PE files.** Linking to them is not the same as linking a
   plain `.so`; anything that depends on Wine's own state (heap, TEB, SEH) only
   works inside the host module, which is exactly where such code belongs.
+* **stdout can block.** In a winelib module the first write to stdout can block
+  indefinitely while stderr keeps working, so the lifted harness reports on
+  stderr (`runtime/linux64/lifted_harness.cpp`).

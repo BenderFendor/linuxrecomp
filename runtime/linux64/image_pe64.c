@@ -17,6 +17,57 @@
 
 #define PAGE 4096ull
 
+/* --- memory backend ------------------------------------------------------ */
+
+static void *mmap_reserve(uint64_t address, uint64_t size) {
+    void *mapped = mmap((void *)(uintptr_t)address, (size_t)size,
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    return mapped == MAP_FAILED ? NULL : mapped;
+}
+
+static int mmap_release(void *address, uint64_t size) {
+    return munmap(address, (size_t)size);
+}
+
+static int mmap_protect(void *address, uint64_t size, int protection) {
+    int prot = 0;
+    if (protection & PE_PROT_READ) {
+        prot |= PROT_READ;
+    }
+    if (protection & PE_PROT_WRITE) {
+        prot |= PROT_WRITE;
+    }
+    if (protection & PE_PROT_EXEC) {
+        prot |= PROT_EXEC;
+    }
+    uintptr_t start = (uintptr_t)address & ~(PAGE - 1);
+    uintptr_t end = ((uintptr_t)address + (uintptr_t)size + PAGE - 1) & ~(PAGE - 1);
+    return mprotect((void *)start, (size_t)(end - start), prot);
+}
+
+static const pe_memory_ops kDefaultMemoryOps = {
+    mmap_reserve, mmap_release, mmap_protect,
+};
+
+static const pe_memory_ops *g_memory_ops = &kDefaultMemoryOps;
+
+void pe_set_memory_ops(const pe_memory_ops *ops) {
+    g_memory_ops = ops ? ops : &kDefaultMemoryOps;
+}
+
+void *pe_reserve(uint64_t address, uint64_t size) {
+    return g_memory_ops->reserve(address, size);
+}
+
+int pe_release(void *address, uint64_t size) {
+    return g_memory_ops->release(address, size);
+}
+
+int pe_protect(void *address, uint64_t size, int protection) {
+    return g_memory_ops->protect(address, size, protection);
+}
+
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint32_t rd32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
@@ -69,18 +120,6 @@ static uint8_t *read_file(const char *path, size_t *size_out, char *err, size_t 
     fclose(handle);
     *size_out = (size_t)size;
     return bytes;
-}
-
-static int protect_range(uint8_t *base, uint64_t start_va, uint64_t image_base,
-                         uint64_t length, int prot) {
-    if (length == 0) {
-        return 0;
-    }
-    uint64_t start = start_va - image_base;
-    uint64_t end = start + length;
-    uint64_t page_start = start & ~(PAGE - 1);
-    uint64_t page_end = (end + PAGE - 1) & ~(PAGE - 1);
-    return mprotect(base + page_start, (size_t)(page_end - page_start), prot);
 }
 
 int pe_map(const char *path, pe_image *image, char *err, size_t err_len) {
@@ -150,11 +189,10 @@ int pe_map(const char *path, pe_image *image, char *err, size_t err_len) {
     }
 
     /* The preferred base or nothing. See the policy note in the header. */
-    void *mapped = mmap((void *)(uintptr_t)image->image_base, image->size_of_image,
-                        PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-    if (mapped == MAP_FAILED) {
-        int saved = errno;
+    int saved = 0;
+    void *mapped = pe_reserve(image->image_base, image->size_of_image);
+    if (!mapped) {
+        saved = errno;
         free(file);
         return fail(err, err_len,
                     "%s: cannot map %#llx bytes at preferred base %#llx: %s "
@@ -163,7 +201,7 @@ int pe_map(const char *path, pe_image *image, char *err, size_t err_len) {
                     (unsigned long long)image->image_base, strerror(saved));
     }
     if ((uintptr_t)mapped != image->image_base) {
-        munmap(mapped, image->size_of_image);
+        pe_release(mapped, image->size_of_image);
         free(file);
         return fail(err, err_len, "%s: mapped at %p instead of %#llx", path, mapped,
                     (unsigned long long)image->image_base);
@@ -191,7 +229,7 @@ int pe_map(const char *path, pe_image *image, char *err, size_t err_len) {
     free(file);
 
     /* Headers are read-only afterwards; sections follow their characteristics. */
-    if (mprotect(image->data, (size_t)image->size_of_headers, PROT_READ) != 0) {
+    if (pe_protect(image->data, image->size_of_headers, PE_PROT_READ) != 0) {
         pe_unmap(image);
         return fail(err, err_len, "%s: cannot protect headers", path);
     }
@@ -199,15 +237,14 @@ int pe_map(const char *path, pe_image *image, char *err, size_t err_len) {
         const pe_section *section = &image->sections[i];
         uint64_t size = section->virtual_size > section->raw_size ? section->virtual_size
                                                                  : section->raw_size;
-        int prot = PROT_READ;
+        int prot = PE_PROT_READ;
         if (section->characteristics & SCN_MEM_WRITE) {
-            prot |= PROT_WRITE;
+            prot |= PE_PROT_WRITE;
         }
         if (section->characteristics & SCN_MEM_EXECUTE) {
-            prot |= PROT_EXEC;
+            prot |= PE_PROT_EXEC;
         }
-        if (protect_range(image->data, image->image_base + section->rva, image->image_base,
-                          size, prot) != 0) {
+        if (pe_protect(image->data + section->rva, size, prot) != 0) {
             pe_unmap(image);
             return fail(err, err_len, "%s: cannot protect section %s", path,
                         section->name);
@@ -218,7 +255,7 @@ int pe_map(const char *path, pe_image *image, char *err, size_t err_len) {
 
 void pe_unmap(pe_image *image) {
     if (image->data) {
-        munmap(image->data, image->size_of_image);
+        pe_release(image->data, image->size_of_image);
     }
     memset(image, 0, sizeof(*image));
 }

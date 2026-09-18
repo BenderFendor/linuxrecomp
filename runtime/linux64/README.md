@@ -23,7 +23,15 @@ Built by `scripts/build-runtime-linux64.sh` (reference side) and
   and the answer is to stop and report rather than invent a value.
 * `lifted_harness.cpp` runs one lifted function with the guest state its ABI
   expects and prints the same report format as `refexec`, so one parser reads
-  both.
+  both. It reports on stderr rather than stdout, because the first stdout write
+  in a winelib process can block indefinitely.
+* `host_guest.{c,h}` decides where guest code runs and how much stack it gets.
+  The host decides, because the constraint differs: a native process uses a
+  `pthread` with a large stack, a Wine process must use a thread Wine owns
+  (`host_guest_wine.c`), since Wine cannot unwind threads it does not know.
+* `wine_memory.c` gives the winelib build Wine's allocator as the loader's memory
+  backend. Wine overwrites memory it cannot see, so guest memory has to come from
+  `VirtualAlloc` rather than `mmap` there.
 
 ```
 ./scripts/build-runtime-linux64.sh
@@ -48,6 +56,11 @@ crash/       guest PC + host backtrace reports
 wine/        winelib host module: the only piece built with winegcc, because it
              imports Wine's DLLs (kernel32, user32, d3d11, xaudio2_8, ...)
 ```
+
+The host layer already exists in the flat layout above: `host_guest.{c,h}` plus
+one `host_guest_wine.c`, and `wine_memory.c` for the winelib build. See
+`docs/linux64/WINE.md` for the constraints they encode and the checks that hold
+them in place.
 
 ## Rules
 

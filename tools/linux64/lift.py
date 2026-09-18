@@ -107,6 +107,25 @@ def _remill_command(binary: str, arch: str, address: int, payload: bytes,
             "--bytes", payload.hex(), "--ir_out", str(output)]
 
 
+def image_key(image_path: str) -> str:
+    """Directory name for one image's lifts.
+
+    Keying on the image name and content hash, not on the address alone. Two
+    PE32+ images share an image base, so their first function is often at the
+    same address: with a per-address layout, lifting one image overwrote the
+    other's manifest and the build then saw a hash mismatch. It stubbed the
+    symbol, which is safe but silent about the real cause.
+    """
+    with open(image_path, "rb") as handle:
+        digest = hashlib.sha256(handle.read()).hexdigest()
+    stem = Path(image_path).stem
+    return f"{stem}-{digest[:8]}"
+
+
+def lift_dir(out_dir: str, image_path: str) -> Path:
+    return Path(out_dir) / image_key(image_path)
+
+
 def lift(image_path: str, va: int, out_dir: str = DEFAULT_OUTPUT, arch: str = "amd64",
          byte_length: Optional[int] = None, os_name: str = "windows",
          length_source: str = "unwind-range",
@@ -145,7 +164,7 @@ def lift(image_path: str, va: int, out_dir: str = DEFAULT_OUTPUT, arch: str = "a
         raise ValueError(f"0x{va:X}: cannot read {length} bytes at rva 0x{start_rva:X}")
 
     name = f"sub_{image.va(start_rva):X}"
-    target_dir = Path(out_dir) / name
+    target_dir = lift_dir(out_dir, image_path) / name
     target_dir.mkdir(parents=True, exist_ok=True)
     ir_path = target_dir / f"{name}.ll"
 
@@ -228,8 +247,8 @@ def lift_all(image_path: str, out_dir: str = DEFAULT_OUTPUT, arch: str = "amd64"
             failed.append((function.start_rva, "bytes not readable"))
             continue
         digest = hashlib.sha256(payload).hexdigest()
-        manifest_path = (Path(out_dir) / f"sub_{image.va(function.start_rva):X}"
-                         / f"sub_{image.va(function.start_rva):X}.manifest.json")
+        symbol = f"sub_{image.va(function.start_rva):X}"
+        manifest_path = lift_dir(out_dir, image_path) / symbol / f"{symbol}.manifest.json"
         if manifest_path.exists():
             try:
                 existing = json.loads(manifest_path.read_text())
@@ -281,7 +300,7 @@ def referenced_symbols(out_dir: str) -> "set[int]":
     entry), and the rest are functions reconnaissance never listed.
     """
     found = set()
-    for ir in Path(out_dir).glob("*/*.ll"):
+    for ir in Path(out_dir).glob("*/*/*.ll"):
         for match in SYMBOL_RE.finditer(ir.read_text(encoding="utf-8", errors="replace")):
             found.add(int(match.group(1)[4:], 16))
     return found
@@ -290,7 +309,7 @@ def referenced_symbols(out_dir: str) -> "set[int]":
 def lifted_symbols(out_dir: str) -> "set[int]":
     """Guest VAs that already have a lifted function in *out_dir*."""
     found = set()
-    for manifest_path in Path(out_dir).glob("*/*.manifest.json"):
+    for manifest_path in Path(out_dir).glob("*/*/*.manifest.json"):
         try:
             manifest = json.loads(manifest_path.read_text())
         except (OSError, ValueError):
@@ -364,7 +383,7 @@ def lift_reachable(image_path: str, out_dir: str = DEFAULT_OUTPUT, arch: str = "
                     failed_this_round.append((image.rva_of(va), str(exc)))
                     # A target that cannot be lifted still needs a symbol for the
                     # link; the build generates a stub that reports the address.
-                    marker = Path(out_dir) / f"sub_{va:X}"
+                    marker = lift_dir(out_dir, image_path) / f"sub_{va:X}"
                     marker.mkdir(parents=True, exist_ok=True)
                     (marker / f"sub_{va:X}.failed").write_text(str(exc))
             summary["rounds"].append({"round": round_index, "kind": "referenced",

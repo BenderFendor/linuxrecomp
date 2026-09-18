@@ -25,6 +25,34 @@ extern "C" {
 
 #define PE_MAX_SECTIONS 32
 
+/* Protection flags, matching the host-independent names the loader uses. */
+#define PE_PROT_READ  1
+#define PE_PROT_WRITE 2
+#define PE_PROT_EXEC  4
+
+/* How the loader obtains and protects guest memory.
+ *
+ * The default uses mmap. A winelib host installs Wine's VirtualAlloc and
+ * VirtualProtect instead, and that is not a detail: Wine keeps its own view of
+ * the address space, and a range obtained with a plain mmap is reported by
+ * VirtualQuery as MEM_FREE, so Wine can hand the same range out again for a
+ * thread stack, a heap or a section. The symptom is a fault that depends on
+ * unrelated timing, and it goes away once Wine knows the range is ours.
+ */
+typedef struct {
+    void *(*reserve)(uint64_t address, uint64_t size);
+    int (*release)(void *address, uint64_t size);
+    int (*protect)(void *address, uint64_t size, int protection);
+} pe_memory_ops;
+
+/* Install a memory backend. Passing NULL restores the mmap default. */
+void pe_set_memory_ops(const pe_memory_ops *ops);
+
+/* Reserve and release guest memory through the installed backend. */
+void *pe_reserve(uint64_t address, uint64_t size);
+int pe_release(void *address, uint64_t size);
+int pe_protect(void *address, uint64_t size, int protection);
+
 typedef struct {
     char name[9];
     uint32_t rva;

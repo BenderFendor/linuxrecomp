@@ -51,7 +51,7 @@ image_path, lift_root, inc_path, list_path, stub_path = sys.argv[1:6]
 digest = hashlib.sha256(pathlib.Path(image_path).read_bytes()).hexdigest()
 
 entries, ir_paths, lifted_vas = [], [], set()
-for manifest_path in sorted(pathlib.Path(lift_root).glob("*/*.manifest.json")):
+for manifest_path in sorted(pathlib.Path(lift_root).glob("*/*/*.manifest.json")):
     manifest = json.loads(manifest_path.read_text())
     source = manifest.get("source", {})
     if source.get("image_sha256") != digest:
@@ -137,10 +137,39 @@ done
   -I"$WORK" -c -o "$WORK/lifted_harness.o" "$ROOT/runtime/linux64/lifted_harness.cpp"
 # shellcheck disable=SC2086
 "$CC" -O1 -g -c -o "$WORK/image_pe64.o" "$ROOT/runtime/linux64/image_pe64.c"
+"$CC" -O1 -g -c -o "$WORK/host_guest.o" "$ROOT/runtime/linux64/host_guest.c"
 
 HARNESS="$OUT_DIR/lifted_harness-$(basename "$IMAGE")"
+# Wine flavor: the same harness as a winelib module. The name keeps the pairing
+# with its image obvious without a doubled .exe.
+WINELIB="$OUT_DIR/lifted_harness-$(basename "$IMAGE" .exe).winelib"
 # shellcheck disable=SC2086
 "$CXX" -O1 -g -o "$HARNESS" "$WORK/lifted_harness.o" "$WORK/lifted_runtime.o" \
-  "$WORK/image_pe64.o" "${OBJECTS[@]}"
+  "$WORK/image_pe64.o" "$WORK/host_guest.o" "${OBJECTS[@]}"
 
 echo "built: $HARNESS"
+
+# --- winelib flavor ---------------------------------------------------------
+# The harness is also built as a winelib module so tests can exercise the Win32
+# layer. Same lifted objects, different host: guest memory comes from Wine's
+# allocator rather than mmap (wine_memory.c), and guest code runs on its own
+# thread with Wine's signals blocked (host_guest_wine.c).
+WINEGCC="${WINEGCC:-winegcc}"
+# The harness is C++, so the winelib link goes through wineg++ (libstdc++).
+WINEGXX="${WINEGXX:-wineg++}"
+if command -v "$WINEGCC" >/dev/null 2>&1; then
+  # wine_memory.c and host_guest_wine.c include Wine's own headers, so they are
+  # compiled by winegcc.
+  "$WINEGCC" -O1 -g -c -o "$WORK/wine_memory.o" "$ROOT/runtime/linux64/wine_memory.c"
+  "$WINEGCC" -O1 -g -c -o "$WORK/host_guest_wine.o" "$ROOT/runtime/linux64/host_guest_wine.c"
+  # shellcheck disable=SC2086
+  if "$WINEGXX" -O1 -g -o "$WINELIB" "$WORK/lifted_harness.o" \
+      "$WORK/lifted_runtime.o" "$WORK/image_pe64.o" "$WORK/wine_memory.o" \
+      "$WORK/host_guest_wine.o" "${OBJECTS[@]}" > "$WORK/wine.link.log" 2>&1; then
+    echo "built: $WINELIB (winelib)"
+  else
+    echo "winelib harness not built; see $WORK/wine.link.log" >&2
+  fi
+else
+  echo "winegcc not found: skipping the winelib harness" >&2
+fi

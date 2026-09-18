@@ -15,8 +15,12 @@ exercise the parser that `tools/cpp/rtti.py` runs.
 
 `winelib/` — the probes that prove the Win32 API strategy: winegcc-built code is
 native ELF, Win32 calls reach Wine's DLLs, a plain native ELF library stands in
-for lifted guest code in the same process, and Wine can call back into native
-code. Built and run by `scripts/check-winelib.sh`.
+for lifted guest code in the same process, Wine can call back into native code,
+guest memory is memory Wine knows about (`memory_visibility.c` checks that a plain
+`mmap` region shows up as `MEM_FREE` while the loader's `pe_reserve` shows up as
+`MEM_COMMIT`), and the ordering rules of a winelib module hold
+(`startup_order.c`: Win32 calls work from an ELF constructor, Unix stdio still
+works after them). Built and run by `scripts/check-winelib.sh`.
 
 Fixture binaries are build outputs, not repository contents: `.gitignore` keeps
 `*.exe` out of the tree, and original binaries are never committed.

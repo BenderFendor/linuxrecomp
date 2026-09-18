@@ -1,5 +1,10 @@
 /* Run a Remill-lifted function under the linuxrecomp runtime.
  *
+ * The report goes to stderr, not stdout. In a Wine process the first write to
+ * stdout blocks indefinitely (the trace lines on stderr get through), which turns
+ * a finished run into a hung one; keeping all harness output on stderr avoids
+ * depending on which stream Wine's console layer is willing to write.
+ *
  * Same command line and same output format as the reference executor
  * (`runtime/linux64/refexec.c`), so a differential test can drive both and
  * compare the two reports field by field:
@@ -15,17 +20,120 @@
  * two. Image memory is comparable, which is what the differential tests read.
  */
 #include "lifted_runtime.h"
-
+#include "host_guest.h"
 #include <cinttypes>
+#include <cstdarg>
+#include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <execinfo.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
+#include <unistd.h>
 
 namespace {
 
+
+bool g_trace = false;
+bool trace_enabled = false;
+
+uint64_t g_guest_base = 0;
+uint64_t g_guest_size = 0;
+
+/* A fault while running lifted code would otherwise leave no trace at all: Wine
+ * swallows a Unix SIGSEGV before it reaches a debug channel, and the process just
+ * exits 139. Reporting the faulting RIP, the address it touched, and a host
+ * backtrace is the difference between a five-second diagnosis and guessing. */
+void crash_handler(int sig, siginfo_t *info, void *context) {
+    ucontext_t *uc = (ucontext_t *)context;
+    uint64_t rip = 0;
+#if defined(__x86_64__)
+    rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+#endif
+    const char *where = (g_guest_size && rip >= g_guest_base &&
+                         rip < g_guest_base + g_guest_size) ? "in guest code" : "in host code";
+    char message[512];
+    int length = std::snprintf(message, sizeof(message),
+                               "lifted: fault %d at rip=%#" PRIx64 " address=%#" PRIx64
+                               " (%s)\n",
+                               sig, rip, (uint64_t)(uintptr_t)info->si_addr, where);
+    ssize_t ignored = write(STDERR_FILENO, message, (size_t)length);
+    (void)ignored;
+    void *frames[32];
+    int count = backtrace(frames, 32);
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
+    _exit(3);
+}
+
+/* Which /proc/self/maps entry holds *address*, and how much room is left below
+ * it. Under Wine the code runs on a PE stack that is not the pthread stack, and
+ * its size is what an immediate crash tends to be about. */
+void trace(const char *format, ...);
+
+
+/* Guest execution runs on a thread with its own large stack.
+ *
+ * Wine runs a winelib module's `main` on the PE stack it allocated for the
+ * module, which is 1 MiB by default, and by the time our lifted code's prologue
+ * runs its allocas there are only a few hundred bytes of that stack left. The
+ * result is an immediate access violation inside the first lifted function, which
+ * took a while to identify because it looks nothing like a stack problem.
+ *
+ * The guest's own stack is a separate region this runtime owns, so the host stack
+ * here only holds the trace machinery: remaining C++ frames, the dispatch
+ * recursion, and one frame per nested call. 64 MiB removes the question.
+ */
+constexpr size_t kExecutionStackSize = 64u * 1024 * 1024;
+
+struct ExecutionJob {
+    const LiftedEntry *entry;
+    uint64_t entry_va;
+    State *state;
+    Memory *memory;
+    StopReason reason   = StopReason::kReturned;
+    uint64_t result     = 0;
+    uint64_t entered    = 0;
+    uint64_t deepest    = 0;
+    size_t missing      = 0;
+};
+
+
+void *run_guest(void *argument) {
+    auto *job = static_cast<ExecutionJob *>(argument);
+    trace("running %s on a %zu MiB stack", job->entry->name,
+          kExecutionStackSize / (1024 * 1024));
+    job->reason = lifted_run_dispatched(job->entry_va, job->state, job->memory);
+    job->result = job->state->gpr.rax.qword;
+    job->entered = lifted_functions_entered();
+    job->deepest = lifted_deepest_dispatch();
+    job->missing = lifted_missing_target_count();
+    return nullptr;
+}
+
+void trace(const char *format, ...) {
+    if (!g_trace) {
+        return;
+    }
+    va_list args;
+    va_start(args, format);
+    std::fputs("trace: ", stderr);
+    std::vfprintf(stderr, format, args);
+    std::fputc('\n', stderr);
+    std::fflush(stderr);
+    va_end(args);
+}
+
 constexpr uint64_t kStackBase = 0x200000;      /* well below the image bases we map */
 constexpr uint64_t kStackSize = 0x100000;      /* 1 MiB */
+/* One reserved block for the memory descriptor and the guest register file. */
+constexpr uint64_t kStateBase = 0x100000;
+constexpr uint64_t kStateSize = 0x100000;      /* 1 MiB */
 /* Space above RSP for the 32-byte home area the Microsoft ABI reserves, plus the
  * extra 8 that puts the entry RSP at 8 mod 16, where a callee expects to start.
  * The reference executor uses the same shape. */
@@ -147,6 +255,11 @@ int main(int argc, char **argv) {
             report_undefined = true;
             continue;
         }
+        if (strcmp(argv[i], "--trace") == 0) {
+            g_trace = true;
+            trace_enabled = true;
+            continue;
+        }
         if (i - 3 < 4 && parse_u64(argv[i], &args[i - 3]) != 0) {
             std::fprintf(stderr, "lifted: bad argument %s\n", argv[i]);
             return 1;
@@ -155,36 +268,90 @@ int main(int argc, char **argv) {
 
     char err[512];
     pe_image image;
+    trace("mapping %s", path);
     if (pe_map(path, &image, err, sizeof(err)) != 0) {
         std::fprintf(stderr, "lifted: %s\n", err);
         return 1;
     }
 
-    void *stack = mmap((void *)(uintptr_t)kStackBase, kStackSize,
-                       PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-    if (stack == MAP_FAILED) {
-        std::fprintf(stderr, "lifted: cannot map the guest stack at %#" PRIx64 "\n",
-                     kStackBase);
+    trace("image mapped at %#" PRIx64 " size %#" PRIx64 ", entry %#" PRIx64,
+          image.image_base, image.size_of_image, image.image_base + image.entry_rva);
+    trace("mapping guest stack at %#" PRIx64, kStackBase);
+    /* Through the loader's memory backend, not mmap directly: inside a Wine
+     * process a raw mapping is invisible to Wine and can be handed out again. */
+    void *stack = pe_reserve(kStackBase, kStackSize);
+    if (!stack) {
+        std::fprintf(stderr, "lifted: cannot map the guest stack at %#" PRIx64
+                     " (errno %d)\n", kStackBase, errno);
+        pe_unmap(&image);
+        return 1;
+    }
+    if ((uintptr_t)stack != kStackBase) {
+        std::fprintf(stderr, "lifted: guest stack landed at %p instead of %#" PRIx64 "\n",
+                     stack, kStackBase);
+        pe_release(stack, kStackSize);
         pe_unmap(&image);
         return 1;
     }
 
-    Memory memory{};
+    trace("guest stack mapped at %p, entry rsp %#" PRIx64, stack,
+          kStackBase + kStackSize - kStackHeadroom);
+    /* The guest state and its memory descriptor come from the host's allocator,
+     * not from the heap and not from this frame. In a Wine process glibc's heap
+     * and this frame are both invisible to Wine, which can hand the same
+     * addresses to its own allocator; memory the runtime keeps for the whole run
+     * has to be memory Wine knows about. */
+    void *state_block = pe_reserve(kStateBase, kStateSize);
+    if (!state_block) {
+        std::fprintf(stderr, "lifted: cannot reserve the guest state block at %#" PRIx64 "\n",
+                     kStateBase);
+        pe_release(stack, kStackSize);
+        pe_unmap(&image);
+        return 1;
+    }
+    Memory &memory = *static_cast<Memory *>(state_block);
     memory.image = &image;
     memory.stack = (uint8_t *)stack;
     memory.stack_base = kStackBase;
     memory.stack_size = kStackSize;
     lifted_report_undefined(report_undefined);
+    lifted_set_memory_trace(report_undefined);
+    lifted_set_dispatch_trace(trace_enabled);
 
     for (int i = 0; i < poke_count; i++) {
         if (apply_poke(&memory, pokes[i]) != 0) {
             std::fprintf(stderr, "lifted: bad --poke %s\n", pokes[i]);
-            munmap(stack, kStackSize);
+            pe_release(stack, kStackSize);
             pe_unmap(&image);
             return 1;
         }
     }
+
+    {
+        pthread_attr_t attributes;
+        void *stack_base = nullptr;
+        size_t stack_size = 0;
+        if (pthread_getattr_np(pthread_self(), &attributes) == 0) {
+            pthread_attr_getstack(&attributes, &stack_base, &stack_size);
+            pthread_attr_destroy(&attributes);
+        }
+        trace("pthread stack %p..%p (%zu bytes), current frame %p", stack_base,
+              static_cast<char *>(stack_base) + stack_size, stack_size,
+              __builtin_frame_address(0));
+    }
+    trace("looking up %#" PRIx64 " among %zu lifted functions", function_va,
+          lifted_entry_count());
+
+    struct sigaction action;
+    std::memset(&action, 0, sizeof(action));
+    action.sa_sigaction = crash_handler;
+    action.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &action, nullptr);
+    sigaction(SIGBUS, &action, nullptr);
+    sigaction(SIGILL, &action, nullptr);
+    sigaction(SIGFPE, &action, nullptr);
+    g_guest_base = image.image_base;
+    g_guest_size = image.size_of_image;
 
     const LiftedEntry *entry = lifted_lookup(function_va);
     if (!entry) {
@@ -196,12 +363,19 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "lifted:   available %s at %#" PRIx64 "\n",
                          available->name, available->va);
         }
-        munmap(stack, kStackSize);
+        pe_release(stack, kStackSize);
         pe_unmap(&image);
         return 3;
     }
 
-    State state;
+    if (sizeof(State) > kStateSize - sizeof(Memory)) {
+        std::fprintf(stderr, "lifted: State (%zu bytes) does not fit the reserved block\n",
+                     sizeof(State));
+        pe_release(stack, kStackSize);
+        pe_unmap(&image);
+        return 1;
+    }
+    State &state = *reinterpret_cast<State *>(static_cast<uint8_t *>(state_block) + sizeof(Memory));
     std::memset(&state, 0, sizeof(state));
     state.gpr.rcx.qword = args[0];
     state.gpr.rdx.qword = args[1];
@@ -218,35 +392,59 @@ int main(int argc, char **argv) {
         *return_slot = 0;
     }
 
-    StopReason reason = lifted_run_dispatched(function_va, &state, &memory);
+    ExecutionJob job{};
+    job.entry = entry;
+    job.entry_va = function_va;
+    job.state = &state;
+    job.memory = &memory;
 
+    trace("entering %s", entry->name);
+    if (host_run_guest(run_guest, &job, kExecutionStackSize) != 0) {
+        std::fprintf(stderr, "lifted: cannot start the execution thread\n");
+        pe_release(stack, kStackSize);
+        pe_unmap(&image);
+        return 1;
+    }
+
+    StopReason reason = job.reason;
+    trace("returned from %s with %s", entry->name, lifted_stop_reason_name(reason));
+
+    trace("looking up the section name");
     const char *section = pe_section_name(&image, function_va);
-    std::printf("lifted: image=%s base=%#" PRIx64 " section=%s symbol=%s va=%#" PRIx64
+    trace("printing the report");
+    std::fprintf(stderr, "lifted: image=%s base=%#" PRIx64 " section=%s symbol=%s va=%#" PRIx64
                 " args=%#" PRIx64 ",%#" PRIx64 ",%#" PRIx64 ",%#" PRIx64
                 " result=%#" PRIx64 " result_dec=%" PRIu64 "\n",
                 path, image.image_base, section ? section : "?", entry->name,
                 function_va, args[0], args[1], args[2], args[3],
-                state.gpr.rax.qword, state.gpr.rax.qword);
-    std::printf("lifted: stop %s at %#" PRIx64 " (%s)\n",
+                job.result, job.result);
+    trace("printing the stop line");
+    std::fprintf(stderr, "lifted: stop %s at %#" PRIx64 " (%s)\n",
                 lifted_stop_reason_name(reason), lifted_stop_pc(), lifted_stop_detail());
-    std::printf("lifted: entered=%" PRIu64 " deepest=%" PRIu64 " missing=%zu\n",
-                lifted_functions_entered(), lifted_deepest_dispatch(),
-                lifted_missing_target_count());
+    std::fprintf(stderr, "lifted: entered=%" PRIu64 " deepest=%" PRIu64 " missing=%zu\n",
+                job.entered, job.deepest, job.missing);
     for (size_t i = 0; i < lifted_missing_target_count(); i++) {
-        std::printf("lifted: unresolved %#" PRIx64 "\n", lifted_missing_target(i));
+        std::fprintf(stderr, "lifted: unresolved %#" PRIx64 "\n", lifted_missing_target(i));
     }
 
     for (int i = 0; i < dump_count; i++) {
-        std::printf("lifted: memory %#" PRIx64 "+%" PRIu64 " =", dump_addr[i],
+        std::fprintf(stderr, "lifted: memory %#" PRIx64 "+%" PRIu64 " =", dump_addr[i],
                     dump_len[i]);
         for (uint64_t offset = 0; offset < dump_len[i]; offset++) {
             uint8_t *pointer = guest_ptr(&memory, dump_addr[i] + offset, 1);
-            std::printf(" %02x", pointer ? *pointer : 0);
+            std::fprintf(stderr, " %02x", pointer ? *pointer : 0);
         }
-        std::printf("\n");
+        std::fprintf(stderr, "\n");
     }
 
-    munmap(stack, kStackSize);
+    std::fflush(stderr);
+    trace("exiting with %s", reason == StopReason::kReturned ? "0" : "4");
+    pe_release(stack, kStackSize);
     pe_unmap(&image);
-    return reason == StopReason::kReturned ? 0 : 4;
+    /* Exit directly. Once guest execution has happened in a Wine process, the
+     * normal return from main can sit in Wine's teardown indefinitely, which
+     * turns a finished test into a hung one. Everything observable is flushed
+     * first, so nothing is lost by skipping that teardown. */
+    std::fflush(nullptr);
+    _exit(reason == StopReason::kReturned ? 0 : 4);
 }

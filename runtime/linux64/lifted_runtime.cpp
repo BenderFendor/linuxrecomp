@@ -22,6 +22,7 @@
  */
 #include "lifted_runtime.h"
 
+#include <cstdarg>
 #include <cinttypes>
 #include <csetjmp>
 #include <cstdio>
@@ -39,6 +40,9 @@ struct StopContext {
 };
 
 StopContext *g_current = nullptr;
+
+const char *reason_name(StopReason reason);
+void trace_dispatch(const char *format, ...);
 
 StopReason g_reason = StopReason::kReturned;
 uint64_t g_stop_pc = 0;
@@ -59,6 +63,8 @@ size_t g_missing_count = 0;
 bool g_report_undefined = false;
 
 Memory *halt(StopReason reason, uint64_t pc, const char *detail) {
+    trace_dispatch("halt %s at %#" PRIx64 " (%s)", reason_name(reason), pc,
+                   detail ? detail : "");
     g_reason = reason;
     g_stop_pc = pc;
     std::snprintf(g_detail, sizeof(g_detail), "%s", detail ? detail : "");
@@ -75,6 +81,7 @@ Memory *halt(StopReason reason, uint64_t pc, const char *detail) {
  * execution through the dispatcher unwinds to the right trace. */
 StopReason trace_once(lifted_function function, State *state, uint64_t pc,
                       Memory *memory) {
+    trace_dispatch("trace %p at %#" PRIx64, (void *)function, pc);
     StopContext context;
     context.previous = g_current;
     g_current = &context;
@@ -84,6 +91,7 @@ StopReason trace_once(lifted_function function, State *state, uint64_t pc,
     if (setjmp(context.jump) == 0) {
         function(state, pc, memory);
     }
+    trace_dispatch("trace %p finished with %s", (void *)function, reason_name(g_reason));
     g_current = context.previous;
     return g_reason;
 }
@@ -160,8 +168,30 @@ uint8_t *mapped(Memory *memory, uint64_t address, uint64_t length) {
     return guest_ptr(memory, address, length);
 }
 
+/* Guest memory tracing, off unless the caller asks. When lifted code faults in a
+ * way the host cannot report (Wine converts an access violation into a PE
+ * exception and takes its own path), the last memory access is the useful clue. */
+bool g_trace_memory = false;
+bool g_trace_dispatch = false;
+
+void trace_dispatch(const char *format, ...) {
+    if (!g_trace_dispatch) {
+        return;
+    }
+    va_list args;
+    va_start(args, format);
+    std::fputs("dispatch: ", stderr);
+    std::vfprintf(stderr, format, args);
+    std::fputc('\n', stderr);
+    std::fflush(stderr);
+    va_end(args);
+}
+
 template <typename T>
 T read_value(Memory *memory, uint64_t address) {
+    if (g_trace_memory) {
+        std::fprintf(stderr, "mem: read %zu at %#" PRIx64 "\n", sizeof(T), address);
+    }
     uint8_t *pointer = mapped(memory, address, sizeof(T));
     if (!pointer) {
         char detail[128];
@@ -176,6 +206,10 @@ T read_value(Memory *memory, uint64_t address) {
 
 template <typename T>
 Memory *write_value(Memory *memory, uint64_t address, T value) {
+    if (g_trace_memory) {
+        std::fprintf(stderr, "mem: write %zu at %#" PRIx64 " = %#" PRIx64 "\n",
+                     sizeof(T), address, (uint64_t)value);
+    }
     uint8_t *pointer = mapped(memory, address, sizeof(T));
     if (!pointer) {
         char detail[128];
@@ -244,6 +278,10 @@ StopReason lifted_run_dispatched(uint64_t va, State *state, Memory *memory) {
 }
 
 void lifted_report_undefined(bool enabled) { g_report_undefined = enabled; }
+
+void lifted_set_memory_trace(bool enabled) { g_trace_memory = enabled; }
+
+void lifted_set_dispatch_trace(bool enabled) { g_trace_dispatch = enabled; }
 
 void lifted_reset_stats(void) {
     g_functions_entered = 0;

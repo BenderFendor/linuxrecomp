@@ -120,6 +120,42 @@ else
   expect "thread exit code survived the boundary" "$out" "exit=0x1234"
 fi
 
+# --- 4. guest memory is memory Wine knows about ----------------------------
+
+if ! winegcc -O1 -I"$ROOT/runtime/linux64" -o "$OUT/memory_visibility.exe" \
+      "$SRC/memory_visibility.c" \
+      "$ROOT/runtime/linux64/image_pe64.c" "$ROOT/runtime/linux64/wine_memory.c" \
+      >"$OUT/memory_visibility.build.log" 2>&1; then
+  fail "build memory visibility probe"
+  sed -n '1,40p' "$OUT/memory_visibility.build.log"
+else
+  pass "build memory visibility probe"
+  out="$(timeout 60 "$OUT/memory_visibility.exe" 2>/dev/null)"
+  expect "Wine reports a plain mmap region as free" "$out" "mmap region state=65536"
+  expect "pe_reserve uses Wine's allocator" "$out" "pe_reserve region state=4096"
+  expect "Wine does not re-issue a committed address" "$out" "same base=(nil)"
+  expect "memory probe passes" "$out" "memory: PASS"
+fi
+
+# --- 5. what a winelib module can do, and when -----------------------------
+
+if ! winegcc -O1 -o "$OUT/startup_order.exe" "$SRC/startup_order.c" -lkernel32 \
+      >"$OUT/startup_order.build.log" 2>&1; then
+  fail "build startup order probe"
+  sed -n '1,40p' "$OUT/startup_order.build.log"
+else
+  pass "build startup order probe"
+  rm -f /tmp/linuxrecomp-startup-order.log
+  timeout 60 "$OUT/startup_order.exe" >/dev/null 2>&1
+  log="$(cat /tmp/linuxrecomp-startup-order.log 2>/dev/null)"
+  expect "Win32 calls work from an ELF constructor" "$log" "ctor: VirtualAlloc MEM_COMMIT worked"
+  expect "VirtualAlloc works at a fixed base" "$log" "main: VirtualAlloc at 0x140000000 worked"
+  expect "VirtualQuery reports the committed region" "$log" "state=4096 protect=4"
+  expect "Unix stderr still works after Win32 calls" "$log" "main: stderr write worked"
+  expect "Unix stdout still works after Win32 calls" "$log" "main: stdout write worked"
+  expect "startup order probe reaches the end" "$log" "main: exit"
+fi
+
 say ""
 if [ "$failures" -eq 0 ]; then
   say "winelib check: ok (no guest image was loaded or executed by Wine)"

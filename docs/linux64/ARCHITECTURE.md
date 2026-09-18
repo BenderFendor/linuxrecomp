@@ -88,6 +88,16 @@ recovery are optimizations taken later, once something boots
 * keep callbacks from the Win32 layer back into lifted code working;
 * report a crash with both the guest PC and a host backtrace.
 
+Two of those are the host layer's job, because they are the places where a host
+imposes its own rules: guest memory comes from the host's allocator, and guest
+code runs on a host-provided thread. In a plain process that is `mmap` and a
+`pthread`; in a Wine process it is `VirtualAlloc` and a Wine-owned thread, because
+Wine keeps its own address-space and thread bookkeeping and overwrites what it
+cannot see. `runtime/linux64/host_guest.{c,h}`, `host_guest_wine.c`,
+`wine_memory.c` and `memory_ops` in `runtime/linux64/image_pe64.{c,h}` are that
+boundary; `docs/linux64/WINE.md` documents the constraints and how they are
+checked.
+
 ## ABI
 
 Phase 1 needs no recovered native signatures. Internal guest calls stay in CPU
