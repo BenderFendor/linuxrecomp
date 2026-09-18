@@ -271,3 +271,27 @@ places the runtime touches the guest's RSP are `call_import` (one pop, for a cal
 lifted code's own push/pop at call and ret; the next step is to log the guest RSP at every
 import call and every ret together with the instruction that caused it, and find the 24
 transitions where the stack moves without a matching restore.
+
+
+## Follow-up: where the program's startup stops
+
+The banner HLExtract prints is referenced by code at `0x14000111c`, inside
+`sub_140001000` (range `0x1000..0x15fe`). That function is not among the 25 distinct
+functions the run enters, so **`main` never ran**: the program's own startup returns
+before reaching it.
+
+The last imports the run makes are `GetProcAddress` twice, `EnterCriticalSection` and a
+tail jump, then the top-level return. `GetStartupInfoA` and `GetCommandLineA` are never
+called, and neither is anything from an initialiser table, so the divergence is inside
+the CRT's startup between `__scrt_initialize_crt` (which does call `FlsAlloc`,
+`EnterCriticalSection` and `HeapCreate`, all present in the trace) and `_initterm`.
+
+Two measurements point at the same thing: the guest stack ends 184 bytes below where it
+started, and the shadow stack reports returns whose stack pointer is one slot above the
+frame on top. A startup that walks a table (initialisers, load-config entries, or its own
+SEH frames) and gets a frame or a table bound wrong would both return early and leave the
+stack short.
+
+Next: instrument `_initterm`'s table walk - the guest addresses it reads and the entries
+it calls - rather than the frames, since that is now where the run stops rather than where
+it breaks.
