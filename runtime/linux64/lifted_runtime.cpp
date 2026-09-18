@@ -676,33 +676,24 @@ StopReason dispatch_from(uint64_t va, State *state, Memory *memory) {
 
     g_functions_entered++;
     StopReason reason = trace_once(entry->function, state, va, memory);
-    if (top_level && g_program_mode && reason == StopReason::kReturned && g_stop_pc != 0 &&
-        !lifted_lookup(g_stop_pc)) {
-        /* A program that returns to an address with no entry of its own has returned into
-         * the middle of lifted code: the tail of a function the compiler split, reached by
-         * a transfer the recovery did not model as a call. That address needs its own
-         * lifted entry, and the coverage loop can only learn that if the run says so -
-         * otherwise it reports nothing missing and stops here, which is exactly what
-         * HLExtract did at 0x14000bfdd, inside sub_14000bec0's range. */
-        record_missing(g_stop_pc);
-        std::snprintf(g_detail, sizeof(g_detail),
-                      "return into lifted code at %#" PRIx64 " with no entry", g_stop_pc);
-    }
-    if (top_level && !g_program_mode) {
-        while (reason == StopReason::kReturned) {
+    if (top_level) {
+        /* Chase the program's returns. A return to 0 is the harness's own stack slot and
+         * is the end of the program; a return to lifted code continues there; a return to
+         * an address with no entry is the next thing to lift, which the coverage loop can
+         * only learn if it is named.
+         *
+         * Program mode used to skip this entirely, on the reasoning that a top-level return
+         * is the program finishing. That is only true when the return goes to the stack
+         * slot the harness placed. HLExtract's chain returned into the middle of a callee
+         * instead, and the run ended there - ten functions short of its own startup
+         * continuing, with nothing reported as missing. */
+        while (reason == StopReason::kReturned && g_stop_pc != 0) {
             const LiftedEntry *next = lifted_lookup(g_stop_pc);
             if (!next) {
-                /* A return to an address that is not lifted is not the program
-                 * finishing: it is the next address to lift. Reporting it as
-                 * "returned" and leaving it there is how a run ends silently, and a
-                 * driver cannot continue from a silence. Returning to 0 is the one
-                 * case that really is the end. */
-                if (g_stop_pc != 0) {
-                    record_missing(g_stop_pc);
-                    std::snprintf(g_detail, sizeof(g_detail),
-                                  "return to unlifted address %#" PRIx64, g_stop_pc);
-                    reason = StopReason::kMissingDispatch;
-                }
+                record_missing(g_stop_pc);
+                std::snprintf(g_detail, sizeof(g_detail),
+                              "return to unlifted address %#" PRIx64, g_stop_pc);
+                reason = StopReason::kMissingDispatch;
                 break;
             }
             entry = next;
