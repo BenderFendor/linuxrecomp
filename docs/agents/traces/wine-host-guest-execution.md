@@ -424,3 +424,37 @@ entries of two tables picked by a scan that could not see the others. The real q
 narrower: the walker is entered and does run entries, so what stops it - and the answer has
 to explain why the returning function is `sub_14000bec0`, whose return lands on the harness's
 own sentinel, meaning its caller's frame was never established.
+
+
+## The startup stops between two of its own calls
+
+The entered functions in order begin: entry, `sub_14000c470`, the startup `sub_140005070`,
+`sub_14000c410`, `sub_14000c2f0`, then `sub_1400089a0` -> `sub_14000bd00` -> `sub_140008700`
+(the walker) -> the initialiser entries. So the walker runs, repeatedly, and it does call
+entries: `sub_14000f650`, `sub_14000ddd0`, `sub_140005610`, `sub_14000f640`,
+`sub_14000f630`, `sub_14000f350`, `sub_140003ee0` and others all appear.
+
+Reading that against the startup's disassembly narrows it sharply:
+
+```
+1400051ed: call 0x14000c2f0     ; entered (5th)
+1400051f4: jne  0x140005218     ; normal path
+1400051ff: call 0x14000b240     ; failure trio - NOT called
+140005209: call 0x14000b000     ; NOT called
+140005213: call 0x1400085c0     ; NOT called
+140005218: call 0x14000bbb0     ; NOT entered
+```
+
+The failure trio is never called, so the branch at 0x51f4 takes the normal path - and the
+very next thing that path does, `call 0x14000bbb0`, never happens. Control therefore leaves
+the startup between its own two call sites, with `sub_14000c2f0` having returned.
+
+The trace also shows every return reported as unbalanced by the shadow stack with the
+recorded frame one slot below the actual stack pointer, systematically. That is an off-by-one
+in the diagnostic, not a guest fault: it means the shadow's mismatch reports cannot be used
+as evidence and should be ignored until the offset is fixed.
+
+The remaining hypothesis to test is the guarded dispatch. `dispatch_from` installs a
+`__builtin_setjmp` guard, and if a nested return trips it the guest stack is left as it was
+while the C stack unwinds - which would look exactly like this: a function returning with the
+frame above it already gone.
