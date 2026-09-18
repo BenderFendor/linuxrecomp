@@ -625,7 +625,13 @@ class Lifter:
             lane = self._sd if wide else self._ss
             isz = s.size if s is not None else 4
             cast = 'int64_t' if isz == 8 else 'int32_t'
-            return ['%s = (%s)(%s);' % (lane(insn, d), cast, self.src(insn, s))]
+            # The outer cast is the conversion the instruction performs, and
+            # saying so explicitly matters: without it MSVC warns C4244 on every
+            # one of these, and across four million lines of generated C a
+            # warning that is always benign is a warning nobody reads.
+            fcast = 'double' if wide else 'float'
+            return ['%s = (%s)(%s)(%s);'
+                    % (lane(insn, d), fcast, cast, self.src(insn, s))]
         if m in ('cvttss2si', 'cvttsd2si'):
             rd_ = self._sd if m.startswith('cvttsd') else self._ss
             fn = 'sse_cvtt_i64' if d.size == 8 else 'sse_cvtt_i32'
