@@ -27,7 +27,7 @@ never persisted.
 | `directories` | Every data directory with its RVA/size/presence |
 | `functions` | Recovered `[start, end)` ranges as guest VAs, with name and provenance |
 | `imports` | One entry per IAT slot: DLL, name or ordinal, hint, IAT VA, ILT VA |
-| `exports` | Name, ordinal, VA, and the forwarder string when the RVA points inside the export directory |
+| `exports` | Name, ordinal, VA, forwarder string, `kind` (`code`/`data`/`forwarder`) and containing section |
 | `relocations` | Base relocations with type and decoded kind |
 | `tls` | Raw data range, TLS index VA, callback VAs, zero-fill size |
 | `unwind` | Every `.pdata` entry with decoded `UNWIND_INFO`: prolog size, code slots, frame register, handler VA, chain |
@@ -49,8 +49,17 @@ Trust order, recorded per function in the `source` field:
 2. `ghidra` — ranges from `--bounds`, the CSV written by the repo's existing
    `tools/ghidra/DumpBounds.java` (`start,end` hex, end exclusive). This fills
    what `.pdata` leaves out: both MinGW and MSVC omit leaf functions.
-3. `export` — a start that is exported but covered by neither of the above.
-   Its `end` is `null`, because nothing established it.
+3. `export` — **an export only counts if it lives in executable code.** MSVC
+   exports data with decorated names: `??_7CPackage@HLLib@@6B@` is "vftable for
+   CPackage", and those live in `.rdata`. Treating every export as a function
+   start put 43 vftables into the function list on `HLLib.dll`; a lifter pointed
+   at them executes data and produces code that was never in the program. Exports
+   are therefore classified as `code`, `data` or `forwarder`, and only `code`
+   ones can become functions. Measured on `HLLib.dll`: 668 exports → 625 code,
+   43 data, 0 forwarder.
+   A `code` export that lands inside an existing range is a split, not a new
+   function; one that matches a range's start is used as that range's name.
+   Until an end is established, the function's `end` is `null`.
 4. `entrypoint` — the image entry point when nothing else covers it.
 
 `end` is `null` rather than equal to `start` in that case, so a consumer cannot
@@ -135,6 +144,22 @@ the function `source` enum.
 * Load-config and `.xdata` handler bodies are recorded but not yet interpreted
   (P8).
 * RTTI-recovered starts are not yet merged into the spec (P8).
+
+## Two things that bite in this reader
+
+**Chained unwind records.** `UNWIND_INFO` with `UNW_FLAG_CHAININFO` carries a
+whole `RUNTIME_FUNCTION` (12 bytes) after its codes, not a 4-byte field. In
+CPython 3.14 `struct.unpack` requires the buffer to match the format exactly, so
+unpacking a 4-byte format out of that 12-byte record raises
+`struct.error: unpack requires a buffer of 4 bytes` — which is how `HLExtract.exe`
+first broke recon. Read the whole record and use `struct.unpack_from`. The
+synthetic image in `test_pe64.py` carries a chained record for this reason.
+
+**Reads never return short slices.** A section header can claim more raw data
+than the file holds, and slicing those phantom bytes yields a short buffer that
+only fails later, inside `struct.unpack`. `rva_to_offset`/`read_rva` therefore
+bound against the file length as well as the section, and return `None` instead
+of a partial read. `test_pe64.py` checks the invariant on a truncated image.
 
 ## Checks
 

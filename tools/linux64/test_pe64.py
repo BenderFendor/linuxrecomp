@@ -40,11 +40,13 @@ RDATA_FILE = 0x800
 ODD_FILE = 0x1000
 FILE_SIZE = 0x1200
 
-KERNEL32_STRING_RVA = 0x2340
-ORDINAL_STRING_RVA = 0x2350
-HINT_NAME_RVA = 0x2360
-EXPORT_NAME_RVA = 0x2334
-EXPORT_DLL_NAME_RVA = 0x2370
+KERNEL32_STRING_RVA = 0x2360
+ORDINAL_STRING_RVA = 0x2370
+HINT_NAME_RVA = 0x2380
+EXPORT_NAME_RVA = 0x2340
+EXPORT_VFTABLE_RVA = 0x234C
+EXPORT_DLL_NAME_RVA = 0x2390
+DATA_EXPORT_RVA = 0x23B0
 ILT_RVA = 0x2040
 IAT_RVA = 0x2080
 ORDINAL_ILT_RVA = 0x2050
@@ -52,13 +54,14 @@ ORDINAL_IAT_RVA = 0x2090
 PDATA_RVA = 0x2100
 UNWIND0_RVA = 0x2140
 UNWIND1_RVA = 0x2150
+UNWIND2_RVA = 0x2160
 TLS_RVA = 0x2180
 TLS_CALLBACKS_RVA = 0x2200
 RELOC_RVA = 0x2280
 EXPORT_RVA = 0x2300
 EXPORT_EAT_RVA = 0x2328
-EXPORT_ENPT_RVA = 0x232C
-EXPORT_ORDINALS_RVA = 0x2330
+EXPORT_ENPT_RVA = 0x2330
+EXPORT_ORDINALS_RVA = 0x2338
 HANDLER_RVA = 0x1300
 
 SECTION_COUNT = 4
@@ -98,7 +101,7 @@ def synth_image() -> bytes:
     directories = {
         0: (EXPORT_RVA, 40),
         1: (0x2000, 60),
-        3: (PDATA_RVA, 36),
+        3: (PDATA_RVA, 48),
         5: (RELOC_RVA, 16),
         9: (TLS_RVA, 40),
         12: (IAT_RVA, 0x20),
@@ -147,18 +150,25 @@ def synth_image() -> bytes:
     struct.pack_into("<H", buf, rdata(HINT_NAME_RVA), 0x0100)
     buf[rdata(HINT_NAME_RVA) + 2:rdata(HINT_NAME_RVA) + 8] = b"Sleep\x00"
 
-    # Exception directory: two real entries plus a zero slot to be skipped.
+    # Exception directory: two plain entries, a zero slot to be skipped, and one
+    # that chains to another function's unwind info.
     struct.pack_into("<III", buf, rdata(PDATA_RVA), TEXT_RVA, TEXT_RVA + 0x10,
                      UNWIND0_RVA)
     struct.pack_into("<III", buf, rdata(PDATA_RVA) + 12, TEXT_RVA + 0x20,
                      TEXT_RVA + 0x40, UNWIND1_RVA)
     struct.pack_into("<III", buf, rdata(PDATA_RVA) + 24, 0, 0, 0)
+    struct.pack_into("<III", buf, rdata(PDATA_RVA) + 36, TEXT_RVA + 0x40,
+                     TEXT_RVA + 0x60, UNWIND2_RVA)
 
-    # Unwind info: plain prolog, then one with an exception handler.
+    # Unwind info: plain prolog, one with an exception handler, and one that
+    # chains to another function's record.
     buf[rdata(UNWIND0_RVA):rdata(UNWIND0_RVA) + 4] = bytes([0x01, 0x04, 0x00, 0x00])
     struct.pack_into("<BBBB", buf, rdata(UNWIND1_RVA), 0x09, 0x08, 0x02, 0x00)
     struct.pack_into("<HH", buf, rdata(UNWIND1_RVA) + 4, 0x0000, 0x0000)
     struct.pack_into("<I", buf, rdata(UNWIND1_RVA) + 8, HANDLER_RVA)
+    struct.pack_into("<BBBB", buf, rdata(UNWIND2_RVA), 0x21, 0x06, 0x00, 0x00)
+    struct.pack_into("<III", buf, rdata(UNWIND2_RVA) + 4, TEXT_RVA, TEXT_RVA + 0x10,
+                     UNWIND0_RVA)
 
     # TLS: raw data in .bss, callbacks in .rdata.
     struct.pack_into("<QQQQII", buf, rdata(TLS_RVA),
@@ -174,15 +184,19 @@ def synth_image() -> bytes:
     for index, value in enumerate(entries):
         struct.pack_into("<H", buf, rdata(RELOC_RVA) + 8 + index * 2, value)
 
-    # Export directory with one named function.
+    # Export directory: one code export and one exported MSVC vftable symbol,
+    # which is data and must never be reported as a function.
     struct.pack_into("<IIHHIIIIIII", buf, rdata(EXPORT_RVA), 0, 0, 0, 0,
-                     EXPORT_DLL_NAME_RVA, 1, 1, 1, EXPORT_EAT_RVA,
+                     EXPORT_DLL_NAME_RVA, 1, 2, 2, EXPORT_EAT_RVA,
                      EXPORT_ENPT_RVA, EXPORT_ORDINALS_RVA)
-    struct.pack_into("<I", buf, rdata(EXPORT_EAT_RVA), TEXT_RVA)
-    struct.pack_into("<I", buf, rdata(EXPORT_ENPT_RVA), EXPORT_NAME_RVA)
-    struct.pack_into("<H", buf, rdata(EXPORT_ORDINALS_RVA), 0)
+    struct.pack_into("<II", buf, rdata(EXPORT_EAT_RVA), TEXT_RVA, DATA_EXPORT_RVA)
+    struct.pack_into("<II", buf, rdata(EXPORT_ENPT_RVA), EXPORT_NAME_RVA,
+                     EXPORT_VFTABLE_RVA)
+    struct.pack_into("<HH", buf, rdata(EXPORT_ORDINALS_RVA), 0, 1)
     buf[rdata(EXPORT_NAME_RVA):rdata(EXPORT_NAME_RVA) + 12] = b"exported_fn\x00"
+    buf[rdata(EXPORT_VFTABLE_RVA):rdata(EXPORT_VFTABLE_RVA) + 18] = b"??_7CWidget@@6B@\x00\x00"
     buf[rdata(EXPORT_DLL_NAME_RVA):rdata(EXPORT_DLL_NAME_RVA) + 12] = b"fixture.dll\x00"
+    struct.pack_into("<Q", buf, rdata(DATA_EXPORT_RVA), IMAGE_BASE + TEXT_RVA + 0x20)
 
     return bytes(buf)
 
@@ -239,9 +253,15 @@ def test_directories_and_imports() -> None:
 def test_exports_and_relocations() -> None:
     image = PE64Image.from_bytes(synth_image(), "synth.exe")
     exports = image.exports
-    assert len(exports) == 1
-    assert exports[0].name == "exported_fn" and exports[0].rva == TEXT_RVA
-    assert exports[0].ordinal == 1 and exports[0].forwarder is None
+    assert len(exports) == 2, exports
+    code, data = exports
+    assert code.name == "exported_fn" and code.rva == TEXT_RVA
+    assert code.ordinal == 1 and code.forwarder is None
+    assert fn.export_kind(image, code) == "code"
+    assert data.name == "??_7CWidget@@6B@" and data.rva == DATA_EXPORT_RVA
+    assert data.ordinal == 2
+    # An exported vftable is data: it must never be offered as a function.
+    assert fn.export_kind(image, data) == "data"
 
     relocations = image.relocations
     assert [(r.kind, r.rva) for r in relocations] == [
@@ -262,7 +282,7 @@ def test_tls_and_unwind() -> None:
     assert tls.callbacks == (IMAGE_BASE + TEXT_RVA,)
 
     entries = image.runtime_functions
-    assert len(entries) == 2, entries           # the zero slot is skipped
+    assert len(entries) == 3, entries           # the zero slot is skipped
     assert (entries[0].begin_rva, entries[0].end_rva) == (TEXT_RVA, TEXT_RVA + 0x10)
     assert entries[0].size == 0x10
 
@@ -275,6 +295,15 @@ def test_tls_and_unwind() -> None:
     assert handled.code_slots == 2 and handled.has_exception_handler
     assert handled.handler_rva == HANDLER_RVA
     assert not handled.is_chained
+
+    # A chained record carries a full RUNTIME_FUNCTION after its codes. Reading
+    # 12 bytes and unpacking a 4-byte field from them raises struct.error on
+    # CPython 3.14, where unpack() requires an exact-size buffer.
+    chained = image.unwind_info(UNWIND2_RVA)
+    assert chained.is_chained and not chained.has_exception_handler
+    assert chained.chained_begin_rva == TEXT_RVA, chained
+    assert (chained.prolog_size, chained.code_slots) == (6, 0)
+    assert chained.handler_rva is None
 
 
 def test_rejections() -> None:
@@ -297,29 +326,52 @@ def test_rejections() -> None:
             raise AssertionError(f"accepted {name} as a PE32+ image")
 
 
+def test_truncated_file() -> None:
+    """A truncated image must fail reads, not hand out short buffers.
+
+    A section header can claim more raw data than the file holds. Slicing those
+    phantom bytes yields a short buffer, and in CPython 3.14 ``struct.unpack``
+    rejects a buffer that is not exactly the format size, so the failure
+    surfaces as `struct.error` deep inside a parser instead of as a missing
+    read. Every read either fails or returns exactly the requested size.
+    """
+    image = PE64Image.from_bytes(synth_image()[:0x900], "short.exe")
+    assert image.rva_to_offset(RDATA_RVA + 0x80, 4) is not None
+    assert image.rva_to_offset(RDATA_RVA + 0x100, 4) is None
+    assert image.read_rva(RDATA_RVA + 0x100, 4) is None
+
+    for delta in range(0, 0x800, 0x40):
+        raw = image.read_rva(RDATA_RVA + delta, 16)
+        assert raw is None or len(raw) == 16, \
+            (hex(delta), None if raw is None else len(raw))
+
+
 def test_function_recovery() -> None:
     image = PE64Image.from_bytes(synth_image(), "synth.exe")
     functions, notes = fn.recover_functions(image)
     assert [(f.start_rva, f.end_rva, f.source) for f in functions] == [
         (TEXT_RVA, TEXT_RVA + 0x10, "pdata"),
         (TEXT_RVA + 0x20, TEXT_RVA + 0x40, "pdata"),
+        (TEXT_RVA + 0x40, TEXT_RVA + 0x60, "pdata"),
     ], functions
     assert functions[0].name == "exported_fn"     # export name attached to the pdata range
     assert functions[1].name is None
     assert notes == set()
     assert fn.validate_ranges(image, functions) == ()
+    # The exported vftable is data; it must not appear as a recovered function.
+    assert all(function.start_rva != DATA_EXPORT_RVA for function in functions)
 
     # An external start inside a pdata range is a split, not a function.
     bounds = ((IMAGE_BASE + TEXT_RVA + 0x08, IMAGE_BASE + TEXT_RVA + 0x10),
               (IMAGE_BASE + TEXT_RVA + 0x80, IMAGE_BASE + TEXT_RVA + 0x90))
     merged, notes = fn.recover_functions(image, bounds)
-    assert [f.source for f in merged] == ["pdata", "pdata", "ghidra"]
-    assert merged[2].start_rva == TEXT_RVA + 0x80
+    assert [f.source for f in merged] == ["pdata", "pdata", "pdata", "ghidra"]
+    assert merged[3].start_rva == TEXT_RVA + 0x80
     assert notes == {"split_starts"}
     assert fn.validate_ranges(image, merged) == ()
     stats = fn.summarize(merged)
-    assert stats == {"count": 3, "by_source": {"pdata": 2, "ghidra": 1},
-                     "unknown_end": 0, "covered_bytes": 0x10 + 0x20 + 0x10}
+    assert stats == {"count": 4, "by_source": {"pdata": 3, "ghidra": 1},
+                     "unknown_end": 0, "covered_bytes": 0x10 + 0x20 + 0x20 + 0x10}
 
     # A start only inside an executable section is legal; outside it is reported.
     bad = (fn.Function(start_rva=BSS_RVA + 4, end_rva=BSS_RVA + 8, source="ghidra"),
@@ -362,6 +414,9 @@ def test_spec_document(tmp: str) -> None:
                                         "end": IMAGE_BASE + TEXT_RVA + 0x10,
                                         "name": "exported_fn", "source": "pdata"}
     assert document["imports"][0]["iat_va"] == IMAGE_BASE + IAT_RVA
+    assert [entry["kind"] for entry in document["exports"]] == ["code", "data"]
+    assert [entry["section"] for entry in document["exports"]] == [".text", ".rdata"]
+    assert document["recon"]["export_kinds"] == {"code": 1, "data": 1, "forwarder": 0}
     assert document["unwind"][1]["handler_va"] == IMAGE_BASE + HANDLER_RVA
     assert document["tls"]["callbacks"] == [IMAGE_BASE + TEXT_RVA]
     assert document["recon"]["relocation_counts"] == {"dir64": 2, "highlow": 1}
@@ -516,6 +571,7 @@ def main() -> int:
     test_exports_and_relocations()
     test_tls_and_unwind()
     test_rejections()
+    test_truncated_file()
     test_function_recovery()
     with tempfile.TemporaryDirectory() as tmp:
         test_bounds_csv(tmp)

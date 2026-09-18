@@ -22,7 +22,8 @@ import sys
 from typing import Optional, Sequence
 
 import spec as spec_mod
-from functions import load_bounds_csv, recover_functions, summarize, validate_ranges
+from functions import (export_kind, load_bounds_csv, recover_functions, summarize,
+                       validate_ranges)
 from pe64 import PE64Image, PEFormatError
 from schema_check import SchemaError
 
@@ -86,9 +87,12 @@ def print_summary(image: PE64Image, functions, notes, problems, stats, output: O
     for dll in dlls:
         print(f"    {dll:<44} {counts[dll]}")
 
-    exported = [symbol for symbol in image.exports if symbol.forwarder is None]
-    print(f"  exports      {len(image.exports)} ({len(exported)} code, "
-          f"{len(image.exports) - len(exported)} forwarder)")
+    kinds: dict = {}
+    for symbol in image.exports:
+        kind = export_kind(image, symbol)
+        kinds[kind] = kinds.get(kind, 0) + 1
+    print(f"  exports      {len(image.exports)} (code {kinds.get('code', 0)}, "
+          f"data {kinds.get('data', 0)}, forwarder {kinds.get('forwarder', 0)})")
 
     tls = image.tls
     if tls is None:

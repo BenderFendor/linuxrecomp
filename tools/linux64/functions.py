@@ -23,6 +23,7 @@ read that as a zero-length range.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from typing import Iterable, Optional, Sequence, Set, Tuple
 
 from pe64 import Function, PE64Image
@@ -64,6 +65,27 @@ def _covered_by(ranges: Sequence[Function], rva: int) -> Optional[Function]:
     return None
 
 
+def _at_start(ranges: Sequence[Function], rva: int) -> Optional[Function]:
+    for function in ranges:
+        if function.start_rva == rva:
+            return function
+    return None
+
+
+def export_kind(image: PE64Image, symbol) -> str:
+    """Classify an export as ``forwarder``, ``code`` or ``data``.
+
+    An export is not automatically a function. MSVC exports vftables and other
+    data with decorated names — ``??_7CPackage@HLLib@@6B@`` is "vftable for
+    CPackage" — and those live in ``.rdata``/``.data``. Treating them as
+    functions puts lifters on data, which produces code that was never in the
+    program.
+    """
+    if symbol.forwarder is not None:
+        return "forwarder"
+    return "code" if any(lo <= symbol.rva < hi for lo, hi in image.code_ranges()) else "data"
+
+
 def recover_functions(
     image: PE64Image,
     bounds: Iterable[Tuple[int, int]] = (),
@@ -72,7 +94,10 @@ def recover_functions(
 
     *bounds* is an optional iterable of ``(start_va, end_va)`` pairs from an
     external analyzer. ``notes`` records what the merge dropped, keyed by
-    reason, so a caller can report it instead of silently losing functions.
+    reason, so a caller can report it instead of silently losing information.
+    No returned range overlaps another: a start that falls inside an existing
+    range is either recognised as that range's start (and gives it a name) or
+    counted as a split.
     """
     functions = [
         Function(start_rva=entry.begin_rva, end_rva=entry.end_rva, source="pdata")
@@ -82,6 +107,11 @@ def recover_functions(
     functions.sort(key=lambda function: function.start_rva)
 
     notes: Set[str] = set()
+    code_ranges = image.code_ranges()
+
+    def add(function: Function) -> None:
+        functions.append(function)
+        functions.sort(key=lambda item: item.start_rva)
 
     external = []
     for start_va, end_va in bounds:
@@ -97,7 +127,7 @@ def recover_functions(
         if _covered_by(functions, start_rva) is not None:
             notes.add("split_starts")
             continue
-        functions.append(Function(start_rva=start_rva, end_rva=end_rva, source=BOUNDS_SOURCE))
+        add(Function(start_rva=start_rva, end_rva=end_rva, source=BOUNDS_SOURCE))
 
     names = {}
     for symbol in image.exports:
@@ -105,26 +135,31 @@ def recover_functions(
             continue
         names.setdefault(symbol.rva, symbol.name or f"ordinal_{symbol.ordinal}")
 
-    known_starts = {function.start_rva for function in functions}
+    # Only exports that live in executable code can be function starts.
     for start_rva, name in names.items():
-        if start_rva not in known_starts:
-            functions.append(Function(start_rva=start_rva, end_rva=None,
-                                      name=name, source="export"))
-            known_starts.add(start_rva)
+        if not any(lo <= start_rva < hi for lo, hi in code_ranges):
+            continue
+        existing = _at_start(functions, start_rva)
+        if existing is not None:
+            continue  # named below, from the name map
+        if _covered_by(functions, start_rva) is not None:
+            notes.add("split_starts")
+            continue
+        add(Function(start_rva=start_rva, end_rva=None, name=name, source="export"))
 
     entry_rva = image.entrypoint_rva
-    if entry_rva and entry_rva not in known_starts:
-        functions.append(Function(start_rva=entry_rva, end_rva=None,
-                                  name=names.get(entry_rva, "entrypoint"),
-                                  source="entrypoint"))
+    if entry_rva:
+        existing = _at_start(functions, entry_rva)
+        if existing is None and _covered_by(functions, entry_rva) is None:
+            add(Function(start_rva=entry_rva, end_rva=None,
+                         name=names.get(entry_rva, "entrypoint"), source="entrypoint"))
 
     named = []
     for function in functions:
         name = function.name or names.get(function.start_rva)
-        if function.source == "entrypoint" and name is None:
+        if name is None and function.source == "entrypoint":
             name = "entrypoint"
-        named.append(Function(start_rva=function.start_rva, end_rva=function.end_rva,
-                              name=name, source=function.source))
+        named.append(function if function.name == name else replace(function, name=name))
     named.sort(key=lambda function: function.start_rva)
     return tuple(named), notes
 

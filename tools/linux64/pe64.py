@@ -470,9 +470,11 @@ class PE64Image:
     def rva_to_offset(self, rva: int, size: int = 1) -> Optional[int]:
         """File offset backing *rva*, or None when the bytes are not in the file.
 
-        Returns None for zero-filled tails (``.bss``) and for RVAs that no
-        section maps. Callers that need raw-data guarantees use this; callers
-        reading optional metadata use the ``Optional`` result directly.
+        Returns None for zero-filled tails (``.bss``), for RVAs that no section
+        maps, and for bytes past the end of the file. That last check matters
+        because a section header can claim more raw data than the file holds
+        (truncated download, deliberately padded header), and a caller that
+        slices those phantom bytes gets a short buffer, not an error.
         """
         section = self.section_for_rva(rva)
         if section is None or not section.has_raw_data:
@@ -480,9 +482,13 @@ class PE64Image:
         delta = rva - section.rva
         if delta + size > section.raw_size:
             return None
-        return section.raw_offset + delta
+        offset = section.raw_offset + delta
+        if offset + size > len(self.data):
+            return None
+        return offset
 
     def read_rva(self, rva: int, size: int) -> Optional[bytes]:
+        """Exactly *size* bytes at *rva*, or None. Never a short slice."""
         offset = self.rva_to_offset(rva, size)
         if offset is None:
             return None
@@ -720,10 +726,14 @@ class PE64Image:
             trailing += 4
         chained_begin_rva = None
         if flags & UNW_FLAG_CHAININFO:
+            # Read the whole chained RUNTIME_FUNCTION, then unpack from it.
+            # struct.unpack is exact-size in CPython 3.14: unpacking a 4-byte
+            # format from this 12-byte record raises struct.error rather than
+            # ignoring the tail.
             raw = self.read_rva(trailing, _RUNTIME_FUNCTION_SIZE)
             if raw is None:
                 return None
-            chained_begin_rva = struct.unpack("<I", raw)[0]
+            chained_begin_rva = struct.unpack_from("<I", raw, 0)[0]
         return UnwindInfo(
             version=version, flags=flags, prolog_size=prolog_size,
             code_slots=code_slots, frame_register=frame_register,

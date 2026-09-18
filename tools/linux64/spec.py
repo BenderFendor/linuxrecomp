@@ -110,6 +110,38 @@ def _tls_entry(image: PE64Image, tls) -> Optional[dict]:
     }
 
 
+def _export_entries(image: PE64Image) -> list:
+    """Export table entries, each classified as code, data or forwarder.
+
+    The classification is what keeps data exports out of the function list: MSVC
+    exports vftables with decorated names such as ``??_7CPackage@HLLib@@6B@``,
+    and a lifter pointed at those addresses executes data.
+    """
+    out = []
+    for symbol in image.exports:
+        kind = _functions.export_kind(image, symbol)
+        section = None
+        if kind != "forwarder":
+            found = image.section_for_rva(symbol.rva)
+            section = found.name if found else None
+        out.append({
+            "name": symbol.name,
+            "ordinal": symbol.ordinal,
+            "va": image.va(symbol.rva),
+            "forwarder": symbol.forwarder,
+            "kind": kind,
+            "section": section,
+        })
+    return out
+
+
+def _export_kind_counts(entries) -> dict:
+    counts = {"code": 0, "data": 0, "forwarder": 0}
+    for entry in entries:
+        counts[entry["kind"]] = counts.get(entry["kind"], 0) + 1
+    return counts
+
+
 def build_spec(
     image: PE64Image,
     functions: Sequence[Function],
@@ -126,6 +158,8 @@ def build_spec(
     """
     if stats is None:
         stats = _functions.summarize(functions)
+
+    exports = _export_entries(image)
 
     spec = {
         "format": SPEC_FORMAT,
@@ -169,11 +203,7 @@ def build_spec(
         "functions": [_function_entry(image, function) for function in functions],
         "imports": [_import_entry(image, symbol) for symbol in image.imports],
         "import_dlls": list(image.import_dlls),
-        "exports": [
-            {"name": symbol.name, "ordinal": symbol.ordinal, "va": image.va(symbol.rva),
-             "forwarder": symbol.forwarder}
-            for symbol in image.exports
-        ],
+        "exports": exports,
         "relocations": [
             {"type": relocation.type, "kind": relocation.kind, "va": image.va(relocation.rva)}
             for relocation in image.relocations
@@ -186,6 +216,7 @@ def build_spec(
             "functions_with_unknown_end": stats["unknown_end"],
             "covered_code_bytes": stats["covered_bytes"],
             "relocation_counts": image.relocation_counts(),
+            "export_kinds": _export_kind_counts(exports),
             "notes": list(notes),
             "problems": list(problems),
         },

@@ -129,12 +129,15 @@
     "export": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "ordinal", "va"],
+      "required": ["name", "ordinal", "va", "kind", "section"],
       "properties": {
         "name": {"type": ["string", "null"]},
         "ordinal": {"type": "integer", "minimum": 0},
         "va": {"type": "integer", "minimum": 0},
-        "forwarder": {"type": ["string", "null"]}
+        "forwarder": {"type": ["string", "null"]},
+        "kind": {"type": "string", "enum": ["code", "data", "forwarder"],
+                 "description": "code exports can be function starts; data exports (for example MSVC vftable symbols) must never be lifted"},
+        "section": {"type": ["string", "null"]}
       }
     },
     "relocation": {
@@ -174,6 +177,7 @@
         "functions_with_unknown_end": {"type": "integer", "minimum": 0},
         "covered_code_bytes": {"type": "integer", "minimum": 0},
         "relocation_counts": {"type": "object", "additionalProperties": {"type": "integer"}},
+        "export_kinds": {"type": "object", "additionalProperties": {"type": "integer"}},
         "notes": {"type": "array", "items": {"type": "string"}},
         "problems": {"type": "array", "items": {"type": "string"}}
       }
