@@ -42,10 +42,10 @@ the numbers directly as guest addresses without re-adding the image base.
 Trust order, recorded per function in the `source` field:
 
 1. `pdata` — the AMD64 exception directory. On x64 the linker writes one
-   `RUNTIME_FUNCTION` per function with unwind data, with `[begin, end)` in RVAs.
-   This is the linker's own table, not a heuristic, so it is authoritative: an
-   external start that lands inside one of these ranges is reported as a split
-   (`recon.notes` = `split_starts`) rather than added as a new function.
+   `RUNTIME_FUNCTION` per unwinding region. These are merged into function ranges
+   first (see the section below), because MSVC splits one function across several
+   regions. An external start that lands inside a merged range is reported as a
+   split (`recon.notes` = `split_starts`) rather than added as a new function.
 2. `ghidra` — ranges from `--bounds`, the CSV written by the repo's existing
    `tools/ghidra/DumpBounds.java` (`start,end` hex, end exclusive). This fills
    what `.pdata` leaves out: both MinGW and MSVC omit leaf functions.
@@ -132,6 +132,34 @@ address, and an interior address is junk for a lifter.
 
 Ingesting those starts into the spec is P8 work; it would add an `rtti` value to
 the function `source` enum.
+
+## MSVC `.pdata` is a region table, not a function table
+
+One MSVC function is often split into several unwinding regions, and each
+continuation begins exactly where the previous region ends and carries
+`UNW_FLAG_CHAININFO` pointing at the region that holds the function's prologue.
+Measured on the project's test binaries, every chained region is address
+contiguous with another region (143 of 143 on HLExtract.exe, 210 of 210 on
+HLLib.dll). Chains can be longer than two: `0x13D0`, `0x13F1` and `0x1478` on
+HLExtract.exe are three regions of one function.
+
+Without merging, those continuations look like tiny functions. HLExtract.exe
+reported one 5-byte "function" that is really `add rsp, 0x28; ret`. A lifter
+pointed at it produces an epilogue as if it were a function entry, and the real
+function gets lifted a second time through its own trace.
+
+`functions.merge_unwind_regions` folds a chained region into the range it
+continues. HLExtract.exe goes from 405 regions to 262 functions, HLLib.dll from
+917 to 707, and `recon.regions_merged` reports the difference.
+
+Two consequences to keep in mind:
+
+* the merged range is still an *unwind* range, so a function's real extent can
+  run past its `end` when the tail has no unwind record. Consumers must follow
+  control flow instead of treating `end` as a hard boundary. HLExtract.exe
+  covers 90,613 of 96,768 code bytes, so about 6 KB sits outside any region.
+* the raw region table stays in the spec's `unwind` array, which is what exception
+  handling needs in P8.
 
 ## Known gaps (deliberate, tracked in ROADMAP.md)
 

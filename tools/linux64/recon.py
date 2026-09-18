@@ -51,7 +51,7 @@ def analyze(path: str, bounds_path: Optional[str] = None):
     functions, merge_notes = recover_functions(image, bounds)
     notes |= merge_notes
     problems = validate_ranges(image, functions)
-    stats = summarize(functions)
+    stats = summarize(functions, image)
     return image, functions, notes, problems, stats
 
 
@@ -111,7 +111,9 @@ def print_summary(image: PE64Image, functions, notes, problems, stats, output: O
     unwind_handlers = sum(1 for entry in image.runtime_functions
                           if (info := image.unwind_info(entry.unwind_rva)) is not None
                           and (info.has_exception_handler or info.has_termination_handler))
-    print(f"  unwind       {len(image.runtime_functions)} .pdata entries, "
+    merged = stats.get("regions_merged", 0)
+    detail = f", {merged} continuations merged" if merged else ""
+    print(f"  unwind       {len(image.runtime_functions)} .pdata entries{detail}, "
           f"{unwind_handlers} with language handlers")
 
     sources = ", ".join(f"{name} {count}" for name, count in sorted(stats["by_source"].items()))

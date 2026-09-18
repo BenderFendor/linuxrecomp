@@ -1,11 +1,30 @@
 # Linux64 runtime
 
-Shared runtime for recompiled AMD64 Windows targets. Nothing here exists yet;
-this is the intended decomposition (P2 onward in `docs/linux64/ROADMAP.md`).
+Shared runtime for recompiled AMD64 Windows targets.
+
+Two pieces exist today, both built by `scripts/build-runtime-linux64.sh` into
+`work/linux64/bin`:
+
+* `image_pe64.{c,h}` maps a PE32+ image at its preferred base with the sections
+  protected according to their characteristics. The preferred base or nothing:
+  relocating is a deliberate non-goal, because mixing raw guest addresses with
+  rebased host addresses is what produces plausible-looking wrong behaviour. Base
+  relocations are therefore irrelevant to this design; they exist to support
+  rebasing, and we never rebase.
+* `refexec.c` calls one function from a mapped image on the real CPU. The guest's
+  `.text` is already x86-64, so a differential test needs no emulator: the CPU
+  running the original bytes is the oracle. Arguments go in through the Microsoft
+  x64 convention using `ms_abi`, and `--poke ADDR=HEXBYTES` and `--dump ADDR:LEN`
+  set up and inspect guest memory.
 
 ```
-image/       map/copy PE sections, keep guest virtual addresses, apply the one
-             documented relocation policy if the preferred base is unavailable
+./scripts/build-runtime-linux64.sh
+work/linux64/bin/refexec IMAGE FUNCTION_VA [a b c d] [--poke ADDR=HEX] [--dump ADDR:LEN]
+```
+
+Planned modules (P3 onward in `docs/linux64/ROADMAP.md`):
+
+```
 cpu/         CPU state bootstrap (Remill State/Memory), stack setup
 dispatch/    guest VA -> lifted function, generated from the backend symbol map
 imports/     IAT slot resolution; thunks at the Win32 boundary

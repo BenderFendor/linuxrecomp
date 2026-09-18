@@ -157,7 +157,7 @@ def build_spec(
     ``functions.summarize``; it is recomputed here when omitted.
     """
     if stats is None:
-        stats = _functions.summarize(functions)
+        stats = _functions.summarize(functions, image)
 
     exports = _export_entries(image)
 

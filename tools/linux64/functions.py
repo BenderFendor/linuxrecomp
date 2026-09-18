@@ -86,6 +86,34 @@ def export_kind(image: PE64Image, symbol) -> str:
     return "code" if any(lo <= symbol.rva < hi for lo, hi in image.code_ranges()) else "data"
 
 
+def merge_unwind_regions(image: PE64Image):
+    """Merge MSVC's unwind *regions* into function ranges.
+
+    ``.pdata`` is not a function table on MSVC: one function is often split into
+    several regions, and each continuation carries ``UNW_FLAG_CHAININFO`` and
+    begins exactly where the previous region ends. Measured on the project's test
+    binaries, every chained region begins at another region's end (143/143 on
+    HLExtract.exe, 210/210 on HLLib.dll), and the chain target is the region
+    holding the function's prologue.
+
+    Without this merge those continuations look like 5-byte functions that are
+    really epilogues, such as ``add rsp, 0x28; ret``, which is data no lifter
+    should treat as a function entry.
+
+    Returns ``[(begin_rva, end_rva, region_count), ...]``.
+    """
+    merged = []
+    for entry in sorted(image.runtime_functions, key=lambda item: item.begin_rva):
+        info = image.unwind_info(entry.unwind_rva)
+        chained = info is not None and info.is_chained
+        if merged and chained and merged[-1][1] == entry.begin_rva:
+            begin, _end, count = merged[-1]
+            merged[-1] = (begin, entry.end_rva, count + 1)
+            continue
+        merged.append((entry.begin_rva, entry.end_rva, 1))
+    return merged
+
+
 def recover_functions(
     image: PE64Image,
     bounds: Iterable[Tuple[int, int]] = (),
@@ -98,11 +126,16 @@ def recover_functions(
     No returned range overlaps another: a start that falls inside an existing
     range is either recognised as that range's start (and gives it a name) or
     counted as a split.
+
+    Ranges come from ``.pdata`` and are therefore *unwind region* ranges. Some
+    code carries no unwind record at all, so a function's real extent can run
+    past its ``end``. Consumers must follow control flow rather than treat
+    ``end`` as a hard boundary.
     """
     functions = [
-        Function(start_rva=entry.begin_rva, end_rva=entry.end_rva, source="pdata")
-        for entry in image.runtime_functions
-        if entry.end_rva > entry.begin_rva
+        Function(start_rva=begin, end_rva=end, source="pdata")
+        for begin, end, _count in merge_unwind_regions(image)
+        if end > begin
     ]
     functions.sort(key=lambda function: function.start_rva)
 
@@ -193,8 +226,13 @@ def validate_ranges(image: PE64Image, functions: Sequence[Function]) -> Tuple[st
     return tuple(problems)
 
 
-def summarize(functions: Sequence[Function]) -> dict:
-    """Counts by source plus byte coverage, for reporting."""
+def summarize(functions: Sequence[Function], image: Optional[PE64Image] = None) -> dict:
+    """Counts by source plus byte coverage, for reporting.
+
+    When *image* is given, also reports how many ``.pdata`` regions were merged
+    into the function ranges, which is the difference between a region count and
+    a function count on MSVC binaries.
+    """
     by_source: dict = {}
     covered = 0
     unknown_end = 0
@@ -204,9 +242,14 @@ def summarize(functions: Sequence[Function]) -> dict:
             unknown_end += 1
         else:
             covered += function.end_rva - function.start_rva
-    return {
+    stats = {
         "count": len(functions),
         "by_source": by_source,
         "unknown_end": unknown_end,
         "covered_bytes": covered,
     }
+    if image is not None:
+        regions = len(image.runtime_functions)
+        stats["unwind_regions"] = regions
+        stats["regions_merged"] = regions - len(merge_unwind_regions(image))
+    return stats

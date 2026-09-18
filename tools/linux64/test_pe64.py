@@ -348,11 +348,17 @@ def test_truncated_file() -> None:
 
 def test_function_recovery() -> None:
     image = PE64Image.from_bytes(synth_image(), "synth.exe")
+
+    # The third .pdata record is a chained continuation that begins where the
+    # second ends, so it merges into it instead of becoming a 0x20-byte function.
+    regions = fn.merge_unwind_regions(image)
+    assert regions == [(TEXT_RVA, TEXT_RVA + 0x10, 1),
+                       (TEXT_RVA + 0x20, TEXT_RVA + 0x60, 2)], regions
+
     functions, notes = fn.recover_functions(image)
     assert [(f.start_rva, f.end_rva, f.source) for f in functions] == [
         (TEXT_RVA, TEXT_RVA + 0x10, "pdata"),
-        (TEXT_RVA + 0x20, TEXT_RVA + 0x40, "pdata"),
-        (TEXT_RVA + 0x40, TEXT_RVA + 0x60, "pdata"),
+        (TEXT_RVA + 0x20, TEXT_RVA + 0x60, "pdata"),
     ], functions
     assert functions[0].name == "exported_fn"     # export name attached to the pdata range
     assert functions[1].name is None
@@ -365,13 +371,14 @@ def test_function_recovery() -> None:
     bounds = ((IMAGE_BASE + TEXT_RVA + 0x08, IMAGE_BASE + TEXT_RVA + 0x10),
               (IMAGE_BASE + TEXT_RVA + 0x80, IMAGE_BASE + TEXT_RVA + 0x90))
     merged, notes = fn.recover_functions(image, bounds)
-    assert [f.source for f in merged] == ["pdata", "pdata", "pdata", "ghidra"]
-    assert merged[3].start_rva == TEXT_RVA + 0x80
+    assert [f.source for f in merged] == ["pdata", "pdata", "ghidra"]
+    assert merged[2].start_rva == TEXT_RVA + 0x80
     assert notes == {"split_starts"}
     assert fn.validate_ranges(image, merged) == ()
-    stats = fn.summarize(merged)
-    assert stats == {"count": 4, "by_source": {"pdata": 3, "ghidra": 1},
-                     "unknown_end": 0, "covered_bytes": 0x10 + 0x20 + 0x20 + 0x10}
+    stats = fn.summarize(merged, image)
+    assert stats == {"count": 3, "by_source": {"pdata": 2, "ghidra": 1},
+                     "unknown_end": 0, "covered_bytes": 0x10 + 0x40 + 0x10,
+                     "unwind_regions": 3, "regions_merged": 1}, stats
 
     # A start only inside an executable section is legal; outside it is reported.
     bad = (fn.Function(start_rva=BSS_RVA + 4, end_rva=BSS_RVA + 8, source="ghidra"),
