@@ -323,6 +323,17 @@ StopReason dispatch_from(uint64_t va, State *state, Memory *memory) {
         while (reason == StopReason::kReturned) {
             const LiftedEntry *next = lifted_lookup(g_stop_pc);
             if (!next) {
+                /* A return to an address that is not lifted is not the program
+                 * finishing: it is the next address to lift. Reporting it as
+                 * "returned" and leaving it there is how a run ends silently, and a
+                 * driver cannot continue from a silence. Returning to 0 is the one
+                 * case that really is the end. */
+                if (g_stop_pc != 0) {
+                    record_missing(g_stop_pc);
+                    std::snprintf(g_detail, sizeof(g_detail),
+                                  "return to unlifted address %#" PRIx64, g_stop_pc);
+                    reason = StopReason::kMissingDispatch;
+                }
                 break;
             }
             entry = next;
@@ -650,6 +661,13 @@ Memory *__remill_function_call(State &state, uint64_t target, Memory *memory) {
 }
 
 Memory *__remill_jump(State &state, uint64_t target, Memory *memory) {
+    /* A tail jump into an import: the thunk pattern `jmp qword ptr [IAT]`. The
+     * import's return is this frame's return, and the return address the caller
+     * pushed is still on the guest stack, which call_import pops. */
+    if (const import_entry *import = imports_find_host(g_imports, target)) {
+        call_import(&state, import, memory);
+        return propagate(StopReason::kReturned, g_stop_pc);
+    }
     if (!lifted_lookup(target)) {
         record_missing(target);
         char detail[96];

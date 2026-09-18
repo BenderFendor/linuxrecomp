@@ -23,6 +23,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
@@ -109,7 +110,8 @@ def lift_addresses(image: str, lift_root: pathlib.Path, addresses: Iterable[int]
 def run(image: str, entry: int, rounds: int, jobs: int, flavour: str,
         arguments: Sequence[str], lift_root: pathlib.Path, timeout: float) -> int:
     RUN_DIR.mkdir(parents=True, exist_ok=True)
-    transcript = RUN_DIR / f"{pathlib.Path(image).stem}-{flavour}.txt"
+    # One transcript per run: a second run must not erase the evidence of the first.
+    transcript = RUN_DIR / f"{pathlib.Path(image).stem}-{flavour}-{time.strftime('%Y%m%d-%H%M%S')}.txt"
     with transcript.open("w") as handle:
         for round_number in range(1, rounds + 1):
             build_harness(image, lift_root)
