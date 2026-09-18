@@ -45,6 +45,12 @@ Source checkouts are pinned under .deps/src.
 Next:
   python -m tools.linux64 doctor
   ./scripts/build-win64-fixtures.sh
+  ./scripts/check-winelib.sh
 
 Building Remill/rev.ng/Anvill is intentionally separate; each has LLVM/toolchain version constraints that should be resolved explicitly rather than hidden in bootstrap.
+The Win32 API layer is the installed Wine (winegcc/winebuild plus its PE DLLs), not a checkout; see docs/linux64/WINE.md.
 MSG
+
+if ! command -v winegcc >/dev/null 2>&1; then
+  echo "warning: winegcc not found - the runtime's Win32 layer needs Wine's winelib toolchain" >&2
+fi
