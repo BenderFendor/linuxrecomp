@@ -24,7 +24,6 @@
 
 #include <cstdarg>
 #include <cinttypes>
-#include <csetjmp>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -33,9 +32,17 @@ namespace {
 
 /* One execution context per active trace. A called function runs inside the
  * caller's trace, so the context is a stack: `halt` always unwinds to the
- * innermost trace, which is the one that hit the boundary. */
+ * innermost trace, which is the one that hit the boundary.
+ *
+ * The buffer is clang's built-in jump buffer, not `jmp_buf`. `setjmp` is a libc
+ * symbol, and a host can supply a different implementation of it with a different
+ * buffer layout: in a winelib build the link binds `setjmp` to Wine's PE-side
+ * `_setjmp` stub, which writes a Windows-shaped buffer into what this file sized
+ * as glibc's `jmp_buf`. Measured on wine-11.15 as a crash inside that stub. The
+ * built-in emits the save and the restore inline, with a layout the compiler owns,
+ * so nothing outside this translation unit can disagree about it. */
 struct StopContext {
-    jmp_buf jump;
+    void *jump[5];
     StopContext *previous;
 };
 
@@ -69,7 +76,7 @@ Memory *halt(StopReason reason, uint64_t pc, const char *detail) {
     g_stop_pc = pc;
     std::snprintf(g_detail, sizeof(g_detail), "%s", detail ? detail : "");
     if (g_current) {
-        longjmp(g_current->jump, 1);
+        __builtin_longjmp(g_current->jump, 1);
     }
     std::fprintf(stderr, "lifted runtime: %s at pc=%#llx (%s) outside a trace\n",
                  detail ? detail : "halt", (unsigned long long)pc,
@@ -88,7 +95,7 @@ StopReason trace_once(lifted_function function, State *state, uint64_t pc,
     g_reason = StopReason::kReturned;
     g_stop_pc = 0;
     g_detail[0] = '\0';
-    if (setjmp(context.jump) == 0) {
+    if (__builtin_setjmp(context.jump) == 0) {
         function(state, pc, memory);
     }
     trace_dispatch("trace %p finished with %s", (void *)function, reason_name(g_reason));

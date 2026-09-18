@@ -104,7 +104,7 @@ zero-argument path is a bare `ret`) stopped looking like a mismatch.
 
 Details in `docs/linux64/LIFTING.md`.
 
-## P4 — imports through the Win32 layer — **blocked**
+## P4 — imports through the Win32 layer — **unblocked**
 
 Target: `kernel32.exe` fixture.
 
@@ -114,16 +114,12 @@ Target: `kernel32.exe` fixture.
 * `Sleep`, `GetTickCount64`, console and file paths work;
 * no shim is written for an import that exists in Wine.
 
-Blocked on the host layer, not on imports. A winelib host can load Wine's DLLs and
-call into native code, and lifted code has been observed returning correct results
-inside a Wine process, but runs are not reproducible: the process dies in the
-runtime's `setjmp`/`longjmp` stop path while the runtime's view of its own `Memory`
-argument stops matching the caller's. Ruled out by measurement, with probes kept in
-`scripts/check-winelib.sh`: Wine's view of guest memory (fixed, `wine_memory.c`),
-the thread used for guest execution (pthread and Wine's `CreateThread` both fail),
-Wine's asynchronous signals, `stdout` blocking, the stack size, and struct layout
-mismatches. The native harness on the same objects is deterministic, so P2/P3
-validation does not depend on this. Next executable step and full measurements:
+The host layer blocked this for a while and no longer does. The runtime's stop path
+used `setjmp`, and in a winelib build that symbol binds to Wine's PE-side `_setjmp`
+stub, whose buffer layout is not glibc's; the runtime now uses clang's built-in jump
+buffer instead. After that change the winelib harness runs the same lifted functions
+as the native one and agrees with it, which is what P4 was waiting for. The
+investigation, including everything that was ruled out, is in
 `docs/agents/traces/wine-host-guest-execution.md`.
 
 ## P5 — window and input

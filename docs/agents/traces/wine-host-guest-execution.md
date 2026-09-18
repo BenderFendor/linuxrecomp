@@ -1,7 +1,10 @@
 # Wine host: running lifted guest code inside a Wine process
 
 Slug: `wine-host-guest-execution`. Risk tier: high (runtime host boundary).
-Status: **blocked, documented**; native path unaffected and verified.
+Status: **resolved**. Root cause: `setjmp` in a winelib build binds to Wine's
+PE-side `_setjmp` stub, whose jump-buffer layout is not glibc's. The runtime now uses
+clang's built-in jump buffer. Winelib and native harnesses agree on the fixture and
+on HLExtract functions.
 
 ## Goal / done criteria
 
@@ -169,18 +172,60 @@ the state it expects, not a fault in our code.
   callee is in a `0x6fffff...` Wine PE DLL. So a Unix-side module called a
   PE-side context save with the runtime's block as the destination.
 
-## Next executable step
+## Resolution
 
-Log `&context.jump` from `trace_once` next to the descriptor's address in the same
-run. If they are equal, the `StopContext` of our own stop path is the buffer being
-written, which points at a stack/target mix-up in how the guest thread enters
-`lifted_run_dispatched`. If they differ, resolve the caller return address at RSP
-(the crash handler already resolves the faulting RIP against `/proc/self/maps`, so
-reuse that path) and name the Wine function that supplied the pointer.
+Logging `&context.jump` from `trace_once` next to the fault was the measurement that
+ended it:
 
-`LINUXRECOMP_GUARD_MEMORY=1` turns on the descriptor guard, and the crash handler
-prints the faulting RIP with its mapping, the bytes around the instruction, and the
-top of the stack.
+```
+trace: memory descriptor guarded read-only at 0x7ffffe8c0000
+context: jump=0x7f74253bfce0 size=200
+lifted: fault 11 at rip=0x6fffffbb0f78 address=0 rsp=0x7f74253bfcd8
+```
+
+`rsp` sits 8 bytes below `&context.jump`: the faulting code is the callee of our own
+`setjmp` call, and that callee is a Wine PE DLL, not glibc. The link says the rest:
+
+```
+nm --defined-only lifted_harness-*.winelib.so | grep jmp
+  000000000003a378 d __imp__setjmp
+  0000000000016448 t _setjmp
+objdump -d ... | grep -B2 "call.*setjmp"
+  179b6:  call   16448 <_setjmp>
+```
+
+So the winelib link resolved `setjmp` to Wine's PE-side `_setjmp` stub, which stores
+a Windows-shaped jump buffer through `%rcx`, while this file had sized the buffer as
+glibc's `jmp_buf` (200 bytes). Every previous symptom follows from that: the writer
+is a store into the buffer at whatever address the buffer has, which is why it moved
+with the block, why the address did not matter, why the allocator did not matter, and
+why the reference to a "context save" fit the instruction bytes so exactly.
+
+Fix: `StopContext` holds clang's built-in jump buffer, and `trace_once`/`halt` use
+`__builtin_setjmp`/`__builtin_longjmp`. The compiler emits the save and the restore
+inline, with a layout it owns, so no host can substitute a different implementation.
+
+Verified after the fix:
+
+```
+fixture  native   5/5    result=0x1234abcd
+fixture  winelib 10/10   result=0x1234abcd
+HLExtract.exe 0x140001250  native  result=0x7f9e04bfedc1  stop call at 0x1d4ce
+HLExtract.exe 0x140001250  winelib result=0x7ffffe8bedc1  stop call at 0x1d4ce
+HLExtract.exe 0x140001000  both stop call at 0x1d436
+python -m tools.linux64 selftest   4/4 + 4/4
+scripts/check-winelib.sh           24 checks ok
+```
+
+The two flavours agree on stops and on results, differing only in stack addresses,
+which the harness documentation already excludes from comparisons.
+
+## Instruments kept
+
+`LINUXRECOMP_GUARD_MEMORY=1` marks the memory descriptor read-only, which turns any
+writer into a fault with a location. The crash handler prints the faulting RIP with
+its mapping, the bytes around the instruction, and the top of the stack, and that is
+what identified the stub.
 
 ## Rollback
 

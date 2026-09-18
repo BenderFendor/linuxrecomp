@@ -108,15 +108,33 @@ and a signal delivered to it ends in `siglongjmp` from a corrupt frame. A
 suspends and notifies threads) are blocked for its lifetime: Wine cannot unwind a
 thread whose frames are not Windows frames.
 
-**Status: the winelib bridge does not yet run a lifted function reliably.** Lifted
-code does execute and produce correct results in a Wine process, but runs are not
-reproducible: roughly one run in one dies inside the runtime's stop path, and the
-runtime's view of its own `Memory` argument stops matching the caller's. The same
-harness, same objects, same lifted code, run as a plain native process, is
-deterministic. Until that is resolved, `scripts/build-lifted-harness.sh` still
-builds the winelib flavour (so the Win32 layer stays testable) but the differential
-tests use the native harness. `docs/agents/traces/wine-host-guest-execution.md`
-records what was measured, what was ruled out, and the next experiment.
+**Lifted code now runs in a Wine process.** The obstacle was not Wine's memory or
+Wine's threads: it was `setjmp`. The runtime stops a trace by jumping out of it, and
+in a winelib build the link binds `setjmp` to Wine's PE-side `_setjmp` stub
+(`nm` shows a local `_setjmp` at a fixed offset plus `__imp__setjmp`), which writes
+a Windows-shaped jump buffer into what the runtime had sized as glibc's `jmp_buf`.
+The symptom was a crash inside that stub, at whichever address the buffer happened
+to live, which is why it looked like memory corruption and followed the block
+around. The runtime now uses clang's built-in jump buffer, saved and restored
+inline with a layout the compiler owns, and nothing outside the translation unit
+can disagree about it.
+
+Measured after the fix, same harness, same lifted functions:
+
+```
+fixture, native harness   result=0x1234abcd   5/5
+fixture, winelib harness  result=0x1234abcd   10/10
+HLExtract.exe 0x140001250 native  result=0x7f9e04bfedc1  stop call at 0x1d4ce
+HLExtract.exe 0x140001250 winelib result=0x7ffffe8bedc1  stop call at 0x1d4ce
+```
+
+The two flavours agree on the stop and on the result, up to the stack addresses
+that the harness's own documentation says are not comparable between executors.
+
+While the defect was live, the thread choice was measured too, and both a `pthread`
+and a Wine `CreateThread` failed the same way; the thread conclusions in
+`runtime/linux64/host_guest.h` are weaker than they read, because the same defect
+was behind both.
 
 ## Adding a Win32 API
 
