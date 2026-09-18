@@ -20,19 +20,27 @@ Two things it does NOT do, both deliberate:
 
   * It does not resolve imports in the lifter. A PE reaches its imports through
     the IAT - an indirect call through a data slot - so the boundary is drawn
-    at load time: the loader writes a sentinel address into every IAT slot and
-    dispatch() routes that range to the HLE layer. That catches every way an
-    import can be reached, not just `call [__imp_X]`: the one-line thunks MSVC
-    emits, a pointer copied out of the IAT and called later, and the vtables
-    D3D hands back. A lifter-side pattern match sees the first and misses the
-    rest. This file emits the sentinel map for the runtime to install.
+    at load time instead, which catches every way an import can be reached and
+    not just `call [__imp_X]`: the one-line thunks MSVC emits, a pointer copied
+    out of the IAT and called later, and the vtables D3D and Wwise hand back.
+
+    Where a 32-bit target needs a sentinel in each slot - the import has to be
+    reimplemented, so it must be recognised when called - a 64-bit Windows
+    guest on a 64-bit Windows host does not. The calling convention on both
+    sides is the same one, so the loader puts the REAL function address in the
+    slot and forwards the call. The map emitted here is for diagnostics: it is
+    what turns an address in a crash trail back into KERNEL32!CreateFileW.
+
+This file also closes the catalog; see the note in main().
 
 Usage:
   py -3.11 generate64.py <game.exe> <funcs.txt> <outdir> [--split N]
 """
 
+import bisect
 import json
 import os
+import re
 import struct
 import sys
 import time
@@ -153,12 +161,83 @@ def main():
     print('[*] catalog: %d functions' % len(bounds))
     print('[*] imports: %d IAT slots' % len(iat))
 
+    # ---- close the catalog ----
+    #
+    # A catalog of function ENTRIES is not closed under the addresses the code
+    # actually jumps to. An optimising compiler tail-jumps into the middle of a
+    # function it shares an epilogue with, and a switch arm can be any
+    # instruction at all; both produce a `dispatch(c, 0x...)` to an address that
+    # is inside .text and is not an entry, and at runtime that is a hard stop -
+    # the dispatch table cannot enter a function body part-way through.
+    #
+    # Battle Pods hits this 1.75 million dispatches in, tail-jumping to
+    # 0x140BA97D5, which sits 0x75 bytes inside the catalogued function at
+    # 0x140BA9760.
+    #
+    # So: lift, read back every literal target the generated text dispatches to,
+    # add the ones that are not catalogued as entries of their own, and repeat
+    # until nothing new appears. The new entry overlaps the function containing
+    # it and that is fine - the same bytes lift to the same code twice under two
+    # extents, and only the entry that is dispatched to is ever called.
+    DISPATCH_RE = re.compile(r'dispatch(?:_jmp)?\(c, 0x([0-9A-Fa-f]+)ull\)')
+
+    def lift_one(va):
+        size, name = bounds[va]
+        fname = 'L_%012X' % va
+        try:
+            return lf.lift_function(read_va(va, size), va, name=fname)
+        except Exception as e:
+            return ('/* ERROR %s at %#x: %s */\n'
+                    'void %s(CPU *c) { (void)c; RECOMP_TODO(%#x, "lift error"); }'
+                    % (name, va, e, fname, va))
+
+    text_lo = base + [s for s in secs if s[0] == '.text'][0][1]
+    text_hi = text_lo + [s for s in secs if s[0] == '.text'][0][2]
+
+    bodies = {}
+    pending = sorted(bounds)
+    rounds = 0
+    added_total = 0
+    t0 = time.time()
+    while pending and rounds < 16:
+        rounds += 1
+        targets = set()
+        for va in pending:
+            body = lift_one(va)
+            bodies[va] = body
+            for m in DISPATCH_RE.finditer(body):
+                targets.add(int(m.group(1), 16))
+        known = set(bounds)
+        starts = sorted(known)
+        new = []
+        for t in sorted(targets):
+            if t in known or not (text_lo <= t < text_hi):
+                continue
+            # Extent runs to the next catalogued start, capped: an entry carved
+            # out of the middle of a function ends where the next one begins.
+            i = bisect.bisect_right(starts, t)
+            end = starts[i] if i < len(starts) else text_hi
+            size = min(end - t, 0x10000)
+            if size <= 0:
+                continue
+            bounds[t] = (size, 'sub_%X_split' % t)
+            new.append(t)
+        if not new:
+            break
+        added_total += len(new)
+        print('[*] closure round %d: +%d dispatch targets not in the catalog'
+              % (rounds, len(new)), flush=True)
+        pending = new
+
+    if added_total:
+        print('[*] catalog closed after %d rounds, %d entries added (%d total)'
+              % (rounds, added_total, len(bounds)))
+
     entries = []
     chunk = []
     file_idx = 0
     nerr = 0
     ntodo = 0
-    t0 = time.time()
 
     def flush():
         nonlocal file_idx, chunk
@@ -179,13 +258,11 @@ def main():
         if size <= 0:
             continue
         fname = 'L_%012X' % va
-        try:
-            body = lf.lift_function(read_va(va, size), va, name=fname)
-        except Exception as e:
+        body = bodies.get(va)
+        if body is None:
+            body = lift_one(va)
+        if body.startswith('/* ERROR'):
             nerr += 1
-            body = ('/* ERROR %s at %#x: %s */\n'
-                    'void %s(CPU *c) { (void)c; RECOMP_TODO(%#x, "lift error"); }'
-                    % (name, va, e, fname, va))
         ntodo += body.count('RECOMP_TODO(')
         chunk.append(body)
         entries.append((va, fname, name))

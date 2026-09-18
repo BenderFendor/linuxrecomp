@@ -1052,11 +1052,26 @@ class Lifter:
                     else:
                         out.append('  if (_jt == GVA(0x%X)) { dispatch(c, 0x%Xull); return; }'
                                    % (tv, tv))
-                out.append('  dispatch_jmp(c, _jt); return; }')
+                # An arm this walk did not enumerate. Same reasoning as the
+                # register-indirect case: try the local labels before giving up
+                # to the global dispatcher.
+                out.append('  _ind = _jt; goto _ljump; }')
                 return out
             if t.type == X86_OP_IMM:
                 return ['dispatch(c, 0x%Xull); return;' % t.imm]
-            return ['/* indirect jmp */ dispatch_jmp(c, %s); return;' % self._target(insn, t)]
+            # An indirect jump. MSVC's x64 switch is
+            #     lea r11, [rip+table] / mov eax,[r11+rax*4] / add rax,r11 / jmp rax
+            # so the target is computed in a REGISTER and is not a literal
+            # anywhere in the image - no amount of static analysis of the
+            # emitted text will find it, and the arm is usually an address
+            # inside this very function, just after a `ret`. Sending it to the
+            # global dispatcher fails: the dispatch table holds function
+            # entries and cannot enter a body part-way through.
+            #
+            # So it goes to the local label dispatch instead, which can, and
+            # only falls back to the global one for a genuine cross-function
+            # tail call. See the _ljump block in lift_function.
+            return ['{ _ind = %s; goto _ljump; }' % self._target(insn, t)]
 
         if m == 'call':
             t = ops[0]
@@ -1245,8 +1260,21 @@ class Lifter:
                                     self.jumptables[ins.address] = tg
                                     labels.update(t for t in tg if t in insn_addrs)
 
+        # An indirect jump can compute ANY instruction in this function as its
+        # target - a switch arm is often the instruction right after a `ret`,
+        # which is a leader no branch points at - so when one is present every
+        # instruction needs a label for the local dispatch below to reach. The
+        # labels are all referenced by that switch, so none is unreferenced.
+        has_indirect = any(
+            i.mnemonic == 'jmp' and i.operands and i.operands[0].type != X86_OP_IMM
+            for i in insns)
+        if has_indirect:
+            labels = set(insn_addrs)
+
         fname = name or ('L_%012X' % start)
         out = ['void %s(CPU *c)' % fname, '{']
+        if has_indirect:
+            out.append('    uint64_t _ind = 0;')
         for ins in insns:
             if ins.address in labels:
                 out.append('L_%012X:' % ins.address)
@@ -1276,6 +1304,18 @@ class Lifter:
             nxt = insns[-1].address + insns[-1].size if insns else end
             out.append('    /* extent ends mid-function: fall through */')
             out.append('    dispatch(c, 0x%Xull); return;' % nxt)
+
+        if has_indirect:
+            # The local label dispatch. A computed target inside this function
+            # becomes a goto; anything else is a real cross-function tail call
+            # and goes to the global dispatcher, which is also what catches a
+            # jump through an IAT slot.
+            out.append('  _ljump:')
+            out.append('    switch (_ind) {')
+            for a in sorted(labels):
+                out.append('      case 0x%Xull: goto L_%012X;' % (a, a))
+            out.append('      default: dispatch_jmp(c, _ind); return;')
+            out.append('    }')
 
         out.append('}')
         return '\n'.join(out)
