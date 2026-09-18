@@ -1100,8 +1100,22 @@ Memory *__remill_jump(State &state, uint64_t target, Memory *memory) {
      * import's return is this frame's return, and the return address the caller
      * pushed is still on the guest stack, which call_import pops. */
     if (const import_entry *import = imports_find_host(g_imports, target)) {
+        /* A tail jump into an import is `jmp qword ptr [IAT]`, the usual way a program
+         * reaches an import it does not call. The import's return is the *guest's* own
+         * return address, which sits at the current stack pointer, so control resumes at
+         * the caller's next instruction rather than here: declaring a return ends the run
+         * at the top level and leaves every frame in the chain unpopped, which is what
+         * HLExtract's startup did - it tail-jumps into EnterCriticalSection and the run
+         * stopped there with the stack 184 bytes short. */
+        const uint64_t *slot =
+            (const uint64_t *)guest_ptr(memory, state.gpr.rsp.qword, sizeof(uint64_t));
+        const uint64_t return_address = slot ? *slot : 0;
         call_import(&state, import, memory, false);
-        return propagate(StopReason::kReturned, g_stop_pc);
+        if (!return_address || !lifted_lookup(return_address)) {
+            return propagate(StopReason::kReturned, g_stop_pc);
+        }
+        StopReason reason = dispatch_from(return_address, &state, memory);
+        return propagate(reason, g_stop_pc);
     }
     if (!lifted_lookup(target)) {
         record_missing(target);
