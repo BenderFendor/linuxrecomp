@@ -65,6 +65,30 @@ void *host_get_proc_address(uint64_t module, const char *name) {
     return (void *)(uintptr_t)GetProcAddress((HMODULE)(uintptr_t)module, name);
 }
 
+void *host_get_command_line(void) {
+    return (void *)GetCommandLineA();
+}
+
+const uint16_t *host_get_environment_w(void) {
+    return (const uint16_t *)GetEnvironmentStringsW();
+}
+
+const char *host_get_environment_a(void) {
+    return (const char *)GetEnvironmentStrings();
+}
+
+int host_get_startup_info(void *buffer, unsigned long size) {
+    if (size < sizeof(STARTUPINFOA)) {
+        return 0;
+    }
+    STARTUPINFOA info;
+    memset(&info, 0, sizeof(info));
+    info.cb = sizeof(info);
+    GetStartupInfoA(&info);
+    memcpy(buffer, &info, sizeof(info));
+    return 1;
+}
+
 int imports_host_available(void) {
     return 1;
 }

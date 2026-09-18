@@ -70,6 +70,13 @@ import_entry *imports_register(import_table *table, uint64_t host_address, const
 /* Host hook: the host's own GetProcAddress, for the thunk that needs it. */
 void *host_get_proc_address(uint64_t module, const char *name);
 
+/* Host hooks for imports whose result has to be copied into guest memory rather than
+ * passed through: the host's own answer is a host address. */
+void *host_get_command_line(void);
+const uint16_t *host_get_environment_w(void);
+const char *host_get_environment_a(void);
+int host_get_startup_info(void *buffer, unsigned long size);
+
 /* True when the host can resolve imports at all. */
 int imports_host_available(void);
 

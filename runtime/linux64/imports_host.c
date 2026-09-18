@@ -26,6 +26,15 @@ void *host_get_proc_address(uint64_t module, const char *name) {
     return NULL;
 }
 
+void *host_get_command_line(void) { return NULL; }
+const uint16_t *host_get_environment_w(void) { return NULL; }
+const char *host_get_environment_a(void) { return NULL; }
+int host_get_startup_info(void *buffer, unsigned long size) {
+    (void)buffer;
+    (void)size;
+    return 0;
+}
+
 int imports_host_available(void) {
     return 0;
 }

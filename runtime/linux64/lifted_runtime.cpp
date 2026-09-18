@@ -198,6 +198,117 @@ uint64_t thunk_get_proc_address(State *, const uint64_t *arguments, Memory *) {
     return (uint64_t)(uintptr_t)resolved;
 }
 
+/* Copy a host string into guest memory and hand the guest the guest address.
+ *
+ * An import that returns a pointer to its own string returns a host address, and a
+ * recompiled program that reads or returns through it is using an address its memory
+ * model does not describe. The guest gets a copy it can address; the copy is kept so
+ * repeated calls return the same address, which a program is entitled to assume. */
+uint64_t guest_string(Memory *memory, const char *text, uint64_t *cache) {
+    if (!text) {
+        return 0;
+    }
+    size_t length = std::strlen(text) + 1;
+    if (*cache == 0 || guest_heap_size_of(*cache) < length) {
+        uint64_t copy = guest_heap_alloc(length);
+        if (!copy) {
+            return 0;
+        }
+        std::memcpy((void *)(uintptr_t)copy, text, length);
+        *cache = copy;
+    }
+    (void)memory;
+    return *cache;
+}
+
+uint64_t g_command_line = 0;
+uint64_t g_environment_w = 0;
+uint64_t g_environment_a = 0;
+
+uint64_t thunk_get_command_line(State *, const uint64_t *, Memory *memory) {
+    /* GetCommandLineA */
+    void *host = host_get_command_line();
+    return host ? guest_string(memory, (const char *)host, &g_command_line) : 0;
+}
+
+uint64_t thunk_get_environment(State *, const uint64_t *arguments, Memory *memory) {
+    /* GetEnvironmentStringsW / GetEnvironmentStrings. The block is double-NUL
+     * terminated and its size is not stated, so it is copied until that terminator. */
+    const uint16_t *wide = host_get_environment_w();
+    uint64_t *cache = &g_environment_w;
+    if (!wide) {
+        const char *narrow = host_get_environment_a();
+        if (!narrow) {
+            return 0;
+        }
+        size_t count = 0;
+        while (narrow[count] != '\0' || narrow[count + 1] != '\0') {
+            count++;
+        }
+        count += 2;
+        if (*cache == 0) {
+            uint64_t copy = guest_heap_alloc(count);
+            if (!copy) {
+                return 0;
+            }
+            std::memcpy((void *)(uintptr_t)copy, narrow, count);
+            *cache = copy;
+        }
+        return *cache;
+    }
+    size_t count = 0;
+    while (wide[count] != 0 || wide[count + 1] != 0) {
+        count++;
+    }
+    count = (count + 2) * sizeof(uint16_t);
+    if (*cache == 0) {
+        uint64_t copy = guest_heap_alloc(count);
+        if (!copy) {
+            return 0;
+        }
+        std::memcpy((void *)(uintptr_t)copy, wide, count);
+        *cache = copy;
+    }
+    (void)arguments;
+    (void)memory;
+    return *cache;
+}
+
+uint64_t thunk_startup_info(State *, const uint64_t *arguments, Memory *memory) {
+    /* GetStartupInfoA(lpStartupInfo): the host fills its own structure, whose pointer
+     * fields are host addresses. Copy the fields into the guest's buffer and leave the
+     * pointers out: a guest that follows one would be following an address its memory
+     * model cannot describe, which is what the unbalanced returns in the HLExtract run
+     * look like. */
+    struct HostStartupInfo {
+        uint32_t cb;
+        char reserved[60];
+        uint32_t flags;
+        uint16_t show_window;
+        uint16_t reserved2[2];
+        uint8_t reserved3[16];
+        int16_t std_input;
+        int16_t std_output;
+        int16_t std_error;
+    } host;
+    std::memset(&host, 0, sizeof(host));
+    host.cb = (uint32_t)sizeof(host);
+    if (!host_get_startup_info(&host, sizeof(host))) {
+        return 0;
+    }
+    uint8_t *guest = guest_ptr(memory, arguments[0], sizeof(host));
+    if (!guest) {
+        return 0;
+    }
+    std::memcpy(guest, &host, sizeof(host));
+    return 0;
+}
+
+uint64_t thunk_free_environment(State *, const uint64_t *, Memory *) {
+    /* FreeEnvironmentStringsA/W: the block is ours, and it is reused across calls. */
+    return 1;
+}
+
 uint64_t thunk_virtual_free(State *, const uint64_t *arguments, Memory *) {
     /* VirtualFree(address, size, type) */
     return guest_heap_free(arguments[0]) ? 1 : 0;
@@ -218,6 +329,12 @@ const ImportThunk kImportThunks[] = {
     { "KERNEL32.dll", "VirtualAlloc", thunk_virtual_alloc },
     { "KERNEL32.dll", "VirtualFree", thunk_virtual_free },
     { "KERNEL32.dll", "GetProcAddress", thunk_get_proc_address },
+    { "KERNEL32.dll", "GetCommandLineA", thunk_get_command_line },
+    { "KERNEL32.dll", "GetEnvironmentStringsW", thunk_get_environment },
+    { "KERNEL32.dll", "GetEnvironmentStrings", thunk_get_environment },
+    { "KERNEL32.dll", "FreeEnvironmentStringsW", thunk_free_environment },
+    { "KERNEL32.dll", "FreeEnvironmentStringsA", thunk_free_environment },
+    { "KERNEL32.dll", "GetStartupInfoA", thunk_startup_info },
 };
 
 /* A name for the trace: the function's name, or its ordinal, or its address when the
@@ -805,9 +922,7 @@ Memory *__remill_function_call(State &state, uint64_t target, Memory *memory) {
     trace_dispatch("call  %#" PRIx64 " rsp=%#" PRIx64, target, state.gpr.rsp.qword);
     if (const import_entry *import = imports_find_host(g_imports, target)) {
         shadow_push(state.gpr.rsp.qword, "import", target);
-        Memory *result = call_import(&state, import, memory, true);
-        shadow_pop(state.gpr.rsp.qword, target);
-        return result;
+        return call_import(&state, import, memory, true);
     }
     if (!lifted_lookup(target)) {
         record_missing(target);
@@ -819,7 +934,6 @@ Memory *__remill_function_call(State &state, uint64_t target, Memory *memory) {
     shadow_push(state.gpr.rsp.qword, "call", target);
     StopReason reason = dispatch_from(target, &state, memory);
     if (reason == StopReason::kReturned) {
-        shadow_pop(state.gpr.rsp.qword, target);
         /* The callee returned and the caller continues in its own lifted code, so the
          * return address has been consumed. Leaving it in g_stop_pc lets a later frame
          * that returns propagate a stale address as its own, which is how a run ended
@@ -849,7 +963,6 @@ Memory *__remill_jump(State &state, uint64_t target, Memory *memory) {
     shadow_push(state.gpr.rsp.qword, "call", target);
     StopReason reason = dispatch_from(target, &state, memory);
     if (reason == StopReason::kReturned) {
-        shadow_pop(state.gpr.rsp.qword, target);
         /* A tail jump: the target's return is this frame's return. */
         return propagate(StopReason::kReturned, g_stop_pc);
     }
