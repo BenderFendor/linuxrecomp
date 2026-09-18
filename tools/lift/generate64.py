@@ -180,6 +180,39 @@ def reloc_code_pointers(data, base, secs, reloc_rva, reloc_sz, text_lo, text_hi)
     return out
 
 
+def jmp_thunks(data, base, secs, text_lo, text_hi):
+    """Aligned one-instruction `jmp rel32` stubs, padded with int3 either side.
+
+    MSVC emits these for incremental linking and for identical-code folding,
+    and a C++ vtable slot points at the STUB rather than at the function. They
+    are not reached by any direct call, so the catalog closure never sees them;
+    a disassembler usually marks them, but not always - this image has 396 and
+    IDA named 392.
+
+    The four it missed are the kind of gap that only shows up when a particular
+    subsystem runs: 0x140D236A0 is reached the first time the I/O library is
+    asked for a board, and before that nothing in the program had ever needed
+    it. One aborts the process with "call into uncatalogued guest code".
+    """
+    found = set()
+    for name, va, size in ((s[0], base + s[1], s[2]) for s in secs):
+        if name != '.text':
+            continue
+        off = rva_to_off(secs, va - base)
+        if off is None:
+            continue
+        for i in range(0, size - 16, 16):
+            p = off + i
+            # 0xE9 rel32, preceded and followed by padding: a lone thunk, not
+            # the tail of a real function that happens to end in a jump.
+            if data[p] != 0xE9 or data[p - 1] != 0xCC or data[p + 5] != 0xCC:
+                continue
+            t = va + i + 5 + struct.unpack_from('<i', data, p + 1)[0]
+            if text_lo <= t < text_hi:
+                found.add(va + i)
+    return found
+
+
 _CODE_MD = None
 
 
@@ -351,6 +384,20 @@ def main():
     if added_ptr:
         print('[*] %d stored code pointers were not in the catalog (%d relocated '
               'pointers into .text)' % (added_ptr, len(ptrs)))
+
+    # Lone jump thunks: a vtable slot points at the stub, not the function, and
+    # nothing calls the stub directly so the closure below never reaches it.
+    thunks = jmp_thunks(data, base, secs, text_lo, text_hi)
+    starts = sorted(bounds)
+    added_thunk = 0
+    for t in sorted(thunks):
+        if t in bounds:
+            continue
+        bounds[t] = (5, 'sub_%X_thunk' % t)
+        added_thunk += 1
+    if added_thunk:
+        print('[*] %d of %d jump thunks were not in the catalog'
+              % (added_thunk, len(thunks)))
 
     # C++ exception handling. The funclets go in as entries, and the functions
     # that had handlers are marked so the lifter gives them a landing pad.
