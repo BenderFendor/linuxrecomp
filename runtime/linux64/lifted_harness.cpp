@@ -219,6 +219,8 @@ void trace(const char *format, ...) {
     va_end(args);
 }
 
+constexpr uint64_t kTebSize = 0x2000;
+
 constexpr uint64_t kStackSize = 0x100000;      /* 1 MiB */
 /* One reserved block for the memory descriptor and the guest register file. */
 constexpr uint64_t kStateSize = 0x100000;      /* 1 MiB */
@@ -543,6 +545,35 @@ int main(int argc, char **argv) {
      * with the function being tested. */
     state.gpr.rsp.qword = stack_top - kStackHeadroom;
     const uint64_t entry_rsp = state.gpr.rsp.qword;
+
+    /* The thread information block.
+     *
+     * Windows code reads gs:[...] constantly: the stack limits, the TLS pointer, the
+     * thread id, the activation context. Remill carries a segment base for each
+     * selector, and it starts at zero, so every gs-relative access lands at a raw
+     * offset - CRT startup in HLExtract reads gs:[0x10] for StackLimit and faults at
+     * guest address 0x10 without this. The block is reserved so it is zeroed, and the
+     * fields below are the ones the layout guarantees at their fixed offsets. */
+    /* From the guest heap rather than its own mapping: the runtime's memory descriptor is
+     * what translates a guest address, and a separate reservation is not in it. A TEB the
+     * guest cannot read is no better than one that is not there. */
+    const uint64_t teb_va = guest_heap_alloc(kTebSize);
+    if (teb_va == 0) {
+        std::fprintf(stderr, "lifted: cannot allocate the thread information block\n");
+        return 1;
+    }
+    {
+        uint64_t *teb = (uint64_t *)teb_va;
+        teb[0x00 / 8] = ~UINT64_C(0);                      /* ExceptionList: the usual -1 */
+        teb[0x08 / 8] = stack_top;                         /* StackBase */
+        teb[0x10 / 8] = stack_top - kStackSize;             /* StackLimit */
+        teb[0x18 / 8] = teb_va;                            /* Self */
+        teb[0x40 / 8] = (uint64_t)getpid();                /* ClientId.UniqueProcess */
+        teb[0x48 / 8] = (uint64_t)(uintptr_t)pthread_self(); /* ClientId.UniqueThread */
+    }
+    state.addr.gs_base.qword = teb_va;
+    state.addr.fs_base.qword = teb_va;
+    trace("thread information block at %#" PRIx64, teb_va);
     uint64_t *return_slot = (uint64_t *)guest_ptr(&memory, stack_top - kStackHeadroom, 8);
     if (return_slot) {
         *return_slot = 0;
