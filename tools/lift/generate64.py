@@ -78,7 +78,8 @@ def read_pe(path):
     # data directory 1 is the import table; 12 is the IAT
     ddoff = opt + 112
     imp_rva, imp_sz = struct.unpack_from('<II', data, ddoff + 8)
-    return data, base, soi, entry, secs, imp_rva
+    reloc_rva, reloc_sz = struct.unpack_from('<II', data, ddoff + 5 * 8)
+    return data, base, soi, entry, secs, imp_rva, reloc_rva, reloc_sz
 
 
 def make_reader(data, base, secs):
@@ -136,6 +137,49 @@ def parse_imports(data, base, secs, imp_rva):
     return out
 
 
+def reloc_code_pointers(data, base, secs, reloc_rva, reloc_sz, text_lo, text_hi):
+    """Addresses in .text that some relocated qword points at.
+
+    A disassembler finds functions by following calls and recognising
+    prologues, and it therefore misses any function that is ONLY ever reached
+    through a pointer - a virtual method in a vtable, a callback in a static
+    table, a jump table of function pointers. IDA missed 0x140B2D770 in Battle
+    Pods exactly this way: sixteen bytes sitting in a gap between two
+    catalogued functions, called through a vtable a million dispatches in.
+
+    The .reloc table settles it without heuristics. In a 64-bit PE every
+    absolute address stored in the image has a DIR64 relocation, because the
+    loader must fix it up if the image moves - so the relocations ARE the
+    complete list of stored pointers. The ones whose value lands in .text are
+    stored code pointers, and a stored code pointer is a function entry.
+    Guessing from alignment or from a `48 89 5C 24` prologue would find most of
+    them and invent others; this finds exactly the real ones.
+    """
+    out = set()
+    if not reloc_rva:
+        return out
+    off = rva_to_off(secs, reloc_rva)
+    if off is None:
+        return out
+    end = off + reloc_sz
+    while off < end:
+        va_page, blk = struct.unpack_from('<II', data, off)
+        if not blk:
+            break
+        for i in range((blk - 8) // 2):
+            ent = struct.unpack_from('<H', data, off + 8 + i * 2)[0]
+            if (ent >> 12) != 10:            # IMAGE_REL_BASED_DIR64
+                continue
+            slot = rva_to_off(secs, va_page + (ent & 0xFFF))
+            if slot is None or slot + 8 > len(data):
+                continue
+            v = struct.unpack_from('<Q', data, slot)[0]
+            if text_lo <= v < text_hi:
+                out.add(v)
+        off += blk
+    return out
+
+
 def main():
     argv = sys.argv[1:]
     split = 400
@@ -149,7 +193,7 @@ def main():
     exe_path, funcs_path, outdir = argv[0], argv[1], argv[2]
     os.makedirs(outdir, exist_ok=True)
 
-    data, base, soi, entry, secs, imp_rva = read_pe(exe_path)
+    data, base, soi, entry, secs, imp_rva, reloc_rva, reloc_sz = read_pe(exe_path)
     lift64_cpu.IMAGE_BASE = base
     read_va = make_reader(data, base, secs)
     lf = Lifter(image_size=soi, read_va=read_va, image_base=base)
@@ -193,6 +237,26 @@ def main():
 
     text_lo = base + [s for s in secs if s[0] == '.text'][0][1]
     text_hi = text_lo + [s for s in secs if s[0] == '.text'][0][2]
+
+    # Stored code pointers first: these are entries the disassembler could not
+    # have found, and adding them before the closure loop means their own
+    # dispatch targets get closed over too.
+    ptrs = reloc_code_pointers(data, base, secs, reloc_rva, reloc_sz,
+                               text_lo, text_hi)
+    starts = sorted(bounds)
+    added_ptr = 0
+    for t in sorted(ptrs):
+        if t in bounds:
+            continue
+        i = bisect.bisect_right(starts, t)
+        end_of = starts[i] if i < len(starts) else text_hi
+        size = min(end_of - t, 0x10000)
+        if size > 0:
+            bounds[t] = (size, 'sub_%X_ptr' % t)
+            added_ptr += 1
+    if added_ptr:
+        print('[*] %d stored code pointers were not in the catalog (%d relocated '
+              'pointers into .text)' % (added_ptr, len(ptrs)))
 
     bodies = {}
     pending = sorted(bounds)
