@@ -28,6 +28,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "guest_heap.h"
+
 namespace {
 
 /* One execution context per active trace. A called function runs inside the
@@ -50,6 +52,24 @@ StopContext *g_current = nullptr;
 
 const char *reason_name(StopReason reason);
 void trace_dispatch(const char *format, ...);
+
+/* DLL and function names compare the way the loader's do. */
+bool ascii_equal_ignore_case(const char *left, const char *right) {
+    while (*left && *right) {
+        char a = *left++;
+        char b = *right++;
+        if (a >= 'A' && a <= 'Z') {
+            a = (char)(a - 'A' + 'a');
+        }
+        if (b >= 'A' && b <= 'Z') {
+            b = (char)(b - 'A' + 'a');
+        }
+        if (a != b) {
+            return false;
+        }
+    }
+    return *left == '\0' && *right == '\0';
+}
 StopReason g_reason = StopReason::kReturned;
 uint64_t g_stop_pc = 0;
 char g_detail[256];
@@ -68,8 +88,107 @@ size_t g_missing_count = 0;
  * rather than pretending the value was defined. */
 bool g_report_undefined = false;
 
-/* Imports the host bound for this image, if any. */
-const import_table *g_imports = nullptr;
+/* Imports the host bound for this image, if any. Mutable: a program can obtain a
+ * callable host address at run time, and the dispatcher has to know it. */
+import_table *g_imports = nullptr;
+
+/* Some imports cannot be handed straight to the host.
+ *
+ * Wine's HeapAlloc returns host memory, and a recompiled program that writes
+ * through that pointer is writing outside the address space this runtime
+ * describes: the first HLExtract run to reach it stopped with "write of unmapped
+ * guest address 0x7ffffe231460", a host pointer. The fix is not to change what
+ * these functions mean but where the memory is, so the guest allocates from the
+ * guest heap and the pointer it gets back is one it can use. The same applies to
+ * the imports that return pointers to host strings or host structures.
+ *
+ * This table is the one place a Win32 entry is not Wine's, and every entry is here
+ * for a reason a target demonstrated: the guest cannot address host memory. */
+typedef uint64_t (*thunk_function)(State *state, const uint64_t *arguments, Memory *memory);
+
+/* The value GetProcessHeap returns is opaque to the guest; it only has to be
+ * consistent between the calls that use it. */
+constexpr uint64_t kGuestProcessHeap = 0x1000;
+
+uint64_t thunk_process_heap(State *, const uint64_t *, Memory *) { return kGuestProcessHeap; }
+
+uint64_t thunk_heap_alloc(State *, const uint64_t *arguments, Memory *) {
+    /* HeapAlloc(heap, flags, bytes) */
+    return guest_heap_alloc(arguments[2]);
+}
+
+uint64_t thunk_heap_realloc(State *, const uint64_t *arguments, Memory *) {
+    /* HeapReAlloc(heap, flags, memory, bytes) */
+    return guest_heap_realloc(arguments[2], arguments[3]);
+}
+
+uint64_t thunk_heap_free(State *, const uint64_t *arguments, Memory *) {
+    /* HeapFree(heap, flags, memory) */
+    return guest_heap_free(arguments[2]) ? 1 : 0;
+}
+
+uint64_t thunk_heap_size(State *, const uint64_t *arguments, Memory *) {
+    /* HeapSize(heap, flags, memory) */
+    return guest_heap_size_of(arguments[2]);
+}
+
+uint64_t thunk_virtual_alloc(State *, const uint64_t *arguments, Memory *) {
+    /* VirtualAlloc(address, size, type, protect). An explicit address would have to
+     * be a range the memory model knows about, so for now only the "anywhere" form
+     * is served; the rest fails the way an allocation failure does, which the
+     * program is expected to handle. */
+    if (arguments[0] != 0) {
+        trace_dispatch("virtual alloc at %#llx is not served", (unsigned long long)arguments[0]);
+        return 0;
+    }
+    return guest_heap_alloc(arguments[1]);
+}
+
+uint64_t thunk_get_proc_address(State *, const uint64_t *arguments, Memory *) {
+    /* GetProcAddress(module, name). The program then calls what it got, so the
+     * address has to be one the dispatcher can route: register it as it is found. */
+    const char *name = (const char *)(uintptr_t)arguments[1];
+    void *resolved = host_get_proc_address(arguments[0], name);
+    if (!resolved) {
+        return 0;
+    }
+    uintptr_t value = (uintptr_t)name;
+    const char *label = value < 0x10000 ? "ordering" : name;
+    imports_register(g_imports, (uint64_t)(uintptr_t)resolved, "run-time", label);
+    return (uint64_t)(uintptr_t)resolved;
+}
+
+uint64_t thunk_virtual_free(State *, const uint64_t *arguments, Memory *) {
+    /* VirtualFree(address, size, type) */
+    return guest_heap_free(arguments[0]) ? 1 : 0;
+}
+
+struct ImportThunk {
+    const char *dll;
+    const char *name;
+    thunk_function function;
+};
+
+const ImportThunk kImportThunks[] = {
+    { "KERNEL32.dll", "GetProcessHeap", thunk_process_heap },
+    { "KERNEL32.dll", "HeapAlloc", thunk_heap_alloc },
+    { "KERNEL32.dll", "HeapReAlloc", thunk_heap_realloc },
+    { "KERNEL32.dll", "HeapFree", thunk_heap_free },
+    { "KERNEL32.dll", "HeapSize", thunk_heap_size },
+    { "KERNEL32.dll", "VirtualAlloc", thunk_virtual_alloc },
+    { "KERNEL32.dll", "VirtualFree", thunk_virtual_free },
+    { "KERNEL32.dll", "GetProcAddress", thunk_get_proc_address },
+};
+
+const thunk_function find_thunk(const import_entry *import) {
+    for (const ImportThunk &thunk : kImportThunks) {
+        if (ascii_equal_ignore_case(thunk.dll, import->dll) &&
+            ascii_equal_ignore_case(thunk.name, import->name)) {
+            return thunk.function;
+        }
+    }
+    return nullptr;
+}
 
 /* Call a host import the way its own ABI expects.
  *
@@ -136,8 +255,27 @@ const char *reason_name(StopReason reason) {
         case StopReason::kFunctionCall: return "call";
         case StopReason::kJump: return "jump";
         case StopReason::kMissingDispatch: return "missing-dispatch";
+        case StopReason::kMissingBlock: return "missing-block";
     }
     return "unknown";
+}
+
+/* The lifted function whose range contains *address*, when the address is not
+ * itself a lifted entry. Lifted entries come from .pdata and cover their functions
+ * contiguously, so an address between two entries belongs to the earlier one. */
+const LiftedEntry *lifted_containing(uint64_t address) {
+    const LiftedEntry *previous = nullptr;
+    for (size_t i = 0; i < lifted_entry_count(); i++) {
+        const LiftedEntry *entry = lifted_entry(i);
+        if (entry->va == address) {
+            return nullptr;
+        }
+        if (entry->va > address) {
+            return previous;
+        }
+        previous = entry;
+    }
+    return nullptr;
 }
 
 void record_missing(uint64_t target) {
@@ -298,6 +436,10 @@ uint8_t *guest_ptr(Memory *memory, uint64_t address, uint64_t length) {
         address + length <= memory->stack_base + memory->stack_size) {
         return memory->stack + (address - memory->stack_base);
     }
+    if (memory->heap_base && address >= memory->heap_base &&
+        address + length <= memory->heap_base + memory->heap_size) {
+        return (uint8_t *)(uintptr_t)address;
+    }
     return nullptr;
 }
 
@@ -314,7 +456,7 @@ StopReason lifted_run_dispatched(uint64_t va, State *state, Memory *memory) {
 
 void lifted_report_undefined(bool enabled) { g_report_undefined = enabled; }
 
-void lifted_set_imports(const import_table *table) {
+void lifted_set_imports(import_table *table) {
     g_imports = table;
 }
 
@@ -460,6 +602,14 @@ Memory *call_import(State *state, const import_entry *import, Memory *memory) {
         arguments[i] = value;
     }
 
+    if (const thunk_function thunk = find_thunk(import)) {
+        const uint64_t thunked = thunk(state, arguments, memory);
+        state->gpr.rax.qword = thunked;
+        state->gpr.rsp.qword = state->gpr.rsp.qword + 8;
+        trace_dispatch("thunk %s returned %#llx", import->name, (unsigned long long)thunked);
+        return memory;
+    }
+
     trace_dispatch("import %s!%s%u at %p arg0=%#llx arg1=%#llx", import->dll,
                    import->by_ordinal ? "#" : "", import->by_ordinal ? import->ordinal : 0,
                    (void *)(uintptr_t)import->host_address,
@@ -519,8 +669,31 @@ Memory *__remill_error(State &, uint64_t address, Memory *) {
     return halt(StopReason::kError, address, "remill error");
 }
 
-Memory *__remill_missing_block(State &, uint64_t address, Memory *) {
-    return halt(StopReason::kError, address, "missing lifted block");
+Memory *__remill_missing_block(State &state, uint64_t address, Memory *memory) {
+    /* Remill calls this when control leaves the region it lifted for one function:
+     * an indirect jump or a tail call out of the function. That is ordinary
+     * cross-function control flow, so continue at the target when it is lifted
+     * somewhere else. The case that cannot be continued is a jump into the middle
+     * of a lifted function, and it is reported as its own reason so the address can
+     * be lifted on its own instead of being mistaken for a missing function. */
+    if (lifted_lookup(address)) {
+        StopReason reason = dispatch_from(address, &state, memory);
+        if (reason == StopReason::kReturned) {
+            return propagate(StopReason::kReturned, g_stop_pc);
+        }
+        return propagate(reason, g_stop_pc);
+    }
+    if (const LiftedEntry *container = lifted_containing(address)) {
+        char detail[128];
+        std::snprintf(detail, sizeof(detail),
+                      "jump into the middle of %s (interior block %#" PRIx64 ")",
+                      container->name, address);
+        return halt(StopReason::kMissingBlock, address, detail);
+    }
+    record_missing(address);
+    char detail[96];
+    std::snprintf(detail, sizeof(detail), "jump to unlifted address %#" PRIx64, address);
+    return halt(StopReason::kMissingBlock, address, detail);
 }
 
 /* --- compare and exchange ------------------------------------------------ */

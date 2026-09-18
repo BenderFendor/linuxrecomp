@@ -30,6 +30,9 @@ struct Memory {
     uint8_t *stack;
     uint64_t stack_base;
     uint64_t stack_size;
+    /* The guest heap: memory the program allocated, at guest addresses. */
+    uint64_t heap_base;
+    uint64_t heap_size;
 };
 
 /* Resolve a guest address to a host pointer, or nullptr when unmapped. */
@@ -42,6 +45,11 @@ enum class StopReason {
     kFunctionCall,
     kJump,
     kMissingDispatch,
+    /* Control left a lifted function into a block that is not lifted. Distinct
+     * from kMissingDispatch because the address is inside a function that was
+     * lifted: the fix is to lift that address on its own, not to look for a
+     * missing function. */
+    kMissingBlock,
 };
 
 extern "C" {
@@ -62,7 +70,7 @@ void lifted_set_memory_trace(bool enabled);
 /* Imports the host bound for this image. The dispatcher uses the table to tell a
  * call to a host import (whose target is a host address, not a guest one) from a
  * call to lifted guest code. */
-void lifted_set_imports(const import_table *table);
+void lifted_set_imports(import_table *table);
 size_t lifted_import_count(void);
 
 /* Print each trace boundary: entry, finish and halt. For locating a fault that

@@ -43,18 +43,32 @@ typedef struct {
 
 /* Host hook: resolve dll!name (or dll!ordinal) to a host address, or NULL when the
  * host cannot supply it. Provided per host: imports_wine.c for the winelib build,
- * and a stub that always fails otherwise. */
-void *host_resolve_import(const char *dll, const char *name, uint16_t ordinal, int by_ordinal);
+ * and a stub that always fails otherwise.
+ *
+ * `image_path` is the recompiled program's own path. A program's DLLs live next to
+ * it, not next to the harness that runs it, so the host searches there first. */
+void *host_resolve_import(const char *dll, const char *name, uint16_t ordinal, int by_ordinal,
+                          const char *image_path);
 
 /* Walk the image's import directory, resolve every thunk through the host, write
  * the resolved host address into the guest's IAT slot, and record the binding.
  * Returns 0 on success, -1 with a message in `error` when the image cannot be
  * walked. Thunks the host cannot resolve are counted, not fatal: a program that
  * never calls them still runs. */
-int imports_bind(const pe_image *image, import_table *table, char *error, size_t error_size);
+int imports_bind(const pe_image *image, const char *image_path, import_table *table, char *error,
+                 size_t error_size);
 
 /* The binding for a host address, or NULL when the address is not one of ours. */
 const import_entry *imports_find_host(const import_table *table, uint64_t host_address);
+
+/* Record another host address the program can call, so the dispatcher recognises it.
+ * A program can obtain one at run time (GetProcAddress), and a call through a pointer
+ * the runtime does not know is a call it cannot route. */
+import_entry *imports_register(import_table *table, uint64_t host_address, const char *dll,
+                               const char *name);
+
+/* Host hook: the host's own GetProcAddress, for the thunk that needs it. */
+void *host_get_proc_address(uint64_t module, const char *name);
 
 /* True when the host can resolve imports at all. */
 int imports_host_available(void);

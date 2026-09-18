@@ -149,8 +149,22 @@ def lift(image_path: str, va: int, out_dir: str = DEFAULT_OUTPUT, arch: str = "a
         raise PEFormatError(f"{image.name}: {image.machine_name} is not AMD64")
 
     if start_rva is None:
-        start_rva, end_rva = function_at(image, va)
-        length = byte_length if byte_length else end_rva - start_rva
+        try:
+            start_rva, end_rva = function_at(image, va)
+            length = byte_length if byte_length else end_rva - start_rva
+        except ValueError:
+            # A call target that no unwind range describes. Reconnaissance does not
+            # list it, but the program reaches it, so lift from there to whatever
+            # bounds it and record that the extent is a guess rather than a record.
+            functions, _notes = fn.recover_functions(image)
+            known = [function.start_rva for function in functions
+                     if function.start_rva is not None]
+            start_rva = image.rva_of(va)
+            end_rva = start_rva
+            length, length_source = choose_length(image, va, known)
+            if byte_length:
+                length = byte_length
+                length_source = "explicit"
     else:
         if not byte_length:
             raise ValueError(f"0x{va:X}: an explicit start needs an explicit length")

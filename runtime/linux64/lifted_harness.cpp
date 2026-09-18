@@ -20,6 +20,7 @@
  * two. Image memory is comparable, which is what the differential tests read.
  */
 #include "lifted_runtime.h"
+#include "guest_heap.h"
 #include "host_guest.h"
 #include <cinttypes>
 #include <cstdarg>
@@ -219,6 +220,7 @@ void trace(const char *format, ...) {
 constexpr uint64_t kStackSize = 0x100000;      /* 1 MiB */
 /* One reserved block for the memory descriptor and the guest register file. */
 constexpr uint64_t kStateSize = 0x100000;      /* 1 MiB */
+constexpr uint64_t kGuestHeapSize = 0x10000000; /* 256 MiB of guest heap */
 constexpr uint64_t kPageSize = 0x1000;         /* the descriptor gets its own page */
 /* Space above RSP for the 32-byte home area the Microsoft ABI reserves, plus the
  * extra 8 that puts the entry RSP at 8 mod 16, where a callee expects to start.
@@ -370,7 +372,7 @@ int main(int argc, char **argv) {
     static import_table imports;
     {
         char import_error[256];
-        if (imports_bind(&image, &imports, import_error, sizeof(import_error)) != 0) {
+        if (imports_bind(&image, path, &imports, import_error, sizeof(import_error)) != 0) {
             std::fprintf(stderr, "lifted: %s\n", import_error);
             pe_unmap(&image);
             return 1;
@@ -415,6 +417,18 @@ int main(int argc, char **argv) {
     memory.stack = (uint8_t *)stack;
     memory.stack_base = stack_base;
     memory.stack_size = kStackSize;
+    /* The guest heap: a program allocates, and the memory it gets has to be memory
+     * the guest can address. */
+    if (guest_heap_init(kGuestHeapSize) != 0) {
+        std::fprintf(stderr, "lifted: cannot reserve the guest heap\n");
+        pe_release(stack, kStackSize);
+        pe_unmap(&image);
+        return 1;
+    }
+    memory.heap_base = guest_heap_base();
+    memory.heap_size = guest_heap_size();
+    trace("guest heap %#" PRIx64 " size %#" PRIx64, memory.heap_base, memory.heap_size);
+
     lifted_report_undefined(report_undefined);
     lifted_set_memory_trace(report_undefined);
     lifted_set_dispatch_trace(trace_enabled);

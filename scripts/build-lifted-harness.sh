@@ -139,6 +139,8 @@ done
 "$CC" -O1 -g -c -o "$WORK/image_pe64.o" "$ROOT/runtime/linux64/image_pe64.c"
 "$CC" -O1 -g -c -o "$WORK/host_guest.o" "$ROOT/runtime/linux64/host_guest.c"
 "$CC" -O1 -g -c -o "$WORK/imports.o" "$ROOT/runtime/linux64/imports.c" -I"$ROOT/runtime/linux64"
+"$CC" -O1 -g -c -o "$WORK/guest_heap.o" "$ROOT/runtime/linux64/guest_heap.c" \
+  -I"$ROOT/runtime/linux64"
 "$CC" -O1 -g -c -o "$WORK/imports_host.o" "$ROOT/runtime/linux64/imports_host.c" \
   -I"$ROOT/runtime/linux64"
 
@@ -149,6 +151,7 @@ WINELIB="$OUT_DIR/lifted_harness-$(basename "$IMAGE" .exe).winelib"
 # shellcheck disable=SC2086
 "$CXX" -O1 -g -o "$HARNESS" "$WORK/lifted_harness.o" "$WORK/lifted_runtime.o" \
   "$WORK/image_pe64.o" "$WORK/host_guest.o" "$WORK/imports.o" "$WORK/imports_host.o" \
+  "$WORK/guest_heap.o" \
   "${OBJECTS[@]}"
 
 echo "built: $HARNESS"
@@ -171,10 +174,13 @@ if command -v "$WINEGCC" >/dev/null 2>&1; then
     "$ROOT/runtime/linux64/imports_wine.c"
   "$WINEGCC" -O1 -g -I"$ROOT/runtime/linux64" -c -o "$WORK/imports_host_winelib.o" \
     "$ROOT/runtime/linux64/imports.c"
+  "$WINEGCC" -O1 -g -I"$ROOT/runtime/linux64" -c -o "$WORK/guest_heap_winelib.o" \
+    "$ROOT/runtime/linux64/guest_heap.c"
   # shellcheck disable=SC2086
   if "$WINEGXX" -O1 -g -o "$WINELIB" "$WORK/lifted_harness.o" \
       "$WORK/lifted_runtime.o" "$WORK/image_pe64.o" "$WORK/wine_memory.o" \
       "$WORK/host_guest_wine.o" "$WORK/imports_wine.o" "$WORK/imports_host_winelib.o" \
+      "$WORK/guest_heap_winelib.o" \
       "${OBJECTS[@]}" > "$WORK/wine.link.log" 2>&1; then
     echo "built: $WINELIB (winelib)"
   else

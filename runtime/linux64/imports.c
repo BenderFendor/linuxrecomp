@@ -74,7 +74,8 @@ static int copy_cstring(const pe_image *image, uint64_t va, char *out, size_t ca
     return source[i] == '\0' ? 0 : -1;
 }
 
-int imports_bind(const pe_image *image, import_table *table, char *error, size_t error_size) {
+int imports_bind(const pe_image *image, const char *image_path, import_table *table, char *error,
+                 size_t error_size) {
     memset(table, 0, sizeof(*table));
     if (!image->data) {
         snprintf(error, error_size, "no mapped image");
@@ -148,7 +149,7 @@ int imports_bind(const pe_image *image, import_table *table, char *error, size_t
             }
 
             void *resolved = host_resolve_import(entry->dll, entry->name, entry->ordinal,
-                                                 entry->by_ordinal);
+                                                 entry->by_ordinal, image_path);
             if (!resolved) {
                 table->unresolved++;
                 entry->host_address = 0;
@@ -171,6 +172,22 @@ int imports_bind(const pe_image *image, import_table *table, char *error, size_t
         pe_protect(iat, iat_size, section_protection(image, image->image_base + iat_rva));
     }
     return 0;
+}
+
+import_entry *imports_register(import_table *table, uint64_t host_address, const char *dll,
+                               const char *name) {
+    if (!table || !host_address || table->count >= IMPORTS_MAX) {
+        return NULL;
+    }
+    if (imports_find_host(table, host_address)) {
+        return NULL;
+    }
+    import_entry *entry = &table->entries[table->count++];
+    memset(entry, 0, sizeof(*entry));
+    snprintf(entry->dll, sizeof(entry->dll), "%s", dll ? dll : "?");
+    snprintf(entry->name, sizeof(entry->name), "%s", name ? name : "?");
+    entry->host_address = host_address;
+    return entry;
 }
 
 const import_entry *imports_find_host(const import_table *table, uint64_t host_address) {

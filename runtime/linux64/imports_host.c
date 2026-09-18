@@ -10,11 +10,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
-void *host_resolve_import(const char *dll, const char *name, uint16_t ordinal, int by_ordinal) {
+void *host_resolve_import(const char *dll, const char *name, uint16_t ordinal, int by_ordinal,
+                          const char *image_path) {
     (void)dll;
     (void)name;
     (void)ordinal;
     (void)by_ordinal;
+    (void)image_path;
+    return NULL;
+}
+
+void *host_get_proc_address(uint64_t module, const char *name) {
+    (void)module;
+    (void)name;
     return NULL;
 }
 

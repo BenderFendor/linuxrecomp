@@ -57,6 +57,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                               help="compare lifted code against the reference execution")
     difftest.add_argument("args", nargs=argparse.REMAINDER,
                           help="arguments for difftest (see: difftest --help)")
+    runner = sub.add_parser("run", help="run a recompiled program, lifting what it needs")
+    runner.add_argument("args", nargs=argparse.REMAINDER,
+                        help="arguments for run (see: run --help)")
     sub.add_parser("selftest", help="run the linux64 checks")
 
     args = parser.parse_args(argv)
@@ -73,6 +76,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "difftest":
         import difftest as difftest_module
         return difftest_module.main(list(args.args))
+    if args.command == "run":
+        from . import run as run_module
+        return run_module.main(args.args)
     if args.command == "selftest":
         return _selftest([])
     return 2
