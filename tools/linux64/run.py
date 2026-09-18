@@ -95,7 +95,7 @@ def lift_addresses(image: str, lift_root: pathlib.Path, addresses: Iterable[int]
     for address in addresses:
         completed = subprocess.run(
             [sys.executable, "-m", "tools.linux64", "lift", image, "--function", hex(address),
-             "--jobs", str(jobs), "--out", str(lift_root)],
+             "--jobs", str(jobs), "--out", str(lift_root), "--extend-to-next"],
             cwd=ROOT, capture_output=True, text=True)
         if completed.returncode == 0:
             lifted += 1

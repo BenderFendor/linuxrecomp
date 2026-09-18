@@ -180,6 +180,20 @@ const ImportThunk kImportThunks[] = {
     { "KERNEL32.dll", "GetProcAddress", thunk_get_proc_address },
 };
 
+/* A name for the trace: the function's name, or its ordinal, or its address when the
+ * table has neither (a run-time GetProcAddress result carries whatever the caller had). */
+char g_import_label[160];
+const char *import_label(const import_entry *import, char *buffer) {
+    if (import->by_ordinal) {
+        std::snprintf(buffer, 160, "#%u", import->ordinal);
+    } else if (import->name[0]) {
+        std::snprintf(buffer, 160, "%s", import->name);
+    } else {
+        std::snprintf(buffer, 160, "at %#" PRIx64, import->host_address);
+    }
+    return buffer;
+}
+
 const thunk_function find_thunk(const import_entry *import) {
     for (const ImportThunk &thunk : kImportThunks) {
         if (ascii_equal_ignore_case(thunk.dll, import->dll) &&
@@ -233,7 +247,10 @@ Memory *halt(StopReason reason, uint64_t pc, const char *detail) {
  * execution through the dispatcher unwinds to the right trace. */
 StopReason trace_once(lifted_function function, State *state, uint64_t pc,
                       Memory *memory) {
-    trace_dispatch("trace %p at %#" PRIx64, (void *)function, pc);
+    /* Name the guest address and the symbol: "which function ran" is the question a
+     * whole-program run raises, and a host pointer does not answer it. */
+    const LiftedEntry *entry = lifted_lookup(pc);
+    trace_dispatch("enter %s %#" PRIx64, entry ? entry->name : "?", pc);
     StopContext context;
     context.previous = g_current;
     g_current = &context;
@@ -243,7 +260,7 @@ StopReason trace_once(lifted_function function, State *state, uint64_t pc,
     if (__builtin_setjmp(context.jump) == 0) {
         function(state, pc, memory);
     }
-    trace_dispatch("trace %p finished with %s", (void *)function, reason_name(g_reason));
+    trace_dispatch("leave %#" PRIx64 " with %s", pc, reason_name(g_reason));
     g_current = context.previous;
     return g_reason;
 }
@@ -621,10 +638,10 @@ Memory *call_import(State *state, const import_entry *import, Memory *memory) {
         return memory;
     }
 
-    trace_dispatch("import %s!%s%u at %p arg0=%#llx arg1=%#llx", import->dll,
-                   import->by_ordinal ? "#" : "", import->by_ordinal ? import->ordinal : 0,
-                   (void *)(uintptr_t)import->host_address,
-                   (unsigned long long)arguments[0], (unsigned long long)arguments[1]);
+    trace_dispatch("import %s!%s at %p arg0=%#llx arg1=%#llx arg2=%#llx", import->dll,
+                   import_label(import, g_import_label),
+                   (void *)(uintptr_t)import->host_address, (unsigned long long)arguments[0],
+                   (unsigned long long)arguments[1], (unsigned long long)arguments[2]);
 
     const uint64_t result = call_host_import(import->host_address, arguments);
 

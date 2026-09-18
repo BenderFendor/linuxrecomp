@@ -129,8 +129,14 @@ def lift_dir(out_dir: str, image_path: str) -> Path:
 def lift(image_path: str, va: int, out_dir: str = DEFAULT_OUTPUT, arch: str = "amd64",
          byte_length: Optional[int] = None, os_name: str = "windows",
          length_source: str = "unwind-range",
-         start_rva: Optional[int] = None) -> dict:
+         start_rva: Optional[int] = None, extend_to_next: bool = False) -> dict:
     """Lift the function at *va* and return its manifest.
+
+    *extend_to_next* lifts past the end of the unwind range, up to the next recovered
+    function start. An unwind range can end short of the real function tail when the
+    tail carries no unwind record, and stopping there truncates the function: the
+    HLExtract startup ran 634 bytes, returned, and never reached main because the rest
+    of it sat in the 46-byte gap before the next function.
 
     A recovered range supplies the default byte range. *start_rva* overrides that
     for a call target inside no recovered range, which is how closure lifting
@@ -150,8 +156,22 @@ def lift(image_path: str, va: int, out_dir: str = DEFAULT_OUTPUT, arch: str = "a
 
     if start_rva is None:
         try:
-            start_rva, end_rva = function_at(image, va)
-            length = byte_length if byte_length else end_rva - start_rva
+            container_start, container_end = function_at(image, va)
+            # Start where the program goes, not where the container starts. A call or
+            # a return can land inside a function - a shared epilogue, a branch target
+            # the guest computed - and the code at that address is what runs. The
+            # range still comes from the container, so the extent stays a record
+            # rather than a guess, and length_source says which case this was.
+            start_rva = image.rva_of(va)
+            end_rva = container_end
+            length = byte_length if byte_length else container_end - start_rva
+            if start_rva != container_start:
+                length_source = "interior-block"
+            if extend_to_next and not byte_length:
+                next_start = _next_function_start(image, container_end)
+                if next_start is not None and next_start > container_end:
+                    length = next_start - start_rva
+                    length_source = "next-function"
         except ValueError:
             # A call target that no unwind range describes. Reconnaissance does not
             # list it, but the program reaches it, so lift from there to whatever
@@ -170,6 +190,11 @@ def lift(image_path: str, va: int, out_dir: str = DEFAULT_OUTPUT, arch: str = "a
             raise ValueError(f"0x{va:X}: an explicit start needs an explicit length")
         length = byte_length
         end_rva = start_rva + length
+    if extend_to_next:
+        next_start = _next_function_start(image, start_rva + length)
+        if next_start is not None and next_start > start_rva + length:
+            length = next_start - start_rva
+            length_source = "next-function"
     if length <= 0:
         raise ValueError(f"0x{va:X} has no bytes to lift (unwind range is empty)")
 
@@ -227,7 +252,8 @@ def lift(image_path: str, va: int, out_dir: str = DEFAULT_OUTPUT, arch: str = "a
 
 def lift_all(image_path: str, out_dir: str = DEFAULT_OUTPUT, arch: str = "amd64",
              os_name: str = "windows", jobs: Optional[int] = None,
-             limit: Optional[int] = None, progress=None) -> dict:
+             limit: Optional[int] = None, progress=None,
+             extend_to_next: bool = False) -> dict:
     """Lift every recovered function in *image_path*.
 
     Resumable: a function whose existing manifest records the same bytes is
@@ -276,7 +302,8 @@ def lift_all(image_path: str, out_dir: str = DEFAULT_OUTPUT, arch: str = "amd64"
     def work(function):
         try:
             lift(image_path, image.va(function.start_rva), out_dir, arch,
-                 function.end_rva - function.start_rva, os_name)
+                 function.end_rva - function.start_rva, os_name,
+                 extend_to_next=extend_to_next)
             return function.start_rva, None
         except (RuntimeError, ValueError, FileNotFoundError, PEFormatError,
                 schema_check.SchemaError) as exc:
@@ -332,6 +359,17 @@ def lifted_symbols(out_dir: str) -> "set[int]":
     return found
 
 
+def _next_function_start(image: PE64Image, rva: int) -> Optional[int]:
+    """The first recovered function start after *rva*, or None when nothing follows."""
+    functions, _notes = fn.recover_functions(image)
+    best = None
+    for function in functions:
+        if function.start_rva is not None and function.start_rva > rva:
+            if best is None or function.start_rva < best:
+                best = function.start_rva
+    return best
+
+
 def choose_length(image: PE64Image, va: int, known_starts: "list[int]") -> Tuple[int, str]:
     """Byte range to lift from *va*, with the reason it was chosen.
 
@@ -354,7 +392,7 @@ def choose_length(image: PE64Image, va: int, known_starts: "list[int]") -> Tuple
 
 def lift_reachable(image_path: str, out_dir: str = DEFAULT_OUTPUT, arch: str = "amd64",
                    os_name: str = "windows", jobs: Optional[int] = None,
-                   rounds: int = 6, progress=None) -> dict:
+                   rounds: int = 6, progress=None, extend_to_next: bool = False) -> dict:
     """Lift the recovered functions, then everything they call, until closed.
 
     Remill links direct calls by symbol, so a call to a function that was never
@@ -367,7 +405,8 @@ def lift_reachable(image_path: str, out_dir: str = DEFAULT_OUTPUT, arch: str = "
     known = set()
     for round_index in range(rounds):
         if round_index == 0:
-            result = lift_all(image_path, out_dir, arch, os_name, jobs, progress=progress)
+            result = lift_all(image_path, out_dir, arch, os_name, jobs, progress=progress,
+                              extend_to_next=args.extend_to_next)
             summary["rounds"].append({"round": 0, "kind": "recovered",
                                       "lifted": len(result["lifted"]),
                                       "failed": len(result["failed"])})
@@ -390,7 +429,7 @@ def lift_reachable(image_path: str, out_dir: str = DEFAULT_OUTPUT, arch: str = "
                     continue
                 try:
                     lift(image_path, va, out_dir, arch, length, os_name, source,
-                         start_rva=image.rva_of(va))
+                         start_rva=image.rva_of(va), extend_to_next=extend_to_next)
                     lifted_this_round.append(va)
                 except (RuntimeError, ValueError, FileNotFoundError, PEFormatError,
                         schema_check.SchemaError) as exc:
@@ -431,6 +470,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                                             "amd64_avx512"])
     parser.add_argument("--os", default="windows", choices=["windows", "linux", "macos",
                                                             "solaris"])
+    parser.add_argument("--extend-to-next", action="store_true",
+                        help="lift past the end of the unwind range, to the next "
+                             "recovered function start: an unwind range can end before "
+                             "the function does")
     parser.add_argument("--bytes-length", type=lambda text: int(text, 0), default=None,
                         help="lift this many bytes instead of the recovered range")
     parser.add_argument("--out", default=DEFAULT_OUTPUT, help=f"output root "
@@ -488,7 +531,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     try:
-        manifest = lift(args.image, va, args.out, args.arch, args.bytes_length, args.os)
+        manifest = lift(args.image, va, args.out, args.arch, args.bytes_length, args.os,
+                        extend_to_next=args.extend_to_next)
     except (FileNotFoundError, PEFormatError, ValueError, RuntimeError) as exc:
         print(f"lift: {exc}", file=sys.stderr)
         return 1

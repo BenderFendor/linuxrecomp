@@ -35,7 +35,7 @@
         "range_end_rva": {"type": "integer", "minimum": 0},
         "byte_length": {"type": "integer", "minimum": 1},
         "length_source": {"type": "string",
-                          "enum": ["unwind-range", "next-function", "next-lifted", "default", "explicit"],
+                          "enum": ["unwind-range", "interior-block", "next-function", "next-lifted", "default", "explicit"],
                           "description": "how the byte range was chosen; only unwind-range comes from the linker's own table"},
         "bytes_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "bytes": {"type": "string", "pattern": "^[0-9a-f]+$"}
