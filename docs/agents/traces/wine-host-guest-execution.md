@@ -492,3 +492,27 @@ caller which does not return itself cannot pass the callee's address off as its 
 that clearing is not reached on this path, or the return is being propagated by the jump
 path, which does propagate deliberately. Distinguishing the two is the next step, and the
 trace already numbers the events needed to do it.
+
+
+## The chain advances past 0xbfdd
+
+With mid-function returns recorded, the coverage loop converged in four rounds:
+
+```
+round 4: unresolved=0 | entered=75 deepest=4 missing=0 | stop returned at 0x14000c3a1
+coverage complete: the run needs nothing that is not lifted
+```
+
+The trace confirms the fix worked: `leave 0x14000bfdd with returned` now appears, so that
+address has an entry and ran, and the chain carried on. Entered rose from 71 to 75 and the
+dispatch depth from 2 to 4 - real nesting rather than a flat chain.
+
+The stop has moved to `0x14000c3a1`, with detail "return to 0x14000c3a1", and the same
+pattern repeats one level out: `0x14000c3a1` is inside a lifted range, so the top-level chain
+ended by returning into the middle of another function. `main` is still not entered and the
+program still produces no output.
+
+The behavioural question is unchanged and now better instrumented: the startup calls
+`sub_14000c410` and `sub_14000c2f0`, the failure trio is never called, and the next step on
+the normal path - `call 0x14000bbb0` - never happens. The run is ending inside the callee
+instead of returning to the startup and going on.
