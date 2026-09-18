@@ -111,19 +111,76 @@ WINEDEBUG=-all work/linux64/bin/lifted_harness-data_read.winelib \
 # -> exit 139
 ```
 
+## Follow-up: the writer, identified
+
+The IR/runtime boundary turned out to be clean, so the next instrument was a guard:
+give the `Memory` descriptor its own page and mark it read-only after setup, which
+turns any writer into a reportable fault. Results:
+
+* native, guarded: still passes (`result=0x1234abcd`), so nothing writes the
+  descriptor in a plain process;
+* winelib, guarded: faults with `address=<descriptor page>`, every run.
+
+The faulting instruction is the answer. Bytes around the RIP:
+
+```
+e8 23 f7 ff ff      call rel32
+48 89 c1            mov %rax,%rcx
+e8 bb 59 02 00      call rel32          <- #rcx is the descriptor page
+0f 1f 00
+48 89 11            mov %rdx,(%rcx)
+48 89 59 08         mov %rbx,0x8(%rcx)
+48 8d 44 24 08      lea 0x8(%rsp),%rax
+48 89 41 10         mov %rax,0x10(%rcx)
+48 89 69 18         mov %rbp,0x18(%rcx)
+```
+
+That is a `setjmp`/context-save routine: it stores registers and the caller's RSP
+into `*rcx`. The caller obtained `rcx` from the return value of the call two
+instructions earlier. So some Wine code allocates (or computes) a context slot and
+captures into it, and that slot is the block the runtime reserved, at whichever
+address it was placed: `0x100000`, `0x300000000000`, and a host-chosen
+`0x7ffffe8c0000` all fault with the same writer RIP. Letting Wine pick the address
+(`VirtualAlloc(NULL, ...)`) did not change it, so the pointer is not coming from
+Wine's allocator handing out a range the runtime took.
+
+The writer lives in a file-backed executable mapping with no pathname in
+`/proc/self/maps` (device `00:1c`, unlinked), i.e. a Wine PE-side DLL. Guarding the
+page then makes Wine's own `/usr/lib/wine/x86_64-unix/ntdll.so` fault at
+`mov 0x8(%rax),%ebx` with `rax=0`, which is Wine's exception path running without
+the state it expects, not a fault in our code.
+
+## Measurements that narrow it further
+
+* **The allocator is not the cause.** Backing the runtime's blocks with Wine's
+  process heap (`HeapAlloc`) instead of `VirtualAlloc` produces the same writer
+  RIP at the same kind of address. That experiment was reverted; the backend stays
+  on `VirtualAlloc`.
+* **The address is not the cause.** `0x100000` (fixed), `0x300000000000` (fixed
+  high) and a host-chosen address from `VirtualAlloc(NULL, ...)` all fault with
+  the same writer RIP.
+* **The guard has to be page-aligned to be trusted.** With a heap-allocated,
+  unaligned block the guard covered a second page and our own
+  `memset(&state, 0, sizeof(state))` tripped it. The harness now aligns the
+  descriptor's page and puts `State` on the next one, and the native run passes
+  even guarded (5/5).
+* **At the fault, RSP is on a different stack** (the guest thread's), and the
+  return address at RSP is in a `0x7f...` (Unix/ELF) module, while the writing
+  callee is in a `0x6fffff...` Wine PE DLL. So a Unix-side module called a
+  PE-side context save with the runtime's block as the destination.
+
 ## Next executable step
 
-Audit the boundary between the lifted IR and the runtime. Concretely: dump the IR
-declarations of the `__remill_*` functions the fixture calls
-(`rg "declare.*__remill" work/linux64/lift/*/*/*.ll`), compare their parameter
-lists and calling conventions against `lifted_runtime.cpp`, and write a two-line
-probe that receives `(State *, uint64_t, Memory *)` from lifted code and prints the
-three pointers from inside the callee. If the callee sees a different third
-argument than the caller passed, the remaining work is an ABI fix in the runtime,
-not a Wine investigation. If the arguments are identical, the next measurement is
-a hardware watchpoint on the `Memory` object's first word using a debugger that
-works on this host (the system `gdb` is broken here: `libboost_regex.so.1.91.0`
-is missing).
+Log `&context.jump` from `trace_once` next to the descriptor's address in the same
+run. If they are equal, the `StopContext` of our own stop path is the buffer being
+written, which points at a stack/target mix-up in how the guest thread enters
+`lifted_run_dispatched`. If they differ, resolve the caller return address at RSP
+(the crash handler already resolves the faulting RIP against `/proc/self/maps`, so
+reuse that path) and name the Wine function that supplied the pointer.
+
+`LINUXRECOMP_GUARD_MEMORY=1` turns on the descriptor guard, and the crash handler
+prints the faulting RIP with its mapping, the bytes around the instruction, and the
+top of the stack.
 
 ## Rollback
 

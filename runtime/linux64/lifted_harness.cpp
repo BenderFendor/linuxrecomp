@@ -56,15 +56,102 @@ void crash_handler(int sig, siginfo_t *info, void *context) {
 #if defined(__x86_64__)
     rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
 #endif
+    uint64_t rsp = 0;
+#if defined(__x86_64__)
+    rsp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP];
+#endif
     const char *where = (g_guest_size && rip >= g_guest_base &&
                          rip < g_guest_base + g_guest_size) ? "in guest code" : "in host code";
     char message[512];
     int length = std::snprintf(message, sizeof(message),
                                "lifted: fault %d at rip=%#" PRIx64 " address=%#" PRIx64
-                               " (%s)\n",
-                               sig, rip, (uint64_t)(uintptr_t)info->si_addr, where);
+                               " rsp=%#" PRIx64 " (%s)\n",
+                               sig, rip, (uint64_t)(uintptr_t)info->si_addr, rsp, where);
     ssize_t ignored = write(STDERR_FILENO, message, (size_t)length);
     (void)ignored;
+
+    /* Name the module the faulting address belongs to. Raw calls only: this runs
+     * in a signal handler. */
+    {
+        int fd = open("/proc/self/maps", O_RDONLY);
+        if (fd >= 0) {
+            static char maps[512 * 1024];
+            ssize_t got = read(fd, maps, sizeof(maps) - 1);
+            close(fd);
+            if (got > 0) {
+                maps[got] = '\0';
+                for (char *line = maps; line && *line; ) {
+                    char *end = std::strchr(line, '\n');
+                    unsigned long long low = 0;
+                    unsigned long long high = 0;
+                    if (end) {
+                        *end = '\0';
+                    }
+                    if (std::sscanf(line, "%llx-%llx", &low, &high) == 2 && rip >= low &&
+                        rip < high) {
+                        const char prefix[] = "lifted:   rip is in ";
+                        ignored = write(STDERR_FILENO, prefix, sizeof(prefix) - 1);
+                        char offset[64];
+                        int n = std::snprintf(offset, sizeof(offset), "%s + %#llx :: ",
+                                              line, rip - low);
+                        ignored = write(STDERR_FILENO, offset, (size_t)n);
+                        ignored = write(STDERR_FILENO, "\n", 1);
+                        break;
+                    }
+                    line = end ? end + 1 : nullptr;
+                }
+            }
+        }
+    }
+
+    /* Bytes around the faulting instruction: in a host-side fault, what the
+     * writer is doing is the whole diagnosis. This is what identified a
+     * context-save routine being handed the runtime's memory descriptor as its
+     * destination (see docs/agents/traces/wine-host-guest-execution.md). */
+    if (rip >= 16) {
+        const unsigned char *code = (const unsigned char *)(uintptr_t)(rip - 16);
+        static const char digits[] = "0123456789abcdef";
+        char dump[3 * 48 + 8];
+        int n = 0;
+        dump[n++] = 'l';
+        dump[n++] = ':';
+        dump[n++] = ' ';
+        for (int i = 0; i < 48; i++) {
+            unsigned char byte = code[i];
+            dump[n++] = digits[byte >> 4];
+            dump[n++] = digits[byte & 0xf];
+            dump[n++] = (i == 15) ? '|' : ' ';
+        }
+        dump[n++] = '\n';
+        ignored = write(STDERR_FILENO, dump, (size_t)n);
+        (void)ignored;
+    }
+
+    /* Return addresses at the faulting stack pointer name the caller. */
+    if (rsp) {
+        const uint64_t *stack_words = (const uint64_t *)(uintptr_t)rsp;
+        static const char digits[] = "0123456789abcdef";
+        char out[256];
+        int n = 0;
+        out[n++] = 's';
+        out[n++] = ':';
+        for (int i = 0; i < 6; i++) {
+            out[n++] = ' ';
+            uint64_t value = stack_words[i];
+            char hex[17];
+            for (int d = 0; d < 16; d++) {
+                hex[d] = digits[(value >> ((15 - d) * 4)) & 0xf];
+            }
+            for (int d = 0; d < 16; d++) {
+                out[n++] = hex[d];
+            }
+        }
+        out[n++] = '\n';
+        ignored = write(STDERR_FILENO, out, (size_t)n);
+        (void)ignored;
+
+    }
+
     void *frames[32];
     int count = backtrace(frames, 32);
     backtrace_symbols_fd(frames, count, STDERR_FILENO);
@@ -129,11 +216,10 @@ void trace(const char *format, ...) {
     va_end(args);
 }
 
-constexpr uint64_t kStackBase = 0x200000;      /* well below the image bases we map */
 constexpr uint64_t kStackSize = 0x100000;      /* 1 MiB */
 /* One reserved block for the memory descriptor and the guest register file. */
-constexpr uint64_t kStateBase = 0x100000;
 constexpr uint64_t kStateSize = 0x100000;      /* 1 MiB */
+constexpr uint64_t kPageSize = 0x1000;         /* the descriptor gets its own page */
 /* Space above RSP for the 32-byte home area the Microsoft ABI reserves, plus the
  * extra 8 that puts the entry RSP at 8 mod 16, where a callee expects to start.
  * The reference executor uses the same shape. */
@@ -276,43 +362,40 @@ int main(int argc, char **argv) {
 
     trace("image mapped at %#" PRIx64 " size %#" PRIx64 ", entry %#" PRIx64,
           image.image_base, image.size_of_image, image.image_base + image.entry_rva);
-    trace("mapping guest stack at %#" PRIx64, kStackBase);
-    /* Through the loader's memory backend, not mmap directly: inside a Wine
-     * process a raw mapping is invisible to Wine and can be handed out again. */
-    void *stack = pe_reserve(kStackBase, kStackSize);
+    trace("reserving the guest stack");
+    /* Address 0: the host picks. Only the guest image is address-bound, because
+     * only the image's address is something the guest itself depends on. */
+    void *stack = pe_reserve(0, kStackSize);
     if (!stack) {
-        std::fprintf(stderr, "lifted: cannot map the guest stack at %#" PRIx64
-                     " (errno %d)\n", kStackBase, errno);
+        std::fprintf(stderr, "lifted: cannot map a guest stack (errno %d)\n", errno);
         pe_unmap(&image);
         return 1;
     }
-    if ((uintptr_t)stack != kStackBase) {
-        std::fprintf(stderr, "lifted: guest stack landed at %p instead of %#" PRIx64 "\n",
-                     stack, kStackBase);
-        pe_release(stack, kStackSize);
-        pe_unmap(&image);
-        return 1;
-    }
+    const uint64_t stack_base = (uint64_t)(uintptr_t)stack;
 
     trace("guest stack mapped at %p, entry rsp %#" PRIx64, stack,
-          kStackBase + kStackSize - kStackHeadroom);
+          stack_base + kStackSize - kStackHeadroom);
     /* The guest state and its memory descriptor come from the host's allocator,
      * not from the heap and not from this frame. In a Wine process glibc's heap
      * and this frame are both invisible to Wine, which can hand the same
      * addresses to its own allocator; memory the runtime keeps for the whole run
      * has to be memory Wine knows about. */
-    void *state_block = pe_reserve(kStateBase, kStateSize);
+    void *state_block = pe_reserve(0, kStateSize + kPageSize);
     if (!state_block) {
-        std::fprintf(stderr, "lifted: cannot reserve the guest state block at %#" PRIx64 "\n",
-                     kStateBase);
+        std::fprintf(stderr, "lifted: cannot reserve the guest state block\n");
         pe_release(stack, kStackSize);
         pe_unmap(&image);
         return 1;
     }
-    Memory &memory = *static_cast<Memory *>(state_block);
+    /* The descriptor gets a page of its own, aligned, so the guard below covers
+     * exactly the descriptor and nothing the runtime legitimately writes. */
+    const uintptr_t block = (uintptr_t)state_block;
+    uint8_t *descriptor_page =
+        (uint8_t *)((block + kPageSize - 1) & ~(uintptr_t)(kPageSize - 1));
+    Memory &memory = *reinterpret_cast<Memory *>(descriptor_page);
     memory.image = &image;
     memory.stack = (uint8_t *)stack;
-    memory.stack_base = kStackBase;
+    memory.stack_base = stack_base;
     memory.stack_size = kStackSize;
     lifted_report_undefined(report_undefined);
     lifted_set_memory_trace(report_undefined);
@@ -342,14 +425,32 @@ int main(int argc, char **argv) {
     trace("looking up %#" PRIx64 " among %zu lifted functions", function_va,
           lifted_entry_count());
 
+    if (getenv("LINUXRECOMP_GUARD_MEMORY")) {
+        if (pe_protect(descriptor_page, kPageSize, PE_PROT_READ) != 0) {
+            std::fprintf(stderr, "lifted: cannot guard the memory descriptor\n");
+            return 1;
+        }
+        trace("memory descriptor guarded read-only at %p", descriptor_page);
+    }
+
     struct sigaction action;
     std::memset(&action, 0, sizeof(action));
     action.sa_sigaction = crash_handler;
-    action.sa_flags = SA_SIGINFO;
+    /* SA_ONSTACK: a fault whose own stack is unusable can only be reported on
+     * another stack, which is also what Wine's handlers do. */
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigaction(SIGSEGV, &action, nullptr);
     sigaction(SIGBUS, &action, nullptr);
     sigaction(SIGILL, &action, nullptr);
     sigaction(SIGFPE, &action, nullptr);
+    {
+        static char alternate[64 * 1024];
+        stack_t alt;
+        std::memset(&alt, 0, sizeof(alt));
+        alt.ss_sp = alternate;
+        alt.ss_size = sizeof(alternate);
+        sigaltstack(&alt, nullptr);
+    }
     g_guest_base = image.image_base;
     g_guest_size = image.size_of_image;
 
@@ -368,20 +469,20 @@ int main(int argc, char **argv) {
         return 3;
     }
 
-    if (sizeof(State) > kStateSize - sizeof(Memory)) {
+    if (sizeof(State) > kStateSize) {
         std::fprintf(stderr, "lifted: State (%zu bytes) does not fit the reserved block\n",
                      sizeof(State));
         pe_release(stack, kStackSize);
         pe_unmap(&image);
         return 1;
     }
-    State &state = *reinterpret_cast<State *>(static_cast<uint8_t *>(state_block) + sizeof(Memory));
+    State &state = *reinterpret_cast<State *>(descriptor_page + kPageSize);
     std::memset(&state, 0, sizeof(state));
     state.gpr.rcx.qword = args[0];
     state.gpr.rdx.qword = args[1];
     state.gpr.r8.qword = args[2];
     state.gpr.r9.qword = args[3];
-    const uint64_t stack_top = kStackBase + kStackSize;
+    const uint64_t stack_top = stack_base + kStackSize;
     /* Leave room above RSP for the 32-byte home space the Microsoft ABI reserves
      * for the caller, which a function may read. Without the headroom those reads
      * land past the region and stop the trace for a reason that has nothing to do

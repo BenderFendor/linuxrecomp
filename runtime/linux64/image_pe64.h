@@ -39,6 +39,11 @@ extern "C" {
  * thread stack, a heap or a section. The symptom is a fault that depends on
  * unrelated timing, and it goes away once Wine knows the range is ours.
  */
+/* A reservation address of 0 means the host picks. Guest regions are only
+ * address-sensitive when the guest itself depends on the address (its image
+ * base); everything else should let the host choose, because a host that keeps
+ * its own allocator will hand out a range it considers free, even one that a
+ * fixed-address reservation has already taken. */
 typedef struct {
     void *(*reserve)(uint64_t address, uint64_t size);
     int (*release)(void *address, uint64_t size);

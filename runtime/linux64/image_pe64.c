@@ -20,9 +20,12 @@
 /* --- memory backend ------------------------------------------------------ */
 
 static void *mmap_reserve(uint64_t address, uint64_t size) {
-    void *mapped = mmap((void *)(uintptr_t)address, (size_t)size,
-                        PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    if (address != 0) {
+        flags |= MAP_FIXED_NOREPLACE;
+    }
+    void *mapped = mmap(address ? (void *)(uintptr_t)address : NULL, (size_t)size,
+                        PROT_READ | PROT_WRITE, flags, -1, 0);
     return mapped == MAP_FAILED ? NULL : mapped;
 }
 

@@ -1,23 +1,17 @@
 /* Guest memory through Wine's own allocator.
  *
- * Wine keeps its own view of the address space, and a range obtained with a plain
- * mmap is not in it: VirtualQuery reports such a range as MEM_FREE, so Wine can
- * hand the same addresses out again for a thread stack, a heap block or a section.
- * A guest image or guest stack placed with mmap can therefore be overwritten by
- * unrelated Wine activity, which surfaces as a fault that depends on timing
- * rather than on anything in the lifted code.
+ * Wine keeps its own view of the address space, and memory it does not know about
+ * is memory it will reuse: a range obtained with a plain mmap is reported by
+ * VirtualQuery as MEM_FREE, so Wine can hand the same addresses to its own
+ * allocator. tests/winelib/memory_visibility.c checks that difference directly,
+ * and scripts/check-winelib.sh runs it.
  *
- * Mapping through VirtualAlloc puts the region in Wine's bookkeeping, and
- * VirtualProtect applies the section permissions the same way.
- *
- * Measured on wine-11.15 with a plain mmap:
- *
- *     mmap stack 0x200000, image 0x140000000
- *     after mmap, stack 0x200000:     state=MEM_FREE size=0x7fd60000
- *     after mmap, image 0x140000000:  state=MEM_FREE size=0x6ffebf320000
- *
- * scripts/check-winelib.sh asserts the difference, so this cannot regress
- * silently.
+ * A reservation address of 0 means "anywhere": only the guest image is
+ * address-bound, because only its address is something the guest depends on.
+ * Taking the memory from Wine's process heap (HeapAlloc) instead was measured as
+ * well and changed nothing about the remaining failure (see the trace in
+ * docs/agents/traces/wine-host-guest-execution.md), so this stays with the
+ * simpler allocator.
  *
  * Only the winelib build links this file. The default backend stays mmap, so the
  * native harness and the reference executor need nothing from Wine.
@@ -28,8 +22,8 @@
 #include <windows.h>
 
 static void *wine_reserve(uint64_t address, uint64_t size) {
-    void *mapped = VirtualAlloc((LPVOID)(uintptr_t)address, (SIZE_T)size,
-                                MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    void *mapped = VirtualAlloc(address ? (LPVOID)(uintptr_t)address : NULL, (SIZE_T)size,
+                               MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     return mapped == NULL ? NULL : mapped;
 }
 
