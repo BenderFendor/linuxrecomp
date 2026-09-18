@@ -295,3 +295,34 @@ stack short.
 Next: instrument `_initterm`'s table walk - the guest addresses it reads and the entries
 it calls - rather than the frames, since that is now where the run stops rather than where
 it breaks.
+
+
+## The startup's shape, and why it returns early
+
+`sub_140005070` (672 bytes, the function that runs after the 18-byte entry stub) is MSVC's
+common startup. Disassembling it shows what it actually does:
+
+```
+140005083: call QWORD PTR [rip+0x1414f]   ; 0x1400191d8
+140005094: call QWORD PTR [rip+0x14136]   ; 0x1400191d0
+1400050a0: jne  0x1400050ce                ; branch on the result
+1400050ab: call 0x14000b240                ; failure path:
+1400050b5: call 0x14000b000                ;   report, clean up,
+1400050bf: call 0x1400085c0                ;   and leave
+1400050c9: jmp  0x1400052d6
+```
+
+Two things follow. The startup checks the result of nearly every import it makes and jumps
+to a three-call failure path ending in a jump to the function's exit; and the same shape
+repeats for each of the IAT slots it uses (0x1400191c0, 0x1400191c8, 0x1400191d0,
+0x1400191d8). An import that returns something the check rejects therefore ends the whole
+run before `main`, which is exactly what is observed.
+
+Corroborating evidence from the initialiser tables: scanning `.rdata` for runs of code
+pointers finds two, at rva 0x19438 (4 entries) and 0x1a360 (3 entries). Only one entry,
+0x140003ee0, is ever called in the run; the other five are never reached, and `_initterm`
+itself is not among the 25 functions entered. So the startup diverts before the
+initialisers run.
+
+Next: resolve the four IAT slots above to import names and compare each returned value
+against what the startup's check expects. That is the concrete, bounded question now.
