@@ -26,6 +26,10 @@ namespace {
 
 constexpr uint64_t kStackBase = 0x200000;      /* well below the image bases we map */
 constexpr uint64_t kStackSize = 0x100000;      /* 1 MiB */
+/* Space above RSP for the 32-byte home area the Microsoft ABI reserves, plus the
+ * extra 8 that puts the entry RSP at 8 mod 16, where a callee expects to start.
+ * The reference executor uses the same shape. */
+constexpr uint64_t kStackHeadroom = 0x1008;
 
 int parse_u64(const char *text, uint64_t *out) {
     char *end = nullptr;
@@ -204,13 +208,17 @@ int main(int argc, char **argv) {
     state.gpr.r8.qword = args[2];
     state.gpr.r9.qword = args[3];
     const uint64_t stack_top = kStackBase + kStackSize;
-    state.gpr.rsp.qword = stack_top - 8;   /* 16-byte aligned, room for a return address */
-    uint64_t *return_slot = (uint64_t *)guest_ptr(&memory, stack_top - 8, 8);
+    /* Leave room above RSP for the 32-byte home space the Microsoft ABI reserves
+     * for the caller, which a function may read. Without the headroom those reads
+     * land past the region and stop the trace for a reason that has nothing to do
+     * with the function being tested. */
+    state.gpr.rsp.qword = stack_top - kStackHeadroom;
+    uint64_t *return_slot = (uint64_t *)guest_ptr(&memory, stack_top - kStackHeadroom, 8);
     if (return_slot) {
         *return_slot = 0;
     }
 
-    StopReason reason = lifted_run(entry->function, &state, function_va, &memory);
+    StopReason reason = lifted_run_dispatched(function_va, &state, &memory);
 
     const char *section = pe_section_name(&image, function_va);
     std::printf("lifted: image=%s base=%#" PRIx64 " section=%s symbol=%s va=%#" PRIx64
@@ -221,6 +229,12 @@ int main(int argc, char **argv) {
                 state.gpr.rax.qword, state.gpr.rax.qword);
     std::printf("lifted: stop %s at %#" PRIx64 " (%s)\n",
                 lifted_stop_reason_name(reason), lifted_stop_pc(), lifted_stop_detail());
+    std::printf("lifted: entered=%" PRIu64 " deepest=%" PRIu64 " missing=%zu\n",
+                lifted_functions_entered(), lifted_deepest_dispatch(),
+                lifted_missing_target_count());
+    for (size_t i = 0; i < lifted_missing_target_count(); i++) {
+        std::printf("lifted: unresolved %#" PRIx64 "\n", lifted_missing_target(i));
+    }
 
     for (int i = 0; i < dump_count; i++) {
         std::printf("lifted: memory %#" PRIx64 "+%" PRIu64 " =", dump_addr[i],

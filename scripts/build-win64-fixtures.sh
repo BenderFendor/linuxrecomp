@@ -12,6 +12,7 @@ fi
 
 "$CC" -O2 -g0 "$ROOT/tests/fixtures/win64/return42.c" -o "$OUT/return42.exe"
 "$CC" -O2 -g0 "$ROOT/tests/fixtures/win64/kernel32.c" -o "$OUT/kernel32.exe"
+"$CC" -O2 -g0 "$ROOT/tests/fixtures/win64/data_read.c" -o "$OUT/data_read.exe"
 
 # The RTTI fixture must be MSVC-ABI, so it is not a MinGW build: GCC's Itanium
 # RTTI has a different record layout. clang can target the MSVC ABI directly and

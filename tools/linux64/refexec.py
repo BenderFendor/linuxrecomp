@@ -22,7 +22,6 @@ from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BINARY = os.path.join(ROOT, "work", "linux64", "bin", "refexec")
-HARNESS = os.path.join(ROOT, "work", "linux64", "bin", "lifted_harness")
 BUILD_SCRIPT = os.path.join(ROOT, "scripts", "build-runtime-linux64.sh")
 
 # Both executors print the same report, so one parser serves both. The lifted
@@ -39,6 +38,12 @@ STOP_RE = re.compile(r"^lifted: stop (?P<reason>\S+) at (?P<pc>\S+) \((?P<detail
 
 class RefExecError(RuntimeError):
     """The reference executor could not run the request at all."""
+
+
+class ExecTimeout(RefExecError):
+    """The executor did not finish in time. For a reference run that means the
+    function did not terminate on the synthetic inputs, which is not a fault of
+    the lifter and not something to compare."""
 
 
 class GuestFault(RefExecError):
@@ -129,7 +134,10 @@ def _execute(binary: str, image: str, va: int, args: Sequence[int],
     for address, length in dumps:
         command.extend(["--dump", f"{hex(address)}:{length}"])
 
-    completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise ExecTimeout(f"no result within {timeout}s") from exc
     if completed.returncode == 2 or "guest faulted" in completed.stderr:
         raise GuestFault(completed.stderr.strip() or "guest faulted")
     if completed.returncode not in (0, 4):
@@ -154,6 +162,16 @@ def run(
     return _execute(ensure_built(), image, va, args, pokes, dumps, timeout)
 
 
+def harness_for(image: str) -> str:
+    """Path of the lifted harness built for *image*.
+
+    One harness per image, because it links that image's lifted functions by
+    address: a harness built for one binary must not be used for another.
+    """
+    return os.path.join(ROOT, "work", "linux64", "bin",
+                        f"lifted_harness-{os.path.basename(image)}")
+
+
 def run_lifted(
     image: str,
     va: int,
@@ -168,11 +186,11 @@ def run_lifted(
 
     The harness is built by ``scripts/build-lifted-harness.sh`` for one image.
     """
-    binary = harness or os.environ.get("LIFTED_HARNESS") or HARNESS
+    binary = harness or os.environ.get("LIFTED_HARNESS") or harness_for(image)
     if not os.path.exists(binary):
         raise RefExecError(
             f"no lifted harness at {binary}; build it with "
-            "scripts/build-lifted-harness.sh IMAGE")
+            f"scripts/build-lifted-harness.sh {image}")
     extra = ("--report-undefined",) if report_undefined else ()
     return _execute(binary, image, va, args, pokes, dumps, timeout, extra)
 

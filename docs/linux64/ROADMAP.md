@@ -68,12 +68,41 @@ Two functions were lifted and executed: `0x140006D80` (26 bytes, returns 1) and
 
 Details in `docs/linux64/LIFTING.md`.
 
-## P3 — whole-program direct control flow
+## P3 — whole-program direct control flow — **done**
 
-* dispatcher keyed by guest VA; direct calls and jumps work;
-* original `.rdata`/`.data` bytes are readable at their guest addresses;
-* function-level differential tests are deterministic;
-* extend reconnaissance to direct call/jump edges and indirect-call sites.
+Acceptance, and the evidence:
+
+* **Direct calls and jumps work.** Remill links a direct call as an LLVM call to
+  `sub_<address>`, so the callee runs and the caller continues with no dispatch
+  layer. Indirect calls and jumps go through `__remill_function_call` and
+  `__remill_jump`, which run the target and return, or end the trace for a jump.
+  A target with no lift stops the program and reports its address.
+* **Closure lifting.** `lift --all --reachable` lifts the recovered functions,
+  then every call target they reference, until the set stops growing. On
+  HLExtract.exe: 262 recovered functions, 311 lifted, 0 failures, 10.8 seconds.
+  All 49 extra addresses are outside every recovered range, so the lifter's
+  decoder found functions that `.pdata` never listed.
+* **The original data sections are addressable.** The `data_read.exe` fixture
+  reads a `.rdata` constant, reads a `.data` global and writes it; four fixed
+  cases pass, and a write case asserts the dumped memory equals what was written
+  in both executors.
+* **Deterministic function-level differential tests.** The sweep runs every
+  recovered function on a fixed set of inputs and classifies each case. On
+  HLExtract.exe: 2620 cases, 214 comparable, 100% of comparable cases agreed, 0
+  mismatches, 2405 reference faults (synthetic inputs a function cannot use), 1
+  timeout. Runtime 8.9 seconds.
+* Whole-program start: running HLExtract.exe's entry point executes CRT startup
+  code until the first import call, then reports `call to unlifted address
+  0x1dc00` (a name RVA from an unpopulated IAT). That is the P4 handoff, and the
+  report is the input list P4 needs.
+
+The entry-state work belongs to this milestone because the sweep is only
+meaningful with it: the reference now zeroes every general register and the flags
+and uses the same guest stack at the same address as the harness, which is how a
+function that never defines its return register (`0x1400055D0`, whose
+zero-argument path is a bare `ret`) stopped looking like a mismatch.
+
+Details in `docs/linux64/LIFTING.md`.
 
 ## P4 — imports through the Win32 layer
 

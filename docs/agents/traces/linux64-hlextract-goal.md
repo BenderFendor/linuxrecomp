@@ -143,9 +143,62 @@ Known limits recorded in `docs/linux64/LIFTING.md`: no cross-function calls or
 jumps yet (the trace stops and reports the target, which is P3's entry point),
 flags start zeroed at entry, no x87 or 128-bit memory access, no atomics.
 
+## P3: closure lifting, dispatch, and a real sweep
+
+Three things changed the shape of the work here.
+
+**Remill links direct calls by symbol.** A trace that calls another function
+declares `sub_<address>` and calls it, expecting the whole program to be linked.
+Closure lifting (`lift --all --reachable`) follows those references: HLExtract.exe
+goes from 262 recovered functions to 311 lifted in two rounds, 0 failures, 10.8
+seconds. The 49 extra addresses are all outside every recovered range, which is
+the lifter's decoder finding functions `.pdata` never listed. Any reference still
+unlifted gets a generated stub that stops the program and reports the address, so
+the link cannot fail in a way that hides a runnable program.
+
+**The dispatcher is mostly not needed.** Direct calls are LLVM calls, so only
+indirect calls and jumps reach `__remill_function_call` / `__remill_jump`; the
+runtime runs the target and returns, or ends the trace for a jump. `ret` records
+the return address and returns normally, because the callee has a caller still
+running. Nested traces each get their own stop context on the C stack.
+
+**Entry state had to be made identical.** The first sweep produced 8 mismatches
+that were all the same artefact: functions whose path never defines RAX (0x1400055D0
+is a bare `ret` after a test) returned the *harness's* leftover value in the
+reference and 0 in the lifted run. The reference now zeroes every general register
+and the flags and runs on the same guest stack at the same address as the harness,
+so undefined values agree because both start undefined in the same way. Aligning
+the RSP to 8 mod 16 also removed a class of latent difference for code that spills
+with aligned SSE.
+
+Rewriting that helper introduced a bug worth recording: the first version stashed
+the target and stack pointer in frame slots that the save-pushes then overwrote,
+so the call went through a zeroed register. An isolated probe
+(`/tmp/stack_probe/probe.c`) reproduced it in a handful of lines, and refexec now
+prints the guest RIP and address on a fault, which is what showed the jump to 0.
+gdb is not usable on this machine (missing libboost_regex.so.1.91.0).
+
+Evidence:
+
+| Check | Result |
+|---|---|
+| `lift --all --reachable` on HLExtract.exe | 311 lifted, 0 failed, 10.8s |
+| `difftest --sweep` (all 262 functions) | 2620 cases, 214 comparable, 100% agreed, 0 mismatches, 8.9s |
+| `difftest data_read.exe` | 4 of 4 cases, including a write whose dumped bytes are asserted |
+| `lifted_harness ... 0x140005310` (entry point) | runs CRT startup, stops at `call to unlifted address 0x1dc00` |
+| `python -m tools.linux64 selftest` | parser, fixtures, rtti, refexec wrapper, both difftest suites |
+
+The entry-point run is the P4 handoff: `0x1dc00` is a name RVA inside `.rdata`,
+which is what an unpopulated IAT slot holds before the loader fixes it up. P4
+fills the IAT and dispatches those targets.
+
+New runtime pieces: nested dispatch contexts, `lifted_run_dispatched`, per-run
+statistics (`entered`, `deepest`, `missing`), stubs for unlifted call targets, the
+scan of `.ll` files for referenced `sub_<addr>` symbols, and the `compare_exchange`
+and FPU-control intrinsics the CRT needed.
+
 ## Next
 
-P3: lift every recovered function in the target, dispatch calls and jumps by
-guest VA, keep the original data sections addressable, and grow the differential
-tests from four fixed cases to many.
+P4: populate the IAT so import calls resolve, build the winelib host module, and
+implement only the imports this target reaches (the run reports them by address).
 

@@ -26,15 +26,134 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <ucontext.h>
 #include <unistd.h>
+
+/* Set while a guest function is running, so a fault can say whether it happened
+ * in guest code or in the harness itself. A crash report that cannot make that
+ * distinction is not much use. */
+static uint64_t g_image_base = 0;
+static uint64_t g_image_size = 0;
 
 typedef uint64_t(__attribute__((ms_abi)) * ms_fn_u64)(uint64_t, uint64_t, uint64_t,
                                                       uint64_t);
 
-static void fault_handler(int sig) {
-    char message[128];
+/* Guest stack shape, shared with the lifted harness so both executors hand the
+ * function the same stack: same addresses, same zeroed contents.
+ *
+ * The reference executor runs the guest function on the host stack by default.
+ * That is fine for a function that only touches registers, and wrong for a
+ * function that reads its caller's stack frame or the ABI's home space, because
+ * then the two executors see different memory and a difference in results says
+ * nothing about the lifter. Switching RSP to the same guest region removes that
+ * source of noise.
+ */
+#define GUEST_STACK_BASE 0x200000
+#define GUEST_STACK_SIZE 0x100000
+/* 0x1008 keeps the entry RSP at 8 mod 16, which is where the Microsoft ABI says
+ * a callee starts: the caller's `call` has pushed its return address onto a
+ * 16-byte-aligned stack. A misaligned entry makes a function that spills with an
+ * aligned SSE store fault in the reference and quietly succeed in the lifted
+ * code, which would read as a lifter bug. */
+#define GUEST_STACK_HEADROOM 0x1008
+
+/* Call a Microsoft-ABI function with RSP switched to *sp* and a register state
+ * that matches what the lifted harness sets up.
+ *
+ * System V argument order on entry: rdi = function, rsi = stack pointer,
+ * rdx/rcx/r8/r9 = the four guest arguments.
+ *
+ * Three things matter here, and all three are about making the two executors
+ * comparable rather than about the call itself:
+ *
+ *   - the guest arguments are reshuffled into the Microsoft order (rcx, rdx,
+ *     r8, r9); r8 and r9 are already in place, rcx and rdx are not;
+ *   - every other general register is zeroed and the flags are cleared, because
+ *     the lifted harness starts from a zeroed State. Without this a function
+ *     that returns without defining a register hands back whatever this helper
+ *     left there, and the differential test reports a divergence that is an
+ *     artefact of the test. HLExtract's 0x1400055D0 is exactly that case: its
+ *     zero-argument path is a bare `ret`, and the reference used to return the
+ *     function pointer this helper had left in RAX;
+ *   - the guest enters through `jmp` with the return address already in its
+ *     stack slot, not through `call`, so RSP at entry and the return slot are
+ *     both under our control.
+ *
+ * The entry point and stack pointer live in frame slots rather than registers
+ * because every register has to be zero for the guest. The first version kept
+ * them in registers saved on the stack, and the save pushes then overwrote those
+ * slots, so the call went through a zeroed register. An isolated probe of this
+ * helper caught it, and the fault report now prints the guest RIP and address,
+ * which is what made it visible.
+ *
+ * The one value that cannot match the harness is the return-address slot itself:
+ * it holds a real host address here and a zero there.
+ */
+__attribute__((naked)) static uint64_t call_on_guest_stack(void *function, uint64_t sp,
+                                                           uint64_t a0, uint64_t a1,
+                                                           uint64_t a2, uint64_t a3) {
+    __asm__ volatile(
+        "pushq %rbp\n\t"
+        "movq %rsp, %rbp\n\t"
+        "pushq %rbx\n\t"                 /* saved registers occupy rbp-8 .. rbp-56 */
+        "pushq %rsi\n\t"
+        "pushq %rdi\n\t"
+        "pushq %r12\n\t"
+        "pushq %r13\n\t"
+        "pushq %r14\n\t"
+        "pushq %r15\n\t"
+        "subq $16, %rsp\n\t"             /* scratch below the saves */
+        "movq %rdi, -64(%rbp)\n\t"       /* guest entry point */
+        "movq %rsi, -72(%rbp)\n\t"       /* guest stack pointer */
+        "movq %rcx, %rax\n\t"            /* a1 out of the way */
+        "movq %rdx, %rcx\n\t"            /* a0 -> rcx */
+        "movq %rax, %rdx\n\t"            /* a1 -> rdx */
+        "xorl %ebx, %ebx\n\t"
+        "xorl %esi, %esi\n\t"
+        "xorl %edi, %edi\n\t"
+        "xorl %eax, %eax\n\t"
+        "xorl %r10d, %r10d\n\t"
+        "xorl %r11d, %r11d\n\t"
+        "xorl %r12d, %r12d\n\t"
+        "xorl %r13d, %r13d\n\t"
+        "xorl %r14d, %r14d\n\t"
+        "xorl %r15d, %r15d\n\t"
+        "pushq $2\n\t"                   /* RFLAGS bit 1 is always set */
+        "popfq\n\t"                      /* CF, PF, AF, ZF, SF, OF all clear */
+        "movq -72(%rbp), %rsp\n\t"       /* switch to the guest stack */
+        "leaq 1f(%rip), %rax\n\t"
+        "movq %rax, (%rsp)\n\t"          /* the guest's return address */
+        "xorl %eax, %eax\n\t"            /* rax = 0 at entry, like the lifted State */
+        "jmp *-64(%rbp)\n\t"             /* enter the guest, no register needed */
+        "1:\n\t"
+        "leaq -56(%rbp), %rsp\n\t"       /* back to the host stack, saved registers */
+        "popq %r15\n\t"
+        "popq %r14\n\t"
+        "popq %r13\n\t"
+        "popq %r12\n\t"
+        "popq %rdi\n\t"
+        "popq %rsi\n\t"
+        "popq %rbx\n\t"
+        "popq %rbp\n\t"
+        "ret\n\t");
+}
+
+static void fault_handler(int sig, siginfo_t *info, void *context) {
+    static char message[512];
+    ucontext_t *uc = (ucontext_t *)context;
+    uint64_t rip = 0;
+#if defined(__x86_64__)
+    rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+#endif
+    const char *where = "in the harness";
+    if (g_image_size && rip >= g_image_base && rip < g_image_base + g_image_size) {
+        where = "in guest code";
+    }
     int length = snprintf(message, sizeof(message),
-                          "refexec: guest faulted with signal %d\n", sig);
+                          "refexec: guest faulted with signal %d at rip=%#" PRIx64
+                          " address=%#" PRIx64 " (%s)\n",
+                          sig, rip, (uint64_t)(uintptr_t)info->si_addr, where);
     ssize_t ignored = write(STDERR_FILENO, message, (size_t)length);
     (void)ignored;
     _exit(2);
@@ -192,14 +311,29 @@ int main(int argc, char **argv) {
 
     struct sigaction action;
     memset(&action, 0, sizeof(action));
-    action.sa_handler = fault_handler;
+    action.sa_sigaction = fault_handler;
+    action.sa_flags = SA_SIGINFO;
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGBUS, &action, NULL);
     sigaction(SIGILL, &action, NULL);
     sigaction(SIGFPE, &action, NULL);
+    g_image_base = image.image_base;
+    g_image_size = image.size_of_image;
 
     ms_fn_u64 function = (ms_fn_u64)(uintptr_t)function_va;
-    uint64_t result = function(args[0], args[1], args[2], args[3]);
+
+    void *guest_stack = mmap((void *)(uintptr_t)GUEST_STACK_BASE, GUEST_STACK_SIZE,
+                             PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (guest_stack == MAP_FAILED) {
+        fprintf(stderr, "refexec: cannot map the guest stack at %#x\n", GUEST_STACK_BASE);
+        pe_unmap(&image);
+        return 1;
+    }
+    const uint64_t stack_pointer = GUEST_STACK_BASE + GUEST_STACK_SIZE - GUEST_STACK_HEADROOM;
+
+    uint64_t result = call_on_guest_stack(function, stack_pointer, args[0], args[1],
+                                          args[2], args[3]);
 
     printf("refexec: image=%s base=%#" PRIx64 " section=%s va=%#" PRIx64
            " args=%#" PRIx64 ",%#" PRIx64 ",%#" PRIx64 ",%#" PRIx64
@@ -216,6 +350,7 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
+    munmap(guest_stack, GUEST_STACK_SIZE);
     pe_unmap(&image);
     return 0;
 }

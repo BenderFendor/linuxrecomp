@@ -26,7 +26,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["image", "image_sha256", "function_va", "function_start_rva",
-                   "byte_length", "bytes_sha256", "bytes"],
+                   "byte_length", "length_source", "bytes_sha256", "bytes"],
       "properties": {
         "image": {"type": "string"},
         "image_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
@@ -34,6 +34,9 @@
         "function_start_rva": {"type": "integer", "minimum": 0},
         "range_end_rva": {"type": "integer", "minimum": 0},
         "byte_length": {"type": "integer", "minimum": 1},
+        "length_source": {"type": "string",
+                          "enum": ["unwind-range", "next-function", "next-lifted", "default", "explicit"],
+                          "description": "how the byte range was chosen; only unwind-range comes from the linker's own table"},
         "bytes_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "bytes": {"type": "string", "pattern": "^[0-9a-f]+$"}
       }

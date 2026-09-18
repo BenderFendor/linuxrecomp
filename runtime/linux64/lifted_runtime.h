@@ -74,4 +74,20 @@ size_t lifted_entry_count(void);
 StopReason lifted_run(lifted_function function, State *state, uint64_t pc,
                       Memory *memory);
 
+/* Run the program at *va* with dispatch: a call or jump to another lifted
+ * function continues there instead of stopping the trace. Returns when control
+ * reaches an address that is not a lifted function, or when the trace errors. */
+StopReason lifted_run_dispatched(uint64_t va, State *state, Memory *memory);
+
+/* Observability for a dispatched run. */
+uint64_t lifted_functions_entered(void);
+uint64_t lifted_deepest_dispatch(void);
+size_t lifted_missing_target_count(void);
+uint64_t lifted_missing_target(size_t index);
+/* Reads and discards the counters, so each run reports its own numbers. */
+void lifted_reset_stats(void);
+
+/* Target of the generated stubs for call targets that were never lifted. */
+Memory *lifted_missing_function(State *state, uint64_t pc, Memory *memory);
+
 #endif /* LINUXRECOMP_LIFTED_RUNTIME_H */

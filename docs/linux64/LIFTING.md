@@ -61,57 +61,139 @@ Guest memory is:
 Anything else is unmapped and halts with the address in the report. Heap, extra
 mappings and TLS arrive when a target needs them.
 
+## How calls and jumps work
+
+Remill's model turns out to be simpler than a hand-written dispatcher, and
+knowing which is which matters:
+
+* **A direct call is an LLVM call.** The trace declares the target as
+  `sub_<address>` and calls it, because Remill assumes the whole program will be
+  linked. The callee's `ret` calls `__remill_function_return` and then returns
+  from the LLVM function, so the caller's lifted code simply continues. There is
+  no dispatch overhead and no bookkeeping to get wrong.
+* **An indirect call or jump goes through the runtime.** `__remill_function_call`
+  and `__remill_jump` run the target's lifted function and return, for a call, or
+  end the current trace with the target's outcome, for a jump, since a jump does
+  not come back.
+* **A target with no lift stops the program** and reports the address. That is how
+  an import announces itself before P4 implements it, and the report names the
+  address so the list of imports a target needs can be read straight off a run.
+
+That model means the useful work at this stage is not a dispatcher but **closure**:
+a direct call to a function nobody lifted is an undefined symbol at link time.
+`lift --all --reachable` therefore lifts the recovered functions, reads the
+`sub_<address>` symbols the lifted code refers to, lifts those, and repeats until
+the set stops growing. On HLExtract.exe that takes 262 recovered functions to 311
+lifted, and all 49 extra addresses are **outside every recovered range**: they are
+functions that `.pdata` never listed, found by the lifter's own decoder following
+direct calls. The byte ranges for those come from the next known start (recorded
+as `length_source: next-function`), so their *starts* are evidence and their
+*ends* are a bound.
+
+The build still generates a stub for any referenced address that has no lift, so a
+link failure never hides a program that would have run; the stub stops the program
+with the address instead.
+
+## Entry state has to be identical for a comparison to mean anything
+
+Both executors must hand the function the same world, or a difference in results
+says nothing about the lift:
+
+* the same image mapped at the same base, with the same pokes;
+* the same guest stack, at the same address, with the entry RSP at 8 mod 16 as the
+  Microsoft ABI expects (a misaligned entry makes an aligned SSE spill fault in
+  the reference and quietly succeed in the lifted code);
+* the same register state: arguments in RCX/RDX/R8/R9 and **everything else zero**,
+  because the lifted harness starts from a zeroed `State`;
+* the same flags, cleared.
+
+The register rule was not there at first, and the sweep caught what it cost:
+HLExtract's `0x1400055D0` has a zero-argument path that is a bare `ret`, so it
+never defines RAX. The reference returned whatever the harness had left in RAX,
+which was the function pointer; the lifted run returned 0. Both are "undefined",
+so the only way to agree is to start from the same undefined state.
+
+One value cannot match: the return-address slot holds a real host address in the
+reference and a zero in the harness. A function that reads its own return address
+would see that difference, and none of the ones tested do.
+
+## Differential testing
+
+```bash
+python -m tools.linux64 difftest IMAGE                        # fixed cases
+python -m tools.linux64 difftest IMAGE --sweep                 # every function
+python -m tools.linux64 difftest IMAGE --sweep --limit 60      # a slice
+```
+
+Fixed cases state what they expect of the reference as well as comparing the two
+runs, so a case that is set up wrong fails as a case and not as a lifter.
+
+The sweep runs every recovered function against a deterministic set of inputs:
+no arguments, zeros, small integers, seeded small values, and pointer arguments
+into a scratch area in `.data` (zeroed, and once with every slot pointing back at
+the scratch so a second-level dereference stays mapped). Results are classified
+rather than flattened into one number:
+
+| status | meaning |
+|---|---|
+| `matched` | both executors returned the same value, and any dumped memory agreed |
+| `mismatch` | they disagreed, which is a lifter or runtime defect |
+| `blocked` | the lifted run stopped at an import or an unlifted address, which is a known gap |
+| `reference-fault` | the function faulted on synthetic inputs, so there is nothing to compare |
+| `timeout` | it did not terminate on those inputs |
+
+The honest summary is the comparison rate, not the raw total. On HLExtract.exe the
+sweep reports 2620 cases over all 262 functions: 214 comparable, **100% of
+comparable cases agreed**, 2405 reference faults and 1 timeout. The faults are the
+limit of input synthesis without type information, not a verdict on the lift.
+
+## Data sections
+
+`data_read.exe` in `tests/fixtures/win64` exists because "data is addressable at
+guest addresses" needs a test and not an argument. It exports a `.rdata` constant
+reader, a `.data` global reader and a writer, and exports the global itself so the
+test reads the address out of the image instead of hard-coding it. The four cases
+check the constant value, the initial global, and that a write lands (the dumped
+memory must equal what was written, in both executors).
+
 ## Running it
 
 ```bash
 ./scripts/build-lifted-harness.sh IMAGE       # generates a dispatch table, then links
-work/linux64/bin/lifted_harness IMAGE FUNCTION_VA [a b c d] [--poke ADDR=HEX] [--dump ADDR:LEN]
+work/linux64/bin/lifted_harness-IMAGE IMAGE FUNCTION_VA [a b c d] [--poke ADDR=HEX] [--dump ADDR:LEN]
 ```
 
-The harness builds a dispatch table from the lift manifests, and only from
-manifests whose recorded image hash matches the image it is built for. Mixing
-functions lifted from two different builds of a binary would be a correctness
-hole that nothing else would catch.
+One harness per image, named after it, because it links that image's lifted
+functions by address: using a harness built for one binary against another would
+be silently wrong. The build only takes manifests whose recorded image hash
+matches, for the same reason.
 
-The harness prints the same report format as the reference executor, so one
-parser (`tools/linux64/refexec.py`) reads both:
+The harness prints the same report format as the reference executor, so one parser
+(`tools/linux64/refexec.py`) reads both:
 
 ```
 lifted: image=... base=0x140000000 section=.text symbol=sub_140006d80 va=0x140006d80 args=0x0,... result=0x1 result_dec=1
 lifted: stop returned at 0 (return to 0)
+lifted: entered=1 deepest=1 missing=0
 ```
 
 `--report-undefined` prints a line whenever the lifted code reads a value Remill
 could not determine, which is how an incomplete lift announces itself instead of
 quietly returning a plausible number.
 
-## Differential testing
+## Known limits
 
-```bash
-python -m tools.linux64 difftest IMAGE
-python -m tools.linux64 difftest IMAGE --case compares-pointed-dword-match
-```
-
-Each case runs the same function twice: as original bytes on the real CPU
-(`refexec`) and as lifted code (`lifted_harness`). Cases are fixed rather than
-random so a failure is reproducible.
-
-Compared: the return value, requested guest memory, and that the lifted trace
-stopped by returning rather than hitting an unmodelled boundary. A case may state
-an expected reference result, which catches a case that was set up wrong rather
-than a lifter that is wrong: that check is what caught a bad pointer in the P2
-case list.
-
-Not compared: stack contents. The reference runs the guest function on the host
-stack, the lifted harness gives it a guest stack, so stack addresses differ by
-construction. Image memory is comparable and is what the cases read.
-
-## Known limits at P2
-
-* one function at a time: calls, cross-function jumps and returns into other
-  functions stop the trace and wait for P3's dispatcher;
-* flags are zero at entry, so a function that reads flags before setting them is
-  not covered yet;
-* no x87 or 128-bit memory access (`__remill_read_memory_f80`, `f128`), no
-  atomics, no I/O ports, no hyper calls beyond halting;
+* without type information most functions cannot be given inputs that satisfy
+  them, so the sweep compares a fraction of what it runs. Recovering signatures,
+  or reusing arguments seen at call sites, is what would change that;
+* flags are zero at entry and the sweep never varies them, so a function that
+  reads flags before writing them is compared from one state only;
+* no x87 or 128-bit memory access (`__remill_read_memory_f80`, `f128`), no I/O
+  ports, and floating point exceptions are not modelled: the FPU rounding mode is
+  recorded and reported back, and nothing is ever raised;
+* atomics are modelled as single-threaded compare-exchange and no-op fences, so a
+  target with real guest threads needs work here;
+* imports resolve to nothing yet, which is P4; until then a program stops at its
+  first import call and reports the address;
+* the stack region is fixed at 1 MiB at 0x200000 and the heap does not exist;
 * lifts are per image hash: lift again after changing the target.

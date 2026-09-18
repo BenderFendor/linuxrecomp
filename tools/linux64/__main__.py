@@ -22,16 +22,22 @@ def _selftest(argv: Sequence[str]) -> int:
     status = test_pe64.main()
     refexec._selftest()
 
-    # Differential tests need a lifted harness and the target image. The target
-    # is the project's test program (see docs/linux64/ROADMAP.md); set
-    # LINUXRECOMP_TARGET to point somewhere else. Both are absent in CI, where
-    # this step reports a skip rather than a failure.
-    target = os.environ.get("LINUXRECOMP_TARGET",
-                            "/home/bender/projects/filestorecomp/HLExtract/HLExtract.exe")
-    if os.path.exists(target) and os.path.exists(refexec.HARNESS):
-        status = difftest.main([target]) or status
-    else:
-        print("difftest: SKIP (needs a lifted harness and the target image)")
+    # Differential tests need a lifted harness and the image. The fixture is
+    # built here; the larger target is the project's test program (see
+    # docs/linux64/ROADMAP.md) and can be pointed elsewhere with
+    # LINUXRECOMP_TARGET. Both are absent in CI, where this step reports a skip.
+    targets = [os.path.join(refexec.ROOT, "work", "linux64", "fixtures", "data_read.exe")]
+    override = os.environ.get("LINUXRECOMP_TARGET",
+                              "/home/bender/projects/filestorecomp/HLExtract/HLExtract.exe")
+    if override:
+        targets.append(override)
+    ran_any = False
+    for target in targets:
+        if os.path.exists(target) and os.path.exists(refexec.harness_for(target)):
+            status = difftest.main([target]) or status
+            ran_any = True
+    if not ran_any:
+        print("difftest: SKIP (needs a lifted harness and a target image)")
     return status
 
 
