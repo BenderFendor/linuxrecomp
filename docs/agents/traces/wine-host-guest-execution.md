@@ -458,3 +458,37 @@ The remaining hypothesis to test is the guarded dispatch. `dispatch_from` instal
 `__builtin_setjmp` guard, and if a nested return trips it the guest stack is left as it was
 while the C stack unwinds - which would look exactly like this: a function returning with the
 frame above it already gone.
+
+
+## What ends the run: the program-mode gate, and a return to a mid-function address
+
+`dispatch_from` has the mechanism in full:
+
+```c
+const bool top_level = (g_depth == 0);
+...
+StopReason reason = trace_once(entry->function, state, va, memory);
+if (top_level && !g_program_mode) {
+    while (reason == StopReason::kReturned) { ... chase the return ... }
+}
+g_depth--;
+return reason;
+```
+
+So outside program mode a top-level return is chased to the next lifted function, and in
+program mode it simply ends the run. The entry stub is the top-level function, and a tail
+jump propagates the callee's return as this frame's return, so the whole stub -> startup ->
+... chain shares one stop state. Whatever the last link returns to becomes `g_stop_pc`.
+
+That value is `0x14000bfdd`, and it is a *return target*, not a return site: the range check
+puts `0x14000bec0`, `0x14000bf20` and `0x14000bfdd` all inside the single unwind range
+`0x14000bec0`..`0x14000c02c`, with `0x14000bdf0`..`0x14000bec0` before it and
+`0x14000c030`..`0x14000c049` after. So the chain finished by returning *into the middle of*
+`sub_14000bec0`.
+
+That is the shape of a call inside `sub_14000bec0` whose callee returned to `0xbfdd`, except
+`__remill_function_call` clears the stop state after a nested return precisely so that a
+caller which does not return itself cannot pass the callee's address off as its own. Either
+that clearing is not reached on this path, or the return is being propagated by the jump
+path, which does propagate deliberately. Distinguishing the two is the next step, and the
+trace already numbers the events needed to do it.
