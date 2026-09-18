@@ -190,7 +190,99 @@ SSE64_EXTRA = (
                  'ldmxcsr', 'stmxcsr'})
 )
 
-SSE64_MNEMONICS = SSE_MNEMONICS | SSE64_EXTRA
+# ---- packed integer ----
+#
+# The 32-bit lifter has none of these: a Win32 game of that era does its pixel
+# and audio conversion in x87 or by hand. A Win64 build has no x87 to fall back
+# on, so the compiler emits the pack/unpack/shift family freely, and UE3's
+# colour and texture paths are full of it.
+#
+# All of them are MMX as well as SSE, with mm0-7 and half the width. _xi raises
+# on an mm operand, which turns into a per-instruction TODO rather than a
+# silently 128-bit translation of 64-bit code.
+PUNPCK = {
+    'punpcklbw':  ('u8',  8, 0), 'punpckhbw':  ('u8',  8, 8),
+    'punpcklwd':  ('u16', 4, 0), 'punpckhwd':  ('u16', 4, 4),
+    'punpckldq':  ('u32', 2, 0), 'punpckhdq':  ('u32', 2, 2),
+    'punpcklqdq': ('u64', 1, 0), 'punpckhqdq': ('u64', 1, 1),
+}
+
+# (source field, destination field, low, high) - the saturation bounds are the
+# destination type's, and packuswb is the odd one: signed source, UNSIGNED
+# destination, which is what makes it the one used for colour clamping.
+PACK = {
+    'packsswb': ('i16', 'i8',  8, -0x80, 0x7f),
+    'packssdw': ('i32', 'i16', 4, -0x8000, 0x7fff),
+    'packuswb': ('i16', 'u8',  8, 0, 0xff),
+}
+
+PSHIFT = {
+    'psllw': ('u16', 8, 'l'), 'psrlw': ('u16', 8, 'r'), 'psraw': ('i16', 8, 'a'),
+    'pslld': ('u32', 4, 'l'), 'psrld': ('u32', 4, 'r'), 'psrad': ('i32', 4, 'a'),
+    'psllq': ('u64', 2, 'l'), 'psrlq': ('u64', 2, 'r'),
+}
+
+# Lane-wise, wrapping. The unsigned C types wrap the way the hardware does, so
+# the signed forms use the unsigned lane and differ only in the compare.
+PLANE = {
+    'paddb': ('u8', 16, '+'),  'paddw': ('u16', 8, '+'),
+    'paddd': ('u32', 4, '+'),  'paddq': ('u64', 2, '+'),
+    'psubb': ('u8', 16, '-'),  'psubw': ('u16', 8, '-'),
+    'psubd': ('u32', 4, '-'),  'psubq': ('u64', 2, '-'),
+}
+
+# (lane, count, signed, add, low, high)
+PSAT = {
+    'paddsb':  ('i8', 16, 1, 1, -0x80, 0x7f),
+    'paddsw':  ('i16', 8, 1, 1, -0x8000, 0x7fff),
+    'psubsb':  ('i8', 16, 1, 0, -0x80, 0x7f),
+    'psubsw':  ('i16', 8, 1, 0, -0x8000, 0x7fff),
+    'paddusb': ('u8', 16, 0, 1, 0, 0xff),
+    'paddusw': ('u16', 8, 0, 1, 0, 0xffff),
+    'psubusb': ('u8', 16, 0, 0, 0, 0xff),
+    'psubusw': ('u16', 8, 0, 0, 0, 0xffff),
+}
+
+# A lane compare writes all-ones or zero, not 0/1.
+PCMP = {
+    'pcmpeqb': ('u8', 16, '=='), 'pcmpeqw': ('u16', 8, '=='),
+    'pcmpeqd': ('u32', 4, '=='), 'pcmpeqq': ('u64', 2, '=='),
+    'pcmpgtb': ('i8', 16, '>'),  'pcmpgtw': ('i16', 8, '>'),
+    'pcmpgtd': ('i32', 4, '>'),
+}
+
+PMINMAX = {
+    'pminub': ('u8', 16, '<'),  'pmaxub': ('u8', 16, '>'),
+    'pminsw': ('i16', 8, '<'),  'pmaxsw': ('i16', 8, '>'),
+    'pminsb': ('i8', 16, '<'),  'pmaxsb': ('i8', 16, '>'),
+    'pminuw': ('u16', 8, '<'),  'pmaxuw': ('u16', 8, '>'),
+    'pminsd': ('i32', 4, '<'),  'pmaxsd': ('i32', 4, '>'),
+    'pminud': ('u32', 4, '<'),  'pmaxud': ('u32', 4, '>'),
+}
+
+# (lane, count, selector width, base lane) - pshufd picks four dwords across
+# the register; the lw/hw forms shuffle one half and copy the other.
+PSHUF = {
+    'pshufd':  ('u32', 4, 0, 4),
+    'pshuflw': ('u16', 4, 0, 8),
+    'pshufhw': ('u16', 4, 4, 8),
+}
+
+# The non-temporal stores. Identical to their ordinary forms here: the hint is
+# about the host's cache, which a recompiler is not managing. UE3's texture and
+# vertex uploads use them, so a 64-bit target meets them early.
+SSE64_MOV128 = frozenset({'movntps', 'movntpd', 'movntdq', 'movntdqa', 'lddqu'})
+
+PINTEGER_MISC = frozenset({
+    'pmullw', 'pmulhw', 'pmulhuw', 'pmaddwd', 'pavgb', 'pavgw',
+    'pmovmskb', 'pslldq', 'psrldq', 'pextrw', 'pinsrw', 'pshufb',
+})
+
+SSE64_MNEMONICS = (SSE_MNEMONICS | SSE64_EXTRA
+                   | frozenset(PUNPCK) | frozenset(PACK) | frozenset(PSHIFT)
+                   | frozenset(PLANE) | frozenset(PSAT) | frozenset(PCMP)
+                   | frozenset(PMINMAX) | frozenset(PSHUF) | PINTEGER_MISC
+                   | SSE64_MOV128)
 
 
 class Lifter:
@@ -201,6 +293,7 @@ class Lifter:
         self.func_start = 0
         self.func_end = 0
         self.jumptables = {}
+        self.lea_targets = set()          # rip-relative addresses taken by lea
         self.md = Cs(CS_ARCH_X86, CS_MODE_64)
         self.md.detail = True
 
@@ -421,6 +514,200 @@ class Lifter:
         s = ops[1] if len(ops) > 1 else None
         ea = insn.address
 
+        # ---- packed integer ----
+        if m in PLANE:
+            fld, n, op = PLANE[m]
+            k = self._xi(d)
+            out = ['{ XMM _s = %s;' % self._xm(insn, s)]
+            for i in range(n):
+                out.append(' c->xmm[%d].%s[%d] %s= _s.%s[%d];' % (k, fld, i, op, fld, i))
+            out.append(' }')
+            return [''.join(out)]
+
+        if m in PSAT:
+            fld, n, _sgn, add, lo, hi = PSAT[m]
+            k = self._xi(d)
+            cast = ('int%s_t' if fld[0] == 'i' else 'uint%s_t') % fld[1:]
+            out = ['{ XMM _d = c->xmm[%d], _s = %s; int64_t _v;' % (k, self._xm(insn, s))]
+            for i in range(n):
+                out.append(' _v = (int64_t)_d.%s[%d] %s (int64_t)_s.%s[%d];'
+                           ' c->xmm[%d].%s[%d] = (%s)(_v < %d ? %d : _v > %d ? %d : _v);'
+                           % (fld, i, '+' if add else '-', fld, i,
+                              k, fld, i, cast, lo, lo, hi, hi))
+            out.append(' }')
+            return [''.join(out)]
+
+        if m in PCMP:
+            fld, n, op = PCMP[m]
+            k = self._xi(d)
+            ufld = 'u' + fld[1:]
+            ones = (1 << (128 // n)) - 1
+            out = ['{ XMM _d = c->xmm[%d], _s = %s;' % (k, self._xm(insn, s))]
+            for i in range(n):
+                out.append(' c->xmm[%d].%s[%d] = (_d.%s[%d] %s _s.%s[%d])'
+                           ' ? UINT64_C(%d) : 0;'
+                           % (k, ufld, i, fld, i, op, fld, i, ones))
+            out.append(' }')
+            return [''.join(out)]
+
+        if m in PMINMAX:
+            fld, n, op = PMINMAX[m]
+            k = self._xi(d)
+            out = ['{ XMM _d = c->xmm[%d], _s = %s;' % (k, self._xm(insn, s))]
+            for i in range(n):
+                out.append(' c->xmm[%d].%s[%d] = _d.%s[%d] %s _s.%s[%d]'
+                           ' ? _d.%s[%d] : _s.%s[%d];'
+                           % (k, fld, i, fld, i, op, fld, i, fld, i, fld, i))
+            out.append(' }')
+            return [''.join(out)]
+
+        if m in PSHUF:
+            fld, n, base, total = PSHUF[m]
+            k = self._xi(d)
+            imm = ops[2].imm & 0xFF
+            sel = [(imm >> (2 * i)) & 3 for i in range(4)]
+            out = ['{ XMM _s = %s;' % self._xm(insn, s)]
+            # The half this form does not touch is still COPIED, because the
+            # source may be memory or another register.
+            for i in range(total):
+                if base <= i < base + n:
+                    out.append(' c->xmm[%d].%s[%d] = _s.%s[%d];'
+                               % (k, fld, i, fld, base + sel[i - base]))
+                else:
+                    out.append(' c->xmm[%d].%s[%d] = _s.%s[%d];' % (k, fld, i, fld, i))
+            out.append(' }')
+            return [''.join(out)]
+
+        if m in ('pmullw', 'pmulhw', 'pmulhuw'):
+            k = self._xi(d)
+            fld = 'u16' if m == 'pmulhuw' else 'i16'
+            shift = 0 if m == 'pmullw' else 16
+            out = ['{ XMM _d = c->xmm[%d], _s = %s;' % (k, self._xm(insn, s))]
+            for i in range(8):
+                out.append(' c->xmm[%d].u16[%d] = (uint16_t)(((int32_t)_d.%s[%d] *'
+                           ' (int32_t)_s.%s[%d]) >> %d);'
+                           % (k, i, fld, i, fld, i, shift))
+            out.append(' }')
+            return [''.join(out)]
+
+        if m == 'pmaddwd':
+            k = self._xi(d)
+            out = ['{ XMM _d = c->xmm[%d], _s = %s;' % (k, self._xm(insn, s))]
+            for i in range(4):
+                out.append(' c->xmm[%d].i32[%d] = (int32_t)_d.i16[%d] * _s.i16[%d]'
+                           ' + (int32_t)_d.i16[%d] * _s.i16[%d];'
+                           % (k, i, 2 * i, 2 * i, 2 * i + 1, 2 * i + 1))
+            out.append(' }')
+            return [''.join(out)]
+
+        if m in ('pavgb', 'pavgw'):
+            k = self._xi(d)
+            fld, n = ('u8', 16) if m == 'pavgb' else ('u16', 8)
+            cast = 'uint8_t' if m == 'pavgb' else 'uint16_t'
+            out = ['{ XMM _d = c->xmm[%d], _s = %s;' % (k, self._xm(insn, s))]
+            for i in range(n):
+                out.append(' c->xmm[%d].%s[%d] = (%s)(((uint32_t)_d.%s[%d] +'
+                           ' _s.%s[%d] + 1) >> 1);'
+                           % (k, fld, i, cast, fld, i, fld, i))
+            out.append(' }')
+            return [''.join(out)]
+
+        if m == 'pmovmskb':
+            n = self._xi(s)
+            expr = ' | '.join('((uint32_t)(c->xmm[%d].u8[%d] >> 7) << %d)'
+                              % (n, i, i) for i in range(16))
+            return [self.dst_write(insn, d, '(%s)' % expr)]
+
+        if m in ('pslldq', 'psrldq'):
+            # A whole-register BYTE shift, not a lane shift - the one member of
+            # the family whose count is in bytes.
+            k = self._xi(d)
+            nb = min(ops[1].imm & 0xFF, 16)
+            left = m == 'pslldq'
+            out = ['{ XMM _d = c->xmm[%d];' % k]
+            for i in range(16):
+                src = i - nb if left else i + nb
+                out.append(' c->xmm[%d].u8[%d] = %s;'
+                           % (k, i, ('_d.u8[%d]' % src) if 0 <= src < 16 else '0'))
+            out.append(' }')
+            return [''.join(out)]
+
+        if m == 'pshufb':
+            k = self._xi(d)
+            out = ['{ XMM _d = c->xmm[%d], _s = %s;' % (k, self._xm(insn, s))]
+            for i in range(16):
+                out.append(' c->xmm[%d].u8[%d] = (_s.u8[%d] & 0x80) ? 0 :'
+                           ' _d.u8[_s.u8[%d] & 15];' % (k, i, i, i))
+            out.append(' }')
+            return [''.join(out)]
+
+        if m == 'pextrw':
+            n = self._xi(s)
+            return [self.dst_write(insn, d,
+                                   '(uint32_t)c->xmm[%d].u16[%d]'
+                                   % (n, ops[2].imm & 7))]
+
+        if m == 'pinsrw':
+            k = self._xi(d)
+            return ['c->xmm[%d].u16[%d] = (uint16_t)(%s);'
+                    % (k, ops[2].imm & 7, self.src(insn, s))]
+
+        if m in PUNPCK:
+            fld, n, base = PUNPCK[m]
+            k = self._xi(d)
+            out = ['{ XMM _d = c->xmm[%d], _s = %s;' % (k, self._xm(insn, s))]
+            for i in range(n):
+                out.append(' c->xmm[%d].%s[%d] = _d.%s[%d];'
+                           % (k, fld, 2 * i, fld, base + i))
+                out.append(' c->xmm[%d].%s[%d] = _s.%s[%d];'
+                           % (k, fld, 2 * i + 1, fld, base + i))
+            out.append(' }')
+            return [''.join(out)]
+
+        if m in PACK:
+            sf, df, n, lo, hi = PACK[m]
+            k = self._xi(d)
+            out = ['{ XMM _d = c->xmm[%d], _s = %s; int64_t _v;' % (k, self._xm(insn, s))]
+            for i in range(2 * n):
+                src = '_d' if i < n else '_s'
+                j = i if i < n else i - n
+                cast = ('int%s_t' if df[0] == 'i' else 'uint%s_t') % df[1:]
+                out.append(' _v = %s.%s[%d];'
+                           ' c->xmm[%d].%s[%d] = (%s)(_v < %d ? %d : _v > %d ? %d : _v);'
+                           % (src, sf, j, k, df, i, cast, lo, lo, hi, hi))
+            out.append(' }')
+            return [''.join(out)]
+
+        if m in PSHIFT:
+            fld, n, kind = PSHIFT[m]
+            k = self._xi(d)
+            if s.type == X86_OP_IMM:
+                cnt = 'UINT64_C(%d)' % (s.imm & 0xFF)
+            elif self._is_xmm(s):
+                cnt = 'c->xmm[%d].u64[0]' % self._xi(s)
+            else:
+                return [_todo(ea, '%s %s' % (m, insn.op_str))]
+            width = {'u16': 16, 'i16': 16, 'u32': 32, 'i32': 32, 'u64': 64}[fld]
+            out = ['{ uint64_t _n = %s;' % cnt]
+            # A count at or past the width zeroes the lanes, except for an
+            # arithmetic shift, which saturates to the sign. Not an edge case:
+            # `psrad xmm, 31` broadcasting a sign mask is the idiom this family
+            # is mostly used for, and 31 is one short of the cliff.
+            if kind == 'a':
+                out.append(' if (_n > %d) _n = %d;' % (width - 1, width - 1))
+                body = ' c->xmm[%d].%s[%%d] = (%s)(c->xmm[%d].%s[%%d] >> _n);' \
+                       % (k, fld, fld.replace('i', 'int') + '_t', k, fld)
+            else:
+                out.append(' if (_n > %d) _n = %d;' % (width, width))
+                op = '<<' if kind == 'l' else '>>'
+                body = ' c->xmm[%d].%s[%%d] = _n == %d ? 0 :' \
+                       ' (c->xmm[%d].%s[%%d] %s _n);' \
+                       % (k, fld, width, k, fld, op)
+            for i in range(n):
+                out.append(body % (i, i))
+            out.append(' }')
+            return [''.join(out)]
+
         # ---- scalar moves ----
         if m in ('movss', 'movsd'):
             wide = m == 'movsd'
@@ -459,7 +746,7 @@ class Lifter:
                     % (self.addr_expr(insn, d), self._xi(s))]
 
         # ---- 128-bit moves ----
-        if m in SSE_MOV128:
+        if m in SSE_MOV128 or m in SSE64_MOV128:
             if self._is_xmm(d):
                 return ['c->xmm[%d] = %s;' % (self._xi(d), self._xm(insn, s))]
             return ['wrxm(%s, c->xmm[%d]);' % (self.addr_expr(insn, d), self._xi(s))]
@@ -771,6 +1058,16 @@ class Lifter:
             return [self.dst_write(insn, d, self.src_ext(insn, s, d.size))]
         if m == 'lea':
             d, s = two()
+            # `lea r64, [rip+disp]` is how x64 takes an address, and when the
+            # address is code it is a function pointer - a sort predicate, a
+            # callback, a hand-built vtable. Nothing CALLS those, and they do
+            # not appear in .reloc either because the address is computed and
+            # not stored, so the catalog has no other way to learn about them.
+            # Recorded rather than acted on here: generate64 decides which of
+            # them really are entries.
+            if s.type == X86_OP_MEM and s.mem.base == X86_REG_RIP:
+                self.lea_targets.add(
+                    (insn.address + insn.size + s.mem.disp) & 0xFFFFFFFFFFFFFFFF)
             return [reg_write(self.rname(d.reg), self.addr_expr(insn, s))]
         if m == 'movzx':
             d, s = two()
@@ -1088,13 +1385,21 @@ class Lifter:
         if m == 'call':
             t = ops[0]
             tgt = self._target(insn, t)
+            # c->rip is restored to the RETURN address after the call.
+            #
+            # Without this the guest PC keeps whatever block the callee last
+            # entered, so a fault in the caller is reported against the callee -
+            # and for a one-instruction IAT thunk like `jmp [__imp_memset]` that
+            # reads as "the crash is in memset", which is both wrong and
+            # convincing. One store per call buys a PC that means what it says.
             if t.type == X86_OP_IMM:
-                return ['push64(c, 0x%Xull); dispatch(c, %s);' % (nxt, tgt)]
+                return ['push64(c, 0x%Xull); dispatch(c, %s); c->rip = 0x%Xull;'
+                        % (nxt, tgt, nxt)]
             # Resolve the target BEFORE pushing: `call qword ptr [rsp+0x18]`
             # reads its target with the pre-push rsp, and pushing first shifts
             # every rsp-relative operand by 8.
             return ['{ uint64_t _ct = %s; push64(c, 0x%Xull); dispatch(c, _ct); }'
-                    % (tgt, nxt)]
+                    ' c->rip = 0x%Xull;' % (tgt, nxt, nxt)]
 
         if m in ('ret', 'retn'):
             n = (ops[0].imm if ops and ops[0].type == X86_OP_IMM else 0)
@@ -1139,7 +1444,7 @@ class Lifter:
         if m == 'cmc':
             return ['c->cf = !c->cf;']
         if m == 'cpuid':
-            return [_todo(ea, 'cpuid')]
+            return ['do_cpuid(c);']
         if m == 'xlatb':
             return ['SET8L(c->rax, rd8(c->rbx + R8L(c->rax)));']
 
@@ -1224,6 +1529,8 @@ class Lifter:
                 break
         return targets
 
+    eh_funcs = frozenset()
+
     def lift_function(self, code, start, name=None):
         self.jumptables = {}
         insns = list(self.md.disasm(code, start))
@@ -1280,16 +1587,40 @@ class Lifter:
         has_indirect = any(
             i.mnemonic == 'jmp' and i.operands and i.operands[0].type != X86_OP_IMM
             for i in insns)
-        if has_indirect:
+
+        # A function the original built with a try/catch needs the same
+        # local dispatch, for the same reason: a catch resumes at a
+        # continuation address the handler funclet picks at run time, which
+        # is an indirect jump into the middle of this body by another name.
+        # See runtime eh64.c - without the landing pad a guest throw has
+        # nowhere to land, and a failure the game would have swallowed
+        # kills the process instead.
+        has_eh = start in self.eh_funcs
+        if has_indirect or has_eh:
             labels = set(insn_addrs)
 
         fname = name or ('L_%012X' % start)
         out = ['void %s(CPU *c)' % fname, '{']
-        if has_indirect:
+        # The entry is a block leader too, and it is not always in `labels`.
+        out.append('    c->rip = 0x%Xull;' % start)
+        if has_indirect or has_eh:
             out.append('    uint64_t _ind = 0;')
+        if has_eh:
+            out.append('    ES3_EH_ENTER(0x%Xull);' % start)
         for ins in insns:
             if ins.address in labels:
                 out.append('L_%012X:' % ins.address)
+                # The guest PC, maintained at basic-block granularity.
+                #
+                # A fault in generated C reports a HOST address, and there is no
+                # way back from that to the guest instruction - the lifted body
+                # has no relation to the original layout. One store per block
+                # gives the fault handler a guest address to name, locating a
+                # crash to within a few instructions instead of within a
+                # function that may be two thousand bytes long. Per instruction
+                # would be exact and cost far more; per block is free next to
+                # the dispatch it already went through.
+                out.append('    c->rip = 0x%Xull;' % ins.address)
             # Per instruction, not per function. A single operand the lifter
             # cannot express - a segment-register move, capstone's `riz`
             # pseudo-index, a 1-byte gs: access - is data that the extent
@@ -1317,7 +1648,7 @@ class Lifter:
             out.append('    /* extent ends mid-function: fall through */')
             out.append('    dispatch(c, 0x%Xull); return;' % nxt)
 
-        if has_indirect:
+        if has_indirect or has_eh:
             # The local label dispatch. A computed target inside this function
             # becomes a goto; anything else is a real cross-function tail call
             # and goes to the global dispatcher, which is also what catches a
@@ -1330,6 +1661,9 @@ class Lifter:
             out.append('    }')
 
         out.append('}')
+        if has_eh:
+            out = [ln.replace('return;', 'ES3_EH_LEAVE(); return;')
+                   for ln in out]
         return '\n'.join(out)
 
 

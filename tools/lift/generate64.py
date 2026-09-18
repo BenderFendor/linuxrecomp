@@ -180,6 +180,100 @@ def reloc_code_pointers(data, base, secs, reloc_rva, reloc_sz, text_lo, text_hi)
     return out
 
 
+_CODE_MD = None
+
+
+def plausible_code(read_va, va):
+    """Does this address look like the start of a function rather than data?
+
+    A rip-relative lea into .text is as often a jump table, a string, or a
+    constant pool as it is a function pointer, and adding the data ones costs a
+    translation unit each and lifts garbage. Requiring a few instructions to
+    decode, with no int3 or privileged instruction among them, separates the
+    two cheaply - a real entry always begins with a prologue or a load.
+    """
+    global _CODE_MD
+    if _CODE_MD is None:
+        from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+        _CODE_MD = Cs(CS_ARCH_X86, CS_MODE_64)
+    try:
+        code = read_va(va, 16)
+    except Exception:
+        return False
+    n = 0
+    for ins in _CODE_MD.disasm(code, va):
+        if ins.mnemonic in ('int3', 'in', 'out', 'hlt', 'iretd', 'iretq',
+                            'cli', 'sti', 'lock', 'salc', 'bound'):
+            return False
+        n += 1
+        if n >= 3:
+            return True
+    return False
+
+
+def eh_tables(data, base, secs):
+    """Function starts that had a C++ try/catch, and the catch funclets.
+
+    The lifted body of such a function needs a landing pad (see lift64_cpu's
+    has_eh and runtime eh64.c), and the funclets are entries no disassembler
+    finds by following control flow: nothing CALLS them, .xdata names them.
+    """
+    pe = struct.unpack_from('<I', data, 0x3c)[0]
+    dd = pe + 0x18 + 0x70 + 3 * 8
+    pd_rva, pd_size = struct.unpack_from('<II', data, dd)
+    if not pd_rva or not pd_size:
+        return frozenset(), frozenset()
+    off = rva_to_off(secs, pd_rva)
+    starts, handlers = set(), set()
+
+    def u32(rva):
+        o = rva_to_off(secs, rva)
+        return struct.unpack_from('<I', data, o)[0] if o is not None else 0
+
+    for i in range(pd_size // 12):
+        begin, end, unwind = struct.unpack_from('<III', data, off + 12 * i)
+        seen = 0
+        while unwind and seen < 8:
+            seen += 1
+            uo = rva_to_off(secs, unwind)
+            if uo is None:
+                break
+            ver_flags = data[uo]
+            ncodes = data[uo + 2]
+            tail = unwind + 4 + ((ncodes + 1) & ~1) * 2
+            if ver_flags & 0x20:                       # UNW_FLAG_CHAININFO
+                unwind = u32(tail + 8)
+                continue
+            if not (ver_flags & 0x08):                 # UNW_FLAG_EHANDLER
+                break
+            fi = u32(tail + 4)
+            if not fi:
+                break
+            fo = rva_to_off(secs, fi)
+            if fo is None:
+                break
+            magic, _max, _um, ntry, trymap = struct.unpack_from('<IiiiI', data, fo)
+            # 0x1993052x is MSVC's; any other personality routine keeps its own
+            # shape behind that pointer and is not ours to read.
+            if magic & 0xfffffff0 != 0x19930520:
+                break
+            starts.add(base + begin)
+            to = rva_to_off(secs, trymap)
+            if to is None or ntry <= 0 or ntry > 4096:
+                break
+            for t in range(ntry):
+                _lo, _hi, _ch, nc, ha = struct.unpack_from('<iiiiI', data, to + 20 * t)
+                ho = rva_to_off(secs, ha)
+                if ho is None or nc <= 0 or nc > 256:
+                    continue
+                for k in range(nc):
+                    hv = struct.unpack_from('<I', data, ho + 20 * k + 12)[0]
+                    if hv:
+                        handlers.add(base + hv)
+            break
+    return frozenset(starts), frozenset(handlers)
+
+
 def main():
     argv = sys.argv[1:]
     split = 400
@@ -258,6 +352,25 @@ def main():
         print('[*] %d stored code pointers were not in the catalog (%d relocated '
               'pointers into .text)' % (added_ptr, len(ptrs)))
 
+    # C++ exception handling. The funclets go in as entries, and the functions
+    # that had handlers are marked so the lifter gives them a landing pad.
+    eh_starts, eh_handlers = eh_tables(data, base, secs)
+    lf.eh_funcs = eh_starts
+    starts = sorted(bounds)
+    added_eh = 0
+    for t in sorted(eh_handlers):
+        if t in bounds:
+            continue
+        i = bisect.bisect_right(starts, t)
+        end_of = starts[i] if i < len(starts) else text_hi
+        size = min(end_of - t, 0x10000)
+        if size > 0:
+            bounds[t] = (size, 'sub_%X_catch' % t)
+            added_eh += 1
+    if eh_starts:
+        print('[*] C++ EH: %d functions with handlers, %d catch funclets '
+              '(%d new entries)' % (len(eh_starts), len(eh_handlers), added_eh))
+
     bodies = {}
     pending = sorted(bounds)
     rounds = 0
@@ -271,6 +384,17 @@ def main():
             bodies[va] = body
             for m in DISPATCH_RE.finditer(body):
                 targets.add(int(m.group(1), 16))
+        # Addresses the round's code TOOK rather than called. An entry found
+        # this way is a callback the disassembler had no path to: it is called
+        # only through the pointer, so nothing in .text names it and, because
+        # the address is computed with a rip-relative lea rather than stored,
+        # .reloc does not either. Filtered to what actually decodes as code,
+        # since a lea into .text is just as often a jump table or a literal.
+        for t in lf.lea_targets:
+            if text_lo <= t < text_hi and t not in bounds and plausible_code(read_va, t):
+                targets.add(t)
+        lf.lea_targets.clear()
+
         known = set(bounds)
         starts = sorted(known)
         new = []

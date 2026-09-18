@@ -42,6 +42,12 @@ typedef union {
     int32_t  i32[4];
     int64_t  i64[2];
     uint8_t  u8[16];
+    /* The narrow lanes the packed-integer ops work in. A 32-bit target never
+     * needed these because its compiler had x87 to convert with; a Win64 one
+     * has only SSE, so pack/unpack/shift of bytes and words is everywhere. */
+    int8_t   i8[16];
+    uint16_t u16[8];
+    int16_t  i16[8];
 } XMM;
 
 typedef struct {
@@ -181,6 +187,23 @@ static inline void eflags_unpack(CPU *c, uint64_t v) {
  * there is no STACK_BASE hook to leave open. */
 static inline void push64(CPU *c, uint64_t v) { c->rsp -= 8; wr64(c->rsp, v); }
 static inline uint64_t pop64(CPU *c) { uint64_t v = rd64(c->rsp); c->rsp += 8; return v; }
+
+/* ---- cpuid ----
+ * Forwarded to the host, which is the same architecture: the guest is asking
+ * what this CPU can do, and the lifted code will run on this CPU. Making up an
+ * answer would either hide SSE levels the host has or promise ones it does
+ * not. */
+static inline void do_cpuid(CPU *c)
+{
+    int r[4] = { 0, 0, 0, 0 };
+#if defined(_MSC_VER)
+    __cpuidex(r, (int)(uint32_t)c->rax, (int)(uint32_t)c->rcx);
+#endif
+    SET32(c->rax, (uint32_t)r[0]);
+    SET32(c->rbx, (uint32_t)r[1]);
+    SET32(c->rcx, (uint32_t)r[2]);
+    SET32(c->rdx, (uint32_t)r[3]);
+}
 
 #ifndef RECOMP_TODO
 #define RECOMP_TODO(va, text) abort()
@@ -567,5 +590,10 @@ static inline uint32_t sse_movmskpd(const XMM *x) {
 /* ---- control transfer, provided by the generated dispatch table ---- */
 void dispatch(CPU *c, uint64_t target);
 void dispatch_jmp(CPU *c, uint64_t target);
+
+/* Guest C++ exception handling. Included here, after the CPU typedef, so
+ * that every generated translation unit gets the ES3_EH_ENTER macros the
+ * lifter emits without the generator having to add an include. */
+#include "eh64.h"
 
 #endif /* RECOMP_CPU64_H */
