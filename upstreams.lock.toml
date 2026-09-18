@@ -1,0 +1,72 @@
+# Pinned on 2026-09-18. Update intentionally, not implicitly.
+
+[pcrecomp]
+url = "https://github.com/sp00nznet/pcrecomp.git"
+rev = "534e4b75f65b0ea809db6173522f825b52d399d6"
+license = "MIT"
+mode = "fork-base"
+
+[remill]
+url = "https://github.com/lifting-bits/remill.git"
+rev = "56918a8c2554088e93389e97d292f4035286506c"
+license = "Apache-2.0"
+mode = "direct-dependency"
+required = true
+
+[wine]
+url = "https://gitlab.winehq.org/wine/wine.git"
+tag = "wine-11.15"
+license = "LGPL-2.1-or-later"
+mode = "system-provided"
+required = true
+verified = "wine-11.15: winegcc + winebuild present, 622 PE DLLs in /usr/lib/wine/x86_64-windows, winelib import libs in /usr/lib/wine/x86_64-unix; all probes in scripts/check-winelib.sh pass"
+note = "Win32 API layer. The runtime links Wine's DLLs through winelib instead of reimplementing them. No source checkout is pinned yet because nothing in the build clones Wine; clone this tag only when reading Wine's implementation of a specific API."
+
+[dxvk]
+url = "https://github.com/doitsujin/dxvk.git"
+rev = "7df3596eed49cb79f07c18869a1a9a8c067efe04"
+license = "zlib"
+mode = "direct-dependency"
+required = false
+note = "Two distinct roles. (1) Drop-in replacement for Wine's d3d8/d3d9/d3d10core/d3d11/dxgi DLLs via native DLL overrides, per upstream README. (2) DXVK Native, which the same tree now carries: no Wine at all, WSI backend selected with DXVK_WSI_DRIVER (SDL3, SDL2, GLFW). Building either needs wine 10.0+ and mingw-w64. Wine's own d3d11/wined3d is the default path; DXVK is the alternative when it is not enough."
+
+[dxvk_native_reference]
+url = "https://github.com/misyltoad/dxvk-native.git"
+rev = "c8dc91fabd00cac11d697ccf07426e798393cd40"
+license = "zlib"
+mode = "reference-only"
+required = false
+note = "Historical native-port reference; do not use as the primary DXVK dependency."
+
+[faudio]
+url = "https://github.com/FNA-XNA/FAudio.git"
+rev = "2af4f0027861f846545d322377ff3355eadf52aa"
+license = "zlib"
+mode = "direct-dependency"
+required = false
+note = "XAudio2, X3DAudio, XAPO and XACT3 reimplementation, SDL3 3.2+ backend, exports a C API (FAudio_*). Wine's own xaudio2_0..xaudio2_9 DLLs are the default path for XAudio2 imports; FAudio is the alternative when a target needs behaviour or a version Wine does not provide, and reaching it means writing a thunk from the guest's COM-shaped calls to the FAudio_* API."
+
+[rellic]
+url = "https://github.com/lifting-bits/rellic.git"
+rev = "370abaad86ae5adad82f85b81aff14557462b7f2"
+license = "Apache-2.0"
+mode = "external-tool"
+required = false
+note = "LLVM bitcode -> structured C for debugging/inspection."
+
+[anvill]
+url = "https://github.com/lifting-bits/anvill.git"
+rev = "9948d26cd993952d6010a59f27a198cbe3c79c1d"
+license = "AGPL-3.0"
+mode = "external-tool"
+required = false
+note = "Useful whole-program lifting reference/backend. Main branch consumes protobuf specs; keep out of the MIT-linked core."
+
+[revng]
+url = "https://github.com/revng/revng.git"
+rev = "1e33c335935ba43286017760ff396112914d4f6b"
+branch = "develop"
+license = "GPL-2.0"
+mode = "external-tool"
+required = false
+note = "Secondary lifting/decompilation/validation backend. Keep process-separated from the MIT core."

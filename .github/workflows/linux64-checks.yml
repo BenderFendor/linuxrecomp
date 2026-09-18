@@ -1,0 +1,22 @@
+name: linux64 checks
+
+# Reconnaissance is stdlib-only and its self-test builds a synthetic PE32+
+# image in memory, so this runs on a stock runner with no Wine, no MinGW and no
+# fixtures. The Win32-layer probes need Wine and stay a local check
+# (scripts/check-winelib.sh).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Recon self-test (synthetic PE32+ image + spec validation)
+        run: python -m tools.linux64 selftest

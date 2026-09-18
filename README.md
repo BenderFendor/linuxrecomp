@@ -1,4 +1,19 @@
-# pcrecomp
+# linuxrecomp
+
+A fork of **[sp00nznet/pcrecomp](https://github.com/sp00nznet/pcrecomp)** that
+extends the toolbox from 16/32-bit PC software to **64-bit Windows**: PE32+/AMD64
+programs recompiled to native Linux executables, with the Win32 API taken from
+Wine's own DLLs through winelib rather than reimplemented — and without running
+the guest program on Wine's loader or emulating a single instruction.
+
+Start here: [README-LINUX64.md](README-LINUX64.md), then
+[docs/linux64/RECON.md](docs/linux64/RECON.md) for the program spec,
+[docs/linux64/WINE.md](docs/linux64/WINE.md) for the Win32 layer, and
+[docs/linux64/ROADMAP.md](docs/linux64/ROADMAP.md) for what is done and what is
+next.
+
+The rest of this file documents the upstream toolbox this fork builds on; the
+16-bit and 32-bit paths are unchanged.
 
 ```
     ____  ______   ____  ________________  __  ___ ____

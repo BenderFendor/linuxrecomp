@@ -42,3 +42,7 @@ desktop.ini
 
 # Claude
 .claude/
+
+# linux64 extension: pinned third-party checkouts and per-target work state
+.deps/
+work/linux64/

@@ -1,0 +1,118 @@
+# Bring-up roadmap
+
+Rule: the smallest executable that proves the next boundary. Do not start a full
+game while the preceding boundary is untested. Every milestone lists a check that
+can be run and that fails loudly.
+
+Last revised: 2026-09-18 (after P0 and P1 were completed, and after the Win32
+layer was decided to be Wine's own DLLs — see `WINE.md`).
+
+## P0 — fork + reproducible dependencies — **done**
+
+Acceptance, and the evidence:
+
+* overlay applied to a fork of `sp00nznet/pcrecomp`, upstream history preserved
+  (`git log` reaches `534e4b7`, the revision pinned in `upstreams.lock.toml`).
+* `python -m tools.linux64 doctor` exits 0 on this machine: git, cmake, clang,
+  MinGW-w64, Wine 11.15 with `winegcc`/`winebuild` and PE DLLs, Ghidra 12.1.2
+  headless, `llvm-config`/`opt`/`llc`.
+* `./scripts/build-win64-fixtures.sh` builds `return42.exe` and `kernel32.exe`.
+* upstream self-tests still behave as they did before the fork: 13 pass
+  (`pe_analyze`, `catalog`, `rsrc`, `map_names`, `merge_names`, `debug_symbols`,
+  `rtti`, `score_recovery`, `isextract`, `audit_repo`, `recomp16` CPU self-test,
+  `recomp32_cpu` CPU self-test), 10 blocked by missing optional dependencies
+  (`capstone` for the disassemblers and lifters, the Windows SDK x86 tree for
+  `stdcall_argc`, MinGW's `intrin.h` for the hybrid self-test), 1 pre-existing
+  compile failure in `runtime/recomp32/mmx_selftest.c` (`ptrdiff_t` used without
+  including `<stddef.h>`), recorded here as unrelated debt, not fixed.
+
+## P1 — PE64 reconnaissance — **done**
+
+Acceptance, and the evidence:
+
+* identifies PE32+ AMD64 and rejects PE32 with a message naming the 32-bit
+  pipeline;
+* emits image base, entry point, sections, imports, exports, relocations, TLS,
+  data directories, `.pdata` unwind records, and function ranges as guest VAs;
+* serialises and schema-validates `work/linux64/program.json` before writing;
+* Ghidra headless emits bounds for a fixture and they merge as `source: ghidra`;
+* cross-checked against `x86_64-w64-mingw32-objdump` and against the raw
+  `.reloc`/`.tls` bytes — numbers in `RECON.md`;
+* parses Wine's 450 KB `kernel32.dll` with 2,668 functions and no range problems;
+* `python -m tools.linux64 selftest` passes, including a synthetic PE32+ image
+  that needs no compiler.
+
+## P2 — one AMD64 function → LLVM → host execution
+
+Target: `return42.exe`.
+
+* build Remill (`bootstrap-linux64.sh` checks it out; building it is a separate,
+  explicit step because of LLVM version constraints);
+* lift one known function from `program.json`;
+* compile the bitcode with the host LLVM;
+* execute it in a Linux harness and compare registers/flags/memory against a
+  reference execution of the same bytes.
+
+## P3 — whole-program direct control flow
+
+* dispatcher keyed by guest VA; direct calls and jumps work;
+* original `.rdata`/`.data` bytes are readable at their guest addresses;
+* function-level differential tests are deterministic;
+* extend reconnaissance to direct call/jump edges and indirect-call sites.
+
+## P4 — imports through the Win32 layer
+
+Target: `kernel32.exe` fixture.
+
+* IAT slots resolve to Wine's exports through the winelib host module;
+* callbacks return into lifted code (already proven possible by
+  `tests/winelib/callback.c`);
+* `Sleep`, `GetTickCount64`, console and file paths work;
+* no shim is written for an import that exists in Wine.
+
+## P5 — window and input
+
+Target: a lifted PE64 program that creates a window.
+
+* USER32-style calls reach Wine's `user32.dll` from lifted code;
+* message loop, keyboard and mouse paths work;
+* window procedure callbacks land in lifted code.
+* GUI checks cannot run headless; this milestone adds the first probe that needs
+  a display (see the note in `WINE.md`).
+
+## P6 — rendering
+
+Target: a tiny D3D11 triangle fixture.
+
+* default path: Wine's `d3d11.dll` + `dxgi.dll` (wined3d → Vulkan/OpenGL);
+* alternative path: DXVK's DLLs as drop-in replacements via DLL overrides, or
+  DXVK Native (`DXVK_WSI_DRIVER=SDL3`) if Wine's implementation proves
+  inadequate for a target;
+* acceptance: stable frames, no Wine guest execution, no reimplemented D3D.
+
+## P7 — audio
+
+Target: a tiny tone/buffer fixture.
+
+* default path: Wine's `xaudio2_8.dll`;
+* alternative: FAudio behind a thunk from the guest's XAudio2 calls to the
+  `FAudio_*` API;
+* acceptance: voice creation, buffer submission, and a callback into lifted code.
+
+## P8 — C++/MSVC hard cases
+
+Added as a real target demands them: `.pdata`/`.xdata` handler bodies, MSVC
+RTTI/vtables, adjustor thunks, TLS callbacks, SEH/C++ exception strategy, delay
+imports, COM boundaries, indirect calls and function pointers.
+
+## P9 — first real game
+
+Pick a legally usable, unprotected PE64 target with modest imports before MKX,
+Injustice or DBFZ. Acceptance is incremental: process bootstrap → window →
+renderer init → audio → first interactive frame.
+
+## Later optimization
+
+Only after correctness: direct LLVM call lowering, removing unnecessary CPU-state
+loads and stores, recovering selected signatures, `ms_abi` host functions where
+they simplify a boundary, LTO/PGO, and native replacements for hot shims.

@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/BenderFendor/linuxrecomp/tools/linux64/spec_schema.json",
+  "title": "linuxrecomp program specification v1",
+  "description": "Reconnaissance output for one PE32+/AMD64 image. Every address is a guest virtual address (image base applied) unless the field name ends in _rva or _offset. This document is the only contract between reconnaissance and the lifting backends.",
+  "type": "object",
+  "required": ["format", "arch", "image", "sections", "functions", "imports"],
+  "additionalProperties": false,
+  "properties": {
+    "format": {"const": "linuxrecomp-spec-v1"},
+    "arch": {"const": "amd64"},
+    "generator": {"$ref": "#/$defs/generator"},
+    "image": {"$ref": "#/$defs/image"},
+    "sections": {"type": "array", "items": {"$ref": "#/$defs/section"}},
+    "directories": {"type": "array", "items": {"$ref": "#/$defs/directory"}},
+    "functions": {"type": "array", "items": {"$ref": "#/$defs/function"}},
+    "imports": {"type": "array", "items": {"$ref": "#/$defs/import"}},
+    "import_dlls": {"type": "array", "items": {"type": "string"}},
+    "exports": {"type": "array", "items": {"$ref": "#/$defs/export"}},
+    "relocations": {"type": "array", "items": {"$ref": "#/$defs/relocation"}},
+    "tls": {"type": ["object", "null"], "additionalProperties": false,
+      "required": ["raw_start_va", "raw_end_va", "index_va", "callbacks_va", "callbacks", "zero_fill_size", "characteristics"],
+      "properties": {
+        "raw_start_va": {"type": "integer", "minimum": 0},
+        "raw_end_va": {"type": "integer", "minimum": 0},
+        "index_va": {"type": "integer", "minimum": 0},
+        "callbacks_va": {"type": "integer", "minimum": 0},
+        "callbacks": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+        "zero_fill_size": {"type": "integer", "minimum": 0},
+        "characteristics": {"type": "integer", "minimum": 0}
+      }
+    },
+    "unwind": {"type": "array", "items": {"$ref": "#/$defs/unwind"}},
+    "recon": {"$ref": "#/$defs/recon"}
+  },
+  "$defs": {
+    "generator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool", "source_file", "source_sha256", "source_size"],
+      "properties": {
+        "tool": {"type": "string"},
+        "version": {"type": "string"},
+        "source_file": {"type": "string"},
+        "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "source_size": {"type": "integer", "minimum": 0},
+        "function_bounds_source": {"type": ["string", "null"]}
+      }
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image_base", "entrypoint", "entrypoint_rva"],
+      "properties": {
+        "image_base": {"type": "integer", "minimum": 0},
+        "entrypoint": {"type": "integer", "minimum": 0},
+        "entrypoint_rva": {"type": "integer", "minimum": 0},
+        "machine": {"type": "string"},
+        "subsystem": {"type": "string"},
+        "is_dll": {"type": "boolean"},
+        "size_of_image": {"type": "integer", "minimum": 0},
+        "size_of_headers": {"type": "integer", "minimum": 0},
+        "section_alignment": {"type": "integer", "minimum": 0},
+        "file_alignment": {"type": "integer", "minimum": 0},
+        "checksum": {"type": "integer", "minimum": 0},
+        "timestamp": {"type": "integer", "minimum": 0},
+        "linker_version": {"type": "string"},
+        "dll_characteristics": {"type": "integer", "minimum": 0},
+        "has_dynamic_base": {"type": "boolean"},
+        "large_address_aware": {"type": "boolean"},
+        "stack_reserve": {"type": "integer", "minimum": 0},
+        "stack_commit": {"type": "integer", "minimum": 0},
+        "heap_reserve": {"type": "integer", "minimum": 0},
+        "heap_commit": {"type": "integer", "minimum": 0}
+      }
+    },
+    "section": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "rva", "va", "virtual_size", "raw_offset", "raw_size", "mapped_size", "characteristics", "flags"],
+      "properties": {
+        "name": {"type": "string"},
+        "rva": {"type": "integer", "minimum": 0},
+        "va": {"type": "integer", "minimum": 0},
+        "virtual_size": {"type": "integer", "minimum": 0},
+        "raw_offset": {"type": "integer", "minimum": 0},
+        "raw_size": {"type": "integer", "minimum": 0},
+        "mapped_size": {"type": "integer", "minimum": 0},
+        "characteristics": {"type": "integer", "minimum": 0},
+        "flags": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "directory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "name", "rva", "size", "present"],
+      "properties": {
+        "index": {"type": "integer", "minimum": 0},
+        "name": {"type": "string"},
+        "rva": {"type": "integer", "minimum": 0},
+        "size": {"type": "integer", "minimum": 0},
+        "present": {"type": "boolean"}
+      }
+    },
+    "function": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end", "source"],
+      "properties": {
+        "start": {"type": "integer", "minimum": 0},
+        "end": {"type": ["integer", "null"], "minimum": 0},
+        "name": {"type": ["string", "null"]},
+        "source": {"type": "string", "enum": ["pdata", "ghidra", "export", "entrypoint"]}
+      }
+    },
+    "import": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dll", "name", "ordinal", "iat_va"],
+      "properties": {
+        "dll": {"type": "string"},
+        "name": {"type": ["string", "null"]},
+        "ordinal": {"type": ["integer", "null"], "minimum": 0},
+        "hint": {"type": ["integer", "null"], "minimum": 0},
+        "iat_va": {"type": "integer", "minimum": 0},
+        "ilt_va": {"type": "integer", "minimum": 0}
+      }
+    },
+    "export": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "ordinal", "va"],
+      "properties": {
+        "name": {"type": ["string", "null"]},
+        "ordinal": {"type": "integer", "minimum": 0},
+        "va": {"type": "integer", "minimum": 0},
+        "forwarder": {"type": ["string", "null"]}
+      }
+    },
+    "relocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "kind", "va"],
+      "properties": {
+        "type": {"type": "integer", "minimum": 0},
+        "kind": {"type": "string"},
+        "va": {"type": "integer", "minimum": 0}
+      }
+    },
+    "unwind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["begin", "end", "unwind_rva", "version", "flags", "prolog_size", "code_slots", "frame_register", "frame_offset"],
+      "properties": {
+        "begin": {"type": "integer", "minimum": 0},
+        "end": {"type": "integer", "minimum": 0},
+        "unwind_rva": {"type": "integer", "minimum": 0},
+        "version": {"type": "integer", "minimum": 0},
+        "flags": {"type": "integer", "minimum": 0},
+        "prolog_size": {"type": "integer", "minimum": 0},
+        "code_slots": {"type": "integer", "minimum": 0},
+        "frame_register": {"type": "integer", "minimum": 0},
+        "frame_offset": {"type": "integer", "minimum": 0},
+        "handler_va": {"type": ["integer", "null"], "minimum": 0},
+        "chained_begin_va": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "recon": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "function_count": {"type": "integer", "minimum": 0},
+        "function_sources": {"type": "object", "additionalProperties": {"type": "integer"}},
+        "functions_with_unknown_end": {"type": "integer", "minimum": 0},
+        "covered_code_bytes": {"type": "integer", "minimum": 0},
+        "relocation_counts": {"type": "object", "additionalProperties": {"type": "integer"}},
+        "notes": {"type": "array", "items": {"type": "string"}},
+        "problems": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}
