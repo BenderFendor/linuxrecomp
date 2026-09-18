@@ -392,3 +392,35 @@ entered, which is now a behavioural divergence rather than a missing code proble
 The next question is therefore narrow: what does the walker do between calling the first
 entry and the second. The walker is not a separate `_initterm` in the entered set, so it is
 inlined in the startup.
+
+
+## The initialiser walker, found and read
+
+Searching `.text` for references to the initialiser-table addresses finds exactly one, at
+`0x140008766`, inside `sub_140008700` - a function the run does enter. Its walk is inline:
+
+```
+140008783: lea rbx,[0x140019430]     ; first
+14000878a: lea rdi,[0x140019458]     ; last
+140008793: cmp rbx,rdi
+140008796: jae 0x1400087b3           ; done
+140008798: test eax,eax
+14000879a: jne 0x140008810           ; an earlier entry failed
+14000879c: mov rcx,[rbx]             ; the entry
+14000879f: test rcx,rcx
+1400087a2: je 0x1400087a6            ; null entries are skipped
+1400087a4: call rcx                  ; run it
+1400087aa: cmp rbx,rdi
+1400087ad: jb 0x140008798            ; loop
+```
+
+and then it moves to the next table (`0x140019420`..`0x140019428`, one entry) and onwards.
+So there is a family of small tables, not the two my earlier scan reported: that scan looked
+for runs of three or more code pointers and therefore missed the one- and two-entry tables,
+which is most of them. The walker's own range `0x19430`..`0x19458` is five entries wide.
+
+That reframes the earlier measurement. "Only one of six entries is called" was counting
+entries of two tables picked by a scan that could not see the others. The real question is
+narrower: the walker is entered and does run entries, so what stops it - and the answer has
+to explain why the returning function is `sub_14000bec0`, whose return lands on the harness's
+own sentinel, meaning its caller's frame was never established.
