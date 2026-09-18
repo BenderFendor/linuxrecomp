@@ -78,6 +78,9 @@ void lifted_set_memory_trace(bool enabled);
  * call to lifted guest code. */
 void lifted_set_imports(import_table *table);
 
+/* The image the guest is running from: what its own module handle must be. */
+void lifted_set_guest_image(uint64_t base, const char *path);
+
 /* Entry is the program's root: a top-level return ends the run. */
 void lifted_set_program_mode(bool enabled);
 size_t lifted_import_count(void);

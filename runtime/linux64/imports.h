@@ -76,6 +76,7 @@ void *host_get_command_line(void);
 const uint16_t *host_get_environment_w(void);
 const char *host_get_environment_a(void);
 int host_get_startup_info(void *buffer, unsigned long size);
+void *host_get_module_handle(const char *name);
 
 /* True when the host can resolve imports at all. */
 int imports_host_available(void);

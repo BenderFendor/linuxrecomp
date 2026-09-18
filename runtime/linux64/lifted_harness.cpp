@@ -389,6 +389,7 @@ int main(int argc, char **argv) {
               imports_host_available() ? "wine" : "none");
     }
     import_count = imports.count;
+    lifted_set_guest_image(image.image_base, path);
     trace("reserving the guest stack");
     /* Address 0: the host picks. Only the guest image is address-bound, because
      * only the image's address is something the guest itself depends on. */

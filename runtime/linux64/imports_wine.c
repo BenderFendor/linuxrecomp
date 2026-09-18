@@ -89,6 +89,10 @@ int host_get_startup_info(void *buffer, unsigned long size) {
     return 1;
 }
 
+void *host_get_module_handle(const char *name) {
+    return (void *)(uintptr_t)GetModuleHandleA(name);
+}
+
 int imports_host_available(void) {
     return 1;
 }

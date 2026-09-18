@@ -184,6 +184,61 @@ uint64_t thunk_virtual_alloc(State *, const uint64_t *arguments, Memory *) {
     return guest_heap_alloc(arguments[1]);
 }
 
+/* The program's own module.
+ *
+ * GetModuleHandleA(NULL) returns the module the caller lives in. Handed to Wine, that is
+ * the harness's module, and a program that then reads its own headers - the load config
+ * and TLS directories are what a CRT startup walks - reads the wrong image. The guest
+ * gets its own base and nothing else; a named module still goes to the host, because
+ * that is where the DLLs actually are. */
+bool same_module_name(const char *requested, const char *image_path) {
+    if (!requested || !image_path) {
+        return false;
+    }
+    const char *wanted = requested;
+    for (const char *at = requested; *at; at++) {
+        if (*at == '\\' || *at == '/') {
+            wanted = at + 1;
+        }
+    }
+    const char *have = image_path;
+    for (const char *at = image_path; *at; at++) {
+        if (*at == '\\' || *at == '/') {
+            have = at + 1;
+        }
+    }
+    while (*wanted && *have) {
+        char a = *wanted++;
+        char b = *have++;
+        if (a >= 'A' && a <= 'Z') {
+            a = (char)(a - 'A' + 'a');
+        }
+        if (b >= 'A' && b <= 'Z') {
+            b = (char)(b - 'A' + 'a');
+        }
+        if (a != b) {
+            return false;
+        }
+    }
+    return *wanted == '\0' && *have == '\0';
+}
+
+uint64_t g_guest_image_base = 0;
+const char *g_guest_image_path = nullptr;
+
+uint64_t thunk_get_module_handle(State *, const uint64_t *arguments, Memory *) {
+    /* GetModuleHandleA/W(name) */
+    const char *name = (const char *)(uintptr_t)arguments[0];
+    if (!name || !*name) {
+        return g_guest_image_base;
+    }
+    if (same_module_name(name, g_guest_image_path)) {
+        return g_guest_image_base;
+    }
+    void *host = host_get_module_handle(name);
+    return (uint64_t)(uintptr_t)host;
+}
+
 uint64_t thunk_get_proc_address(State *, const uint64_t *arguments, Memory *) {
     /* GetProcAddress(module, name). The program then calls what it got, so the
      * address has to be one the dispatcher can route: register it as it is found. */
@@ -335,6 +390,8 @@ const ImportThunk kImportThunks[] = {
     { "KERNEL32.dll", "FreeEnvironmentStringsW", thunk_free_environment },
     { "KERNEL32.dll", "FreeEnvironmentStringsA", thunk_free_environment },
     { "KERNEL32.dll", "GetStartupInfoA", thunk_startup_info },
+    { "KERNEL32.dll", "GetModuleHandleA", thunk_get_module_handle },
+    { "KERNEL32.dll", "GetModuleHandleW", thunk_get_module_handle },
 };
 
 /* A name for the trace: the function's name, or its ordinal, or its address when the
@@ -653,6 +710,11 @@ StopReason lifted_run_dispatched(uint64_t va, State *state, Memory *memory) {
 }
 
 void lifted_report_undefined(bool enabled) { g_report_undefined = enabled; }
+
+void lifted_set_guest_image(uint64_t base, const char *path) {
+    g_guest_image_base = base;
+    g_guest_image_path = path;
+}
 
 void lifted_set_program_mode(bool enabled) {
     g_program_mode = enabled;

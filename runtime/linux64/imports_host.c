@@ -35,6 +35,11 @@ int host_get_startup_info(void *buffer, unsigned long size) {
     return 0;
 }
 
+void *host_get_module_handle(const char *name) {
+    (void)name;
+    return NULL;
+}
+
 int imports_host_available(void) {
     return 0;
 }
