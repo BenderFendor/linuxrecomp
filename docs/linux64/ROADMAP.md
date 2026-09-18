@@ -182,6 +182,19 @@ Pick a legally usable, unprotected PE64 target with modest imports before MKX,
 Injustice or DBFZ. Acceptance is incremental: process bootstrap → window →
 renderer init → audio → first interactive frame.
 
+## Scale: measured on Photoshop.exe
+
+`docs/linux64/SCALE.md` records what the pipeline costs on the largest target so
+far (198 MB, 325,924 functions): 61 s of reconversion with no problems, about 31 s
+per function to lift, seconds to build a harness and run a lifted function, and a
+differential match against the reference executor on the image entrypoint.
+
+The number that shapes the plan is the lifting cost: 325,924 functions at 31 s each
+is about 113 days of single-core work, so lifting is lazy and driven by what
+execution reaches, not by what reconversion finds. That is why P4 (imports) and the
+Wine host it depends on come first: without them a real function cannot get past
+its first external call.
+
 ## Later optimization
 
 Only after correctness: direct LLVM call lowering, removing unnecessary CPU-state
