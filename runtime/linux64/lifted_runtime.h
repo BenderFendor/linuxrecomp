@@ -81,6 +81,9 @@ void lifted_set_imports(import_table *table);
 /* The image the guest is running from: what its own module handle must be. */
 void lifted_set_guest_image(uint64_t base, const char *path);
 
+/* The program's .pdata, so its own unwind records can be looked up. */
+void lifted_set_guest_unwind(uint64_t pdata_va, uint64_t count);
+
 /* Entry is the program's root: a top-level return ends the run. */
 void lifted_set_program_mode(bool enabled);
 size_t lifted_import_count(void);

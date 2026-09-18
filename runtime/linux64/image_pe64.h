@@ -92,6 +92,13 @@ void *pe_ptr(const pe_image *image, uint64_t va);
 /* True when `va` falls inside an executable section. */
 int pe_is_code(const pe_image *image, uint64_t va);
 
+/* A data directory of the mapped image: its RVA and size.
+ *
+ * The directories live in the optional header, and reading them from the mapping
+ * rather than from the file keeps one source of truth for the image's layout.
+ * Returns 0 when the directory is absent or empty. */
+int pe_data_directory(const pe_image *image, int index, uint32_t *rva, uint32_t *size);
+
 /* Name of the section containing `va`, or NULL. */
 const char *pe_section_name(const pe_image *image, uint64_t va);
 

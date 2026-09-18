@@ -299,3 +299,33 @@ const char *pe_section_name(const pe_image *image, uint64_t va) {
     }
     return NULL;
 }
+
+int pe_data_directory(const pe_image *image, int index, uint32_t *rva, uint32_t *size) {
+    if (!image || !image->data || index < 0 || index > 15) {
+        return 0;
+    }
+    const uint8_t *base = image->data;
+    const uint32_t pe_offset = *(const uint32_t *)(base + 0x3c);
+    const uint8_t *optional = base + pe_offset + 4 + 20;
+    const uint16_t magic = *(const uint16_t *)optional;
+    /* PE32+ carries the directory table 112 bytes into the optional header. */
+    if (magic != 0x20b) {
+        return 0;
+    }
+    const uint32_t count = *(const uint32_t *)(optional + 108);
+    if ((uint32_t)index >= count) {
+        return 0;
+    }
+    const uint32_t entry_rva = *(const uint32_t *)(optional + 112 + index * 8);
+    const uint32_t entry_size = *(const uint32_t *)(optional + 112 + index * 8 + 4);
+    if (entry_rva == 0 || entry_size == 0) {
+        return 0;
+    }
+    if (rva) {
+        *rva = entry_rva;
+    }
+    if (size) {
+        *size = entry_size;
+    }
+    return 1;
+}

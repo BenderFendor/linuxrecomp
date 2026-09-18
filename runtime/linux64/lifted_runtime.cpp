@@ -280,6 +280,52 @@ uint64_t thunk_get_module_handle(State *, const uint64_t *arguments, Memory *mem
     return (uint64_t)(uintptr_t)host;
 }
 
+/* The program's own unwind tables.
+ *
+ * RtlLookupFunctionEntry answers "what unwind record covers this PC". Wine's ntdll answers
+ * from its own tables, which hold nothing for addresses inside the recompiled program, so
+ * a caller that then unwinds - the SEH path the MSVC C runtime uses - gets no record and
+ * takes the wrong branch. The program's .pdata is mapped as part of its image, so the
+ * answer is a search there, and the record returned is the program's own entry: the layout
+ * of RUNTIME_FUNCTION is the same for both. */
+uint64_t g_guest_pdata_va = 0;
+uint64_t g_guest_pdata_count = 0;
+
+
+uint64_t thunk_rtl_lookup_function_entry(State *, const uint64_t *arguments, Memory *memory) {
+    const uint64_t pc = arguments[0];
+    uint64_t *image_base_out = (uint64_t *)guest_ptr(memory, arguments[1], sizeof(uint64_t));
+    if (!g_guest_pdata_va || !g_guest_pdata_count || pc < g_guest_image_base) {
+        return 0;
+    }
+    const uint32_t rva = (uint32_t)(pc - g_guest_image_base);
+    /* .pdata is one 12-byte RUNTIME_FUNCTION per range, sorted by start. */
+    uint64_t low = 0;
+    uint64_t high = g_guest_pdata_count;
+    while (low < high) {
+        const uint64_t middle = low + (high - low) / 2;
+        const uint32_t *entry =
+            (const uint32_t *)guest_ptr(memory, g_guest_pdata_va + middle * 12, 12);
+        if (!entry) {
+            return 0;
+        }
+        if (rva < entry[0]) {
+            high = middle;
+        } else if (rva >= entry[1]) {
+            low = middle + 1;
+        } else {
+            if (image_base_out) {
+                *image_base_out = g_guest_image_base;
+            }
+            trace_dispatch("unwind: pc %#" PRIx64 " -> entry %#" PRIx64,
+                           (uint64_t)pc, g_guest_pdata_va + middle * 12);
+            return g_guest_pdata_va + middle * 12;
+        }
+    }
+    trace_dispatch("unwind: pc %#" PRIx64 " has no record", (uint64_t)pc);
+    return 0;
+}
+
 uint64_t thunk_get_proc_address(State *, const uint64_t *arguments, Memory *) {
     /* GetProcAddress(module, name). The program then calls what it got, so the
      * address has to be one the dispatcher can route: register it as it is found. */
@@ -433,6 +479,7 @@ const ImportThunk kImportThunks[] = {
     { "KERNEL32.dll", "GetStartupInfoA", thunk_startup_info },
     { "KERNEL32.dll", "GetModuleHandleA", thunk_get_module_handle },
     { "KERNEL32.dll", "GetModuleHandleW", thunk_get_module_handle },
+    { "KERNEL32.dll", "RtlLookupFunctionEntry", thunk_rtl_lookup_function_entry },
 };
 
 /* A name for the trace: the function's name, or its ordinal, or its address when the
@@ -1209,4 +1256,11 @@ const LiftedEntry *lifted_lookup(uint64_t va) {
 
 const LiftedEntry *lifted_entry(size_t index) {
     return index < lifted_entry_count() ? &kLiftedEntries[index] : nullptr;
+}
+
+/* Defined here, outside the anonymous namespace the rest of this file uses, because the
+ * harness that maps the image is what tells the runtime where the program's .pdata is. */
+void lifted_set_guest_unwind(uint64_t pdata_va, uint64_t count) {
+    g_guest_pdata_va = pdata_va;
+    g_guest_pdata_count = count;
 }

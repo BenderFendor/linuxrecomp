@@ -390,6 +390,14 @@ int main(int argc, char **argv) {
     }
     import_count = imports.count;
     lifted_set_guest_image(image.image_base, path);
+    {
+        /* Exception directory, as a guest address and an entry count, for RtlLookupFunctionEntry. */
+        uint32_t exception_rva = 0;
+        uint32_t exception_size = 0;
+        if (pe_data_directory(&image, 3, &exception_rva, &exception_size) && exception_size >= 12) {
+            lifted_set_guest_unwind(image.image_base + exception_rva, exception_size / 12);
+        }
+    }
     trace("reserving the guest stack");
     /* Address 0: the host picks. Only the guest image is address-bound, because
      * only the image's address is something the guest itself depends on. */
